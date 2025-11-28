@@ -19,7 +19,7 @@ A robust, rsnapshot-inspired backup solution optimized for modern Linux laptops 
 
 ### **1\. Clone & Install**
 
-git clone \[https://github.com/yourname/snapshot-backup.git\](https://github.com/yourname/snapshot-backup.git)  
+git clone \[https://github.com/schnebeck/snapshot-backup.git\](https://github.com/schnebeck/snapshot-backup.git)  
 cd snapshot-backup  
 sudo ./install.sh \--startup=auto
 
