@@ -170,6 +170,8 @@ SOURCE_DIRS=(
 
 ### 2. Running Backups
 The script is designed to be run by the `root` user (or a privileged backup user) via Cron or a Systemd Timer.
+The repo has a script example to start snapshot-backup.sh via a Network Manager dispatcher script when the machine
+is connected to your favorite network and is not running on battery.
 
 #### Manual Run (Testing)
 To verify the configuration and run an immediate backup:
