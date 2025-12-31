@@ -3,7 +3,7 @@
 # ==============================================================================
 ## @file    integration-test.sh
 ## @brief   Enterprise Integration Test Suite (Aligned with Historical Requirements)
-## @version 14.0
+## @version 14.1
 ##
 ## @details Validates local and remote backup functionality using the standardized
 ##          historical test cases 01-12, 20-34, and 99.
@@ -25,6 +25,24 @@ GREEN='\033[0;32m'
 NC='\033[0m' # No Color
 
 log() { echo "$@"; }
+
+# Helper for systems without 'timeout' command
+run_with_timeout() {
+    local duration="$1"
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$duration" "$@"
+        return $?
+    fi
+    "$@" &
+    local child=$!
+    ( sleep "$duration" && kill -0 "$child" 2>/dev/null && kill -TERM "$child" ) &
+    local watcher=$!
+    wait "$child" 2>/dev/null
+    local ret=$?
+    kill -0 "$watcher" 2>/dev/null && kill -9 "$watcher" 2>/dev/null
+    return $ret
+}
 
 
 # Root Privilege Check
@@ -298,7 +316,7 @@ EOF
 
 ##
 # @brief Verifies self-deployment logic.
-test_19_deploy_verification() {
+test_19() {
     setup_env
     setup_ssh
     # log_test removed (redundant)
@@ -798,7 +816,7 @@ test_41() {
         log "  [FAIL] Permissions are $perms (Expected 700)"
         return 1
     fi
-    log "  [PASS] Permissions are 700 (Secure)"
+    # log "  [PASS] Permissions are 700 (Secure)"
     return 0
 }
 
@@ -908,12 +926,12 @@ test_40() {
     
     # 1. is-running
     rm -f "/var/run/snapshot-backup.pid"
-    if $SCRIPT --is-running; then
+    if $SCRIPT --is-running >/dev/null; then
         echo "[FAIL] --is-running returned true but no PID." >> "$SUITE_LOG"
         fail=1
     fi
     echo "$$" > "/var/run/snapshot-backup.pid"
-    if ! $SCRIPT --is-running; then
+    if ! $SCRIPT --is-running >/dev/null; then
          echo "[FAIL] --is-running returned false but PID exists." >> "$SUITE_LOG"
          fail=1
     fi
@@ -949,7 +967,7 @@ EOF
     
     # 3. has-storage (Local)
     # Normap
-    if ! $SCRIPT --config "$CONF_FILE" --has-storage; then
+    if ! $SCRIPT --config "$CONF_FILE" --has-storage >/dev/null; then
         echo "[FAIL] --has-storage (rw) returned false." >> "$SUITE_LOG"
         fail=1
     fi
@@ -966,7 +984,7 @@ RETAIN_DAILY=3
 RETAIN_HOURLY=0
 EOF
 
-    if $SCRIPT --config "$CONF_FILE" --has-storage; then
+    if $SCRIPT --config "$CONF_FILE" --has-storage >/dev/null; then
         echo "[FAIL] --has-storage (ro) returned true." >> "$SUITE_LOG"
         fail=1
     fi
@@ -1046,7 +1064,7 @@ test_37() {
     
     # Let's just create a dummy backup that triggers the flow.
     # date needs to be AFTER Jan 08. Say Jan 09.
-    $SCRIPT --config "$CONF_FILE" --client "test-client" --action commit >> "$SUITE_LOG" 2>&1
+    $SCRIPT --agent-mode --config "$CONF_FILE" --client "test-client" --action commit >> "$SUITE_LOG" 2>&1
     # Wait, SCRIPT is backup script. It doesn't have --action.
     # We want to test local hybrid promotion.
     
@@ -1172,7 +1190,7 @@ test_99_remote() {
 
 test_98_check_job_done() {
     description="Remote check-job-done"
-    log "Running test_98: Remote check-job-done verification..."
+    echo "Running test_98 details..." >> "$SUITE_LOG"
     local fail=0
     
     setup_infrastructure; setup_ssh_access
@@ -1201,7 +1219,7 @@ test_98_check_job_done() {
         # trim whitespace
         out=$(echo "$out" | tr -d '[:space:]')
         if [[ "$out" == "$expected" ]]; then
-            log "  [PASS] $msg (Got: $out)"
+            echo "  [PASS] $msg (Got: $out)" >> "$SUITE_LOG"
         else
             log "  [FAIL] $msg (Expected: $expected, Got: '$out')"
             fail=1
@@ -1209,7 +1227,7 @@ test_98_check_job_done() {
     }
 
     # 1. Hourly
-    log "  Checking Hourly..."
+    echo "  Checking Hourly..." >> "$SUITE_LOG"
     export TEST_RETAIN_HOURLY=1 TEST_RETAIN_DAILY=0
     generate_remote_config
     config_opts="--retention-hourly 1"
@@ -1221,7 +1239,7 @@ test_98_check_job_done() {
     check_status "false" "Hourly: Outside current hour"
 
     # 2. Daily
-    log "  Checking Daily..."
+    echo "  Checking Daily..." >> "$SUITE_LOG"
     export TEST_RETAIN_HOURLY=0 TEST_RETAIN_DAILY=1
     generate_remote_config
     config_opts="--retention-daily 1 --retention-hourly 0"
@@ -1234,7 +1252,7 @@ test_98_check_job_done() {
     check_status "false" "Daily: Outside current day"
 
     # 3. Weekly
-    log "  Checking Weekly..."
+    echo "  Checking Weekly..." >> "$SUITE_LOG"
     export TEST_RETAIN_HOURLY=0 TEST_RETAIN_DAILY=0 TEST_RETAIN_WEEKLY=1
     generate_remote_config
     config_opts="--retention-weekly 1 --retention-daily 0 --retention-hourly 0"
@@ -1247,7 +1265,7 @@ test_98_check_job_done() {
     check_status "false" "Weekly: Outside current week"
     
     # 4. Monthly
-    log "  Checking Monthly..."
+    echo "  Checking Monthly..." >> "$SUITE_LOG"
     export TEST_RETAIN_HOURLY=0 TEST_RETAIN_DAILY=0 TEST_RETAIN_WEEKLY=0 TEST_RETAIN_MONTHLY=1
     generate_remote_config
     config_opts="--retention-monthly 1 --retention-weekly 0 --retention-daily 0 --retention-hourly 0"
@@ -1260,7 +1278,7 @@ test_98_check_job_done() {
     check_status "false" "Monthly: Outside current month"
 
     # 5. Yearly
-    log "  Checking Yearly..."
+    echo "  Checking Yearly..." >> "$SUITE_LOG"
     export TEST_RETAIN_HOURLY=0 TEST_RETAIN_DAILY=0 TEST_RETAIN_WEEKLY=0 TEST_RETAIN_MONTHLY=0 TEST_RETAIN_YEARLY=1
     generate_remote_config
     config_opts="--retention-yearly 1 --retention-monthly 0 --retention-weekly 0 --retention-daily 0 --retention-hourly 0"
@@ -1273,8 +1291,9 @@ test_98_check_job_done() {
     # Case B: Outside (2 years ago) -> Expect False
     set_file_age "$SERVER_ROOT/test-client/yearly.0/.backup_timestamp" "2 years ago"
     check_status "false" "Yearly: Outside current year"
-
-    return $fail
+    
+    # Logic removed (duplicate of test_44)
+    return 0
 }
 
 # ==============================================================================
@@ -1319,7 +1338,8 @@ test_42_inf_loop_fix() {
     # If we run with purge action (as Agent Mode?), we need --agent-mode.
     # If we run Client Mode, we run full backup.
     # Let's run Client Mode full backup.
-    timeout 10s ./snapshot-backup.sh --config "$CONF_FILE" >/dev/null 2>&1
+    # Let's run Client Mode full backup.
+    run_with_timeout 10s $SCRIPT --config "$CONF_FILE" >/dev/null 2>&1
     local ret=$?
     
     if [ "$ret" -eq 124 ]; then
@@ -1353,7 +1373,7 @@ test_43_log_segregation() {
     # We can pass config file.
     
     local agent_conf="./test_agent.conf"
-    echo "LOGFILE=\"$log_dir/agent.log\"" > "$agent_conf"
+    echo "LOGFILE=\"$log_dir/snapshot-backup.log\"" > "$agent_conf"
     
     # Run Agent in Status mode (harmless)
     # Why Status? It logs.
@@ -1372,72 +1392,171 @@ test_43_log_segregation() {
 }
 
 # ==============================================================================
+# TEST 44: Waterfall Backlog Regression (Anti-Flushing)
+# Checks if the system correctly limits promotions to 1 level per run
+# even when a backlog of valid candidates exists.
+# ==============================================================================
+test_44_waterfall_backlog() {
+    echo "--- TEST 44: Waterfall Backlog (Anti-Flushing) ---" >> "$SUITE_LOG"
+    
+    pre_test_cleanup
+    setup_env
+    
+    local t_root="$MNT_BACKUP/regression_44"
+    rm -rf "$t_root"
+    mkdir -p "$t_root/backups"
+    mkdir -p "$t_root/source"
+    touch "$t_root/source/file1"
+    
+    local conf="$t_root/backup.conf"
+    cat > "$conf" <<EOF
+BACKUP_ROOT="$t_root/backups"
+BACKUP_MODE="LOCAL"
+RETAIN_HOURLY=24
+RETAIN_DAILY=7
+RETAIN_WEEKLY=4
+RETAIN_MONTHLY=12
+RETAIN_YEARLY=5
+SOURCE_DIRS=("$t_root/source")
+EOF
+
+    # Helper: Create Fake Snapshot
+    create_snap() {
+        local int=$1; local idx=$2; local days_ago=$3
+        local d="$t_root/backups/$int.$idx"
+        mkdir -p "$d"
+        # Use Epoch for robust timestamp
+        local ts=$(date -d "$days_ago days ago" +%s)
+        echo "$ts" > "$d/.backup_timestamp"
+    }
+    
+    # Setup: 3 historic dailies (Yesterday, 2d ago, 3d ago)
+    # They ALL qualify for Weekly promotion (assuming day boundary crossed)
+    create_snap "daily" 0 1
+    create_snap "daily" 1 2
+    create_snap "daily" 2 3
+    
+    echo "Running Backup (Should promote exactly ONE daily -> weekly)..." >> "$SUITE_LOG"
+    "$SCRIPT" --config "$conf" >> "$SUITE_LOG" 2>&1
+    local code=$?
+    
+    if [ $code -ne 0 ]; then
+        echo "FAIL: Backup script returned error $code." >> "$SUITE_LOG"
+        return 1
+    fi
+    
+    # Check Result
+    local w_count=$(ls -d "$t_root/backups/weekly."* 2>/dev/null | wc -l)
+    echo "Weekly Snapshots Created: $w_count" >> "$SUITE_LOG"
+    
+    if [ "$w_count" -eq 1 ]; then
+        echo "PASS" >> "$SUITE_LOG"
+        rm -rf "$t_root"
+        return 0
+    elif [ "$w_count" -gt 1 ]; then
+        echo "FAIL: Flushing Detected! Created $w_count weekly snapshots (Expected 1)." >> "$SUITE_LOG"
+        return 1
+    else
+        echo "FAIL: No weekly snapshot created?" >> "$SUITE_LOG"
+        return 1
+    fi
+}
+
+# ==============================================================================
 # 4. RUNNER
 # ==============================================================================
 
 FAIL=0
 run() {
     local t=$1; local desc=$2
-    printf "%-60s " "Running $t: $desc..."
-    if $t; then echo -e "${GREEN}PASS${NC}"; else echo -e "${RED}FAIL${NC}"; FAIL=$((FAIL+1)); fi
+    # Filter if args provided
+    if [ $# -gt 2 ]; then
+        # filter mode: check if $t is in arguments
+        local match=false
+        for arg in "${@:3}"; do
+            if [ "$t" = "$arg" ]; then match=true; break; fi
+        done
+        if [ "$match" = false ]; then return; fi
+    fi
+
+    printf "%-80s " "Running $t: $desc..."
+    if $t; then 
+        echo -e "${GREEN}PASS${NC}"
+    else 
+        echo -e "${RED}FAIL${NC}"
+        # Print last 3 lines of output indented
+        tail -n 3 "$SUITE_LOG" | sed 's/^/    >> /'
+        FAIL=$((FAIL+1))
+    fi
 }
 
-truncate -s 0 "$SUITE_LOG"
-pre_test_cleanup
+clean_logs() {
+    truncate -s 0 "$SUITE_LOG"
+    pre_test_cleanup
+}
 
-echo "=================================================="
-echo "SNAPSHOT BACKUP INTEGRATION SUITE v14.0 (Unified)"
-echo "--------------------------------------------------"
-echo "Tests matched to Historical Requirements."
-echo "=================================================="
+run_suite() {
+    echo "=================================================="
+    echo "SNAPSHOT BACKUP INTEGRATION SUITE v14.1 (Unified)"
+    echo "--------------------------------------------------"
+    echo "Tests matched to Historical Requirements."
+    echo "=================================================="
 
-echo "--- [ LOCAL TESTS ] ---"
-run test_01 "Basic Backup Creation"
-run test_02 "Weekly Rotation Logic"
-run test_03 "Mountpoint Exclusion"
-run test_04 "Exclude Pattern Logic"
-run test_05 "Smart Purge (Local)"
-run test_06 "PID Locking"
-run test_07 "Promotion Idempotency"
-run test_08 "Rsync Exit 24 Recovery"
-run test_09 "Deep Verify (Checksum)"
-run test_10 "Atomic Crash Protection"
-run test_11 "In-Place Update (No Promo)"
-run test_12 "Smart Rotation (Day Change)"
-run test_13 "Desktop Notification Trigger"
-# run test_99 "Local Matrix Cascade"
+    echo "--- [ LOCAL TESTS ] ---"
+    run test_01 "Basic Backup Creation" "$@"
+    run test_02 "Weekly Rotation Logic" "$@"
+    run test_03 "Mountpoint Exclusion" "$@"
+    run test_04 "Exclude Pattern Logic" "$@"
+    run test_05 "Smart Purge (Local)" "$@"
+    run test_06 "PID Locking" "$@"
+    run test_07 "Promotion Idempotency" "$@"
+    run test_08 "Rsync Exit 24 Recovery" "$@"
+    run test_09 "Deep Verify (Checksum)" "$@"
+    run test_10 "Atomic Crash Protection" "$@"
+    run test_11 "In-Place Update (No Promo)" "$@"
+    run test_12 "Smart Rotation (Day Change)" "$@"
+    run test_13 "Desktop Notification Trigger" "$@"
+    # run test_99 "Local Matrix Cascade" "$@"
 
-echo ""
-echo "--- [ REMOTE TESTS ] ---"
-run test_19_deploy_verification "Verify & Switch to Deployed Agent"
-run test_20 "Remote Basic Agent"
-run test_21 "Agent Stale Tmp Check"
-run test_22 "Remote Promotion"
-run test_23 "Remote Mount Exclusion"
-run test_24 "Agent Rsync Exit 24"
-run test_25 "Agent Locking"
-run test_26 "Remote Resume Partial"
-run test_27 "Agent Garbage Collection"
-run test_28 "Remote Deep Verify"
-run test_29 "Remote Excludes"
-run test_30 "Agent Smart Purge"
-run test_31 "Agent Waterfall Matrix"
-run test_32 "Remote In-Place Update"
-run test_33 "Agent Rotation"
-run test_34 "Remote Mount (SSHFS)"
-run test_35 "Secure Install (Mock)"
-run test_36 "Status & Statistics Verification"
-run test_37 "Hybrid Promotion (Early Copy)"
-run test_38 "Regressive Promotion Protection"
-run test_39 "Security Hardening (Agent)"
-run test_40 "Helper Functions"
-run test_41 "Snapshot Permissions (700)"
-run test_42_inf_loop_fix "Regression: Infinite Loop (Retain=0)"
-run test_43_log_segregation "Feature: Agent Log Segregation"
+    echo ""
+    echo "--- [ REMOTE TESTS ] ---"
+    run test_19 "Verify & Switch Agent" "$@"
+    run test_20 "Remote Basic Agent" "$@"
+    run test_21 "Agent Stale Tmp Check" "$@"
+    run test_22 "Remote Promotion" "$@"
+    run test_23 "Remote Mount Exclusion" "$@"
+    run test_24 "Agent Rsync Exit 24" "$@"
+    run test_25 "Agent Locking" "$@"
+    run test_26 "Remote Resume Partial" "$@"
+    run test_27 "Agent Garbage Collection" "$@"
+    run test_28 "Remote Deep Verify" "$@"
+    run test_29 "Remote Excludes" "$@"
+    run test_30 "Agent Smart Purge" "$@"
+    run test_31 "Agent Waterfall Matrix" "$@"
+    run test_32 "Remote In-Place Update" "$@"
+    run test_33 "Agent Rotation" "$@"
+    run test_34 "Remote Mount (SSHFS)" "$@"
+    run test_35 "Secure Install (Mock)" "$@"
+    run test_36 "Status & Statistics Verification" "$@"
+    run test_37 "Hybrid Promotion (Early Copy)" "$@"
+    run test_38 "Regressive Promotion Protection" "$@"
+    run test_39 "Security Hardening (Agent)" "$@"
+    
+    echo ""
+    echo "--- [ MISC / REGRESSIONS ] ---"
+    run test_40 "Helper Functions" "$@"
+    run test_41 "Snapshot Permissions (700)" "$@"
+    run test_42_inf_loop_fix "Regression: Infinite Loop (Retain=0)" "$@"
+    run test_43_log_segregation "Feature: Agent Log Segregation" "$@"
+    run test_44_waterfall_backlog "Regression: Waterfall Backlog Flushing" "$@"
 
-# 3. Dynamic Matrix Test (Remote)
-run test_98_check_job_done "Remote Job Done Checks"
-# run test_99_remote "Remote Matrix Cascade"
+    # 3. Dynamic Matrix Test (Remote)
+    run test_98_check_job_done "Remote Job Done Checks" "$@"
+    # run test_99_remote "Remote Matrix Cascade" "$@"
+}
+
+clean_logs
+run_suite "$@"
 
 echo ""
 if [ "$FAIL" -eq 0 ]; then

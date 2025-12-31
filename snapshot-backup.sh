@@ -1,9 +1,9 @@
-#!/bin/bash
+#!/bin/sh
 
 # ==============================================================================
 ## @file    snapshot-backup.sh
-## @brief   Unified Snapshot Backup Client & Agent
-## @version 14.0
+## @brief   Unified Snapshot Backup Client & Agent (POSIX sh)
+## @version 15.0
 ##
 ## @details This script implements a dynamic waterfall rotation policy.
 ##          It provides robust backup capabilities for local storage (atomic 
@@ -25,7 +25,14 @@
 # ==============================================================================
 # VERSION HISTORY / CHANGELOG
 # ==============================================================================
-# v14.0 (Unified Release)
+# v15.0 (Final POSIX Release)
+# - COMPLIANCE: Strict POSIX sh compatibility (removed source, echo -e).
+# - ROBUSTNESS: Added safe_rm, timeout dependencies, and strict arg parsing.
+# - FIXES: Resolved recursive directory nesting and deployment path bugs.
+# ------------------------------------------------------------------------------
+# v14.1 (POSIX sh Port)
+# - PORTED: Converted from Bash to POSIX sh.
+# - COMPAT: Supports existing Bash-array config files via custom parser.
 # - MERGED: snapshot-agent.sh functionality fully integrated into snapshot-backup.sh.
 # - DEDUPLICATED: Unified shared logic for waterfalls, retention, and checks.
 #   - Added: prune_snapshots (Shared retention enforcement).
@@ -38,7 +45,8 @@
 # ==============================================================================
 
 set -u
-set -o pipefail
+# set -o pipefail # Not POSIX supported
+
 
 # ==============================================================================
 # 1. CONSTANTS & CONFIGURATION DEFAULTS
@@ -46,7 +54,7 @@ set -o pipefail
 
 ## @var SCRIPT_VERSION
 #  @brief Version string for compatibility and logging.
-SCRIPT_VERSION="14.1"
+SCRIPT_VERSION="15.0"
 
 EXPECTED_CONFIG_VERSION="1.8"
 CONFIG_FILE="/etc/snapshot-backup.conf"
@@ -59,7 +67,8 @@ LAST_VERIFY_FILE="/var/lib/snapshot-backup/last_verify.timestamp"
 
 ## @var INTERVALS
 #  @brief Hierarchical rotation levels ordered by granularity.
-INTERVALS=("hourly" "daily" "weekly" "monthly" "yearly")
+#  POSIX Sh: Space separated string
+INTERVALS="hourly daily weekly monthly yearly"
 
 RUN_MODE="AUTO"
 HAS_LOCK=false
@@ -92,9 +101,9 @@ REMOTE_SSH_OPTS=""
 REMOTE_STORAGE_ROOT="/var/backups/snapshots"
 BACKUP_ROOT="/mnt/backup"
 
-SOURCE_DIRS=("/")
-EXCLUDE_PATTERNS=(".cache" "*.tmp" ".thumbnails" "swapfile" "node_modules" ".git" "lost+found" ".Trash" "/var/lib/docker")
-EXCLUDE_MOUNTPOINTS=("/proc" "/sys" "/dev" "/run" "/tmp" "/mnt" "/media" "/backup" "/snap" "/var/lib/docker/overlay2" "/var/lib/containers")
+SOURCE_DIRS="/"
+EXCLUDE_PATTERNS=".cache *.tmp .thumbnails swapfile node_modules .git lost+found .Trash /var/lib/docker"
+EXCLUDE_MOUNTPOINTS="/proc /sys /dev /run /tmp /mnt /media /backup /snap /var/lib/docker/overlay2 /var/lib/containers"
 
 RETAIN_HOURLY=0
 RETAIN_DAILY=7
@@ -115,23 +124,22 @@ NETWORK_TIMEOUT=10
 # ==============================================================================
 
 ##
-# @brief Safe recursive delete wrapper
-safe_rm() {
-    local target="$1"
-    if [[ -z "$target" ]] || [[ "$target" == "/" ]]; then
-        die "CRITICAL SAFETY ERROR: Attempted to delete execution root or empty path: '$target'"
-    fi
-     # Prevent deleting common system roots just in case
-    if [[ "$target" == "/bin" ]] || [[ "$target" == "/usr" ]] || [[ "$target" == "/etc" ]] || [[ "$target" == "/home" ]]; then
-         die "CRITICAL SAFETY ERROR: Attempted to delete system directory: '$target'"
-    fi
-    rm -rf "$target"
-}
-
-##
 # @brief Standardized logging to file, console and syslog.
 # @param level Severity level (INFO, WARN, ERROR).
 # @param msg Message body.
+## @brief Safe recursive delete.
+safe_rm() {
+    local target="$1"
+    if [ -z "$target" ] || [ "$target" = "/" ]; then
+        log "ERROR" "Refusing to rm -rf '$target'"
+        return 1
+    fi
+    if [ -e "$target" ]; then
+        log "INFO" "safe_rm deleting '$target'"
+        rm -rf "$target"
+    fi
+}
+
 log() {
     local level="$1"
     shift
@@ -150,39 +158,82 @@ log() {
 
     # Append to logfile if writable
     if [ -w "$(dirname "$LOGFILE")" ]; then
-        echo "$log_entry" >> "$LOGFILE"
+        # Check if DEBUG is enabled for DEBUG level logs (to prevent file spam)
+        if [ "$level" != "DEBUG" ] || [ "${DEBUG_MODE:-false}" = "true" ]; then
+             echo "$log_entry" >> "$LOGFILE"
+        fi
     fi
 
     # Output to console if interactive or error (Keep Color!)
-    if [ "$RUN_MODE" != "SERVICE" ] || [ "$level" == "ERROR" ]; then
+    if [ "$RUN_MODE" != "SERVICE" ] || [ "$level" = "ERROR" ]; then
+        # Suppress DEBUG unless enabled
+        if [ "$level" = "DEBUG" ] && [ "${DEBUG_MODE:-false}" != "true" ]; then
+            return 0
+        fi
+
         if [ -t 1 ]; then
             case "$level" in
-                ERROR) echo -e "\033[1;31m:: $level: $msg\033[0m" >&2 ;;
-                WARN)  echo -e "\033[1;33m:: $level: $msg\033[0m" ;;
-                INFO)  echo -e "\033[1;32m::\033[0m $msg" ;;
-                *)     echo -e ":: $msg" ;;
+                ERROR) printf "\033[1;31m:: %s: %s\033[0m\n" "$level" "$msg" >&2 ;;
+                WARN)  printf "\033[1;33m:: %s: %s\033[0m\n" "$level" "$msg" ;;
+                INFO)  printf "\033[1;32m::\033[0m %s\n" "$msg" ;;
+                DEBUG) printf "\033[1;34m:: [DEBUG]\033[0m %s\n" "$msg" ;;
+                *)     printf ":: %s\n" "$msg" ;;
             esac
         else
             echo ":: [$level] $clean_msg"
         fi
     fi
 
-    # Send to syslog with appropriate priority
-    local prio="user.info"
-    case "$level" in
-        ERROR) prio="user.err" ;;
-        WARN)  prio="user.warning" ;;
-        INFO)  prio="user.info" ;;
-    esac
-    
-    # Truncate message for syslog to prevent "Argument list too long" errors (keep first 1000 chars)
-    # Use clean_msg for syslog
-    local safe_msg="${clean_msg:0:1000}"
-    if [ "${#clean_msg}" -gt 1000 ]; then
-        safe_msg="${safe_msg} ... [Truncated]"
+    # Send to syslog with appropriate priority (EXCEPT DEBUG)
+    if [ "$level" != "DEBUG" ]; then
+        local prio="user.info"
+        case "$level" in
+            ERROR) prio="user.err" ;;
+            WARN)  prio="user.warning" ;;
+            INFO)  prio="user.info" ;;
+        esac
+        
+        # Truncate message for syslog to prevent "Argument list too long" errors (keep first 1000 chars)
+        # Use clean_msg for syslog
+        local safe_msg=$(echo "$clean_msg" | cut -c 1-1000)
+        if [ "${#clean_msg}" -gt 1000 ]; then
+            safe_msg="${safe_msg} ... [Truncated]"
+        fi
+        
+        logger -t "$LOGTAG" -p "$prio" -- "$safe_msg"
     fi
+}
+
+## @brief Execution Wrapper with Fallback Timeout
+#  Uses system 'timeout' if available, otherwise sleep & kill background job.
+compat_run_with_timeout() {
+    local duration="$1"
+    shift
     
-    logger -t "$LOGTAG" -p "$prio" -- "$safe_msg"
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$duration" "$@"
+        return $?
+    fi
+
+    # Fallback for BusyBox / Minimal systems
+    # Run command in background
+    "$@" &
+    local child_pid=$!
+    
+    # Start separate killer process
+    (
+        sleep "$duration"
+        kill -TERM "$child_pid" 2>/dev/null
+    ) &
+    local killer_pid=$!
+    
+    # Wait for child
+    wait "$child_pid" 2>/dev/null
+    local exit_code=$?
+    
+    # Cleanup killer if child finished first
+    kill -9 "$killer_pid" 2>/dev/null
+    return $exit_code
 }
 
 ## @brief Agent Logging Adapters (Compatibility)
@@ -193,12 +244,42 @@ die() { log "ERROR" "$1"; exit 1; }
 
 ## @brief Checks required system dependencies (Unified)
 check_dependencies() {
-    local dependencies=("date" "df" "awk" "sort" "find" "ls" "rm" "mv" "cp" "grep" "rsync")
-    for cmd in "${dependencies[@]}"; do
+    local dependencies="date df awk sort find ls rm mv cp grep rsync"
+    for cmd in $dependencies; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             die "Required command '$cmd' not found."
         fi
     done
+}
+
+## @brief Basic check if rsync supports --info=progress2
+check_rsync_capabilities() {
+    # Default to standard progress
+    RSYNC_PROGRESS_OPTS="--progress"
+    RSYNC_ACL_OPT=""
+    RSYNC_XATTR_OPT=""
+    
+    # Check for --info support (rsync >= 3.1.0)
+    if rsync --info=progress2 --dry-run --version >/dev/null 2>&1; then
+        RSYNC_PROGRESS_OPTS="--info=progress2"
+        log "INFO" "Rsync Capability: Extended progress supported."
+    else
+        log "WARN" "Rsync Capability: Extended progress NOT supported. Fallback to --progress."
+    fi
+
+    # Check for ACL support (-A)
+    if rsync -A --dry-run --version >/dev/null 2>&1; then
+        RSYNC_ACL_OPT="-A"
+    else
+        log "WARN" "Rsync Capability: ACLs (-A) NOT supported by client."
+    fi
+
+    # Check for Xattr support (-X)
+    if rsync -X --dry-run --version >/dev/null 2>&1; then
+        RSYNC_XATTR_OPT="-X"
+    else
+        log "WARN" "Rsync Capability: Xattrs (-X) NOT supported by client."
+    fi
 }
 
 
@@ -220,16 +301,16 @@ is_interval_current() {
     local last_ts=$(read_timestamp "$ts_file")
     local now=$(date +%s)
     
-    if [ "$int" == "hourly" ]; then
+    if [ "$int" = "hourly" ]; then
         local d1=$(date -d "@$last_ts" +%Y%m%d%H)
         local d2=$(date -d "@$now" +%Y%m%d%H)
-        if [ "$d1" == "$d2" ]; then
+        if [ "$d1" = "$d2" ]; then
             return 0
         fi
     else
         local d1=$(date -d "@$last_ts" +%Y%m%d)
         local d2=$(date -d "@$now" +%Y%m%d)
-        if [ "$d1" == "$d2" ]; then
+        if [ "$d1" = "$d2" ]; then
             return 0
         fi
     fi
@@ -277,10 +358,10 @@ notify() {
                  # Set DBus address for the target user's bus
                  export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$target_uid/bus"
                  # Use timeout to prevent hangs
-                 timeout 5 sudo -E -u "$target_user" notify-send -u "$urgency" -a "Snapshot Backup" "$title" "$msg" 2>/dev/null
+                 compat_run_with_timeout 5 sudo -E -u "$target_user" notify-send -u "$urgency" -a "Snapshot Backup" "$title" "$msg" 2>/dev/null
              fi
         else
-             timeout 5 notify-send -u "$urgency" -a "Snapshot Backup" "$title" "$msg" 2>/dev/null
+             compat_run_with_timeout 5 notify-send -u "$urgency" -a "Snapshot Backup" "$title" "$msg" 2>/dev/null
         fi
     ) || true
 }
@@ -291,7 +372,7 @@ notify() {
 # @return Sanitized integer (0 if invalid).
 sanitize_int() {
     local val=${1:-0}
-    val="${val//[^0-9]/}"
+    val=$(echo "$val" | tr -cd '0-9')
     if [ -z "$val" ]; then
         echo "0"
     else
@@ -333,7 +414,7 @@ cleanup() {
     fi
 
     # 2. Remove Lock File
-    if [ "$HAS_LOCK" = true ] && [ -f "$PIDFILE" ] && [ "$(cat "$PIDFILE" 2>/dev/null)" == "$$" ]; then
+    if [ "$HAS_LOCK" = true ] && [ -f "$PIDFILE" ] && [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ]; then
         rm -f "$PIDFILE"
     fi
     
@@ -370,14 +451,14 @@ check_agent_version() {
     fi
 }
 
-trap 'handle_error $LINENO' ERR
 trap cleanup EXIT INT TERM
 
 ##
 # @brief Check remote connectivity with timeout.
 # @return 0 if connected, 1 if failed.
 test_remote_connection() {
-    timeout "$NETWORK_TIMEOUT" ssh -q -p $REMOTE_PORT -o BatchMode=yes -o ConnectTimeout="$NETWORK_TIMEOUT" -i "$REMOTE_KEY" "$REMOTE_USER@$REMOTE_HOST" exit
+    # Use builtin SSH ConnectTimeout for cleaner checks as requested
+    ssh -q -p $REMOTE_PORT -o BatchMode=yes -o ConnectTimeout="$NETWORK_TIMEOUT" -i "$REMOTE_KEY" "$REMOTE_USER@$REMOTE_HOST" exit
     return $?
 }
 
@@ -397,7 +478,7 @@ check_is_running_cli() {
 # @brief Check if job is done for the shortest interval (CLI Helper).
 check_is_job_done_cli() {
     # If REMOTE mode and not mounted, ask the agent
-    if [ "$BACKUP_MODE" == "REMOTE" ]; then
+    if [ "$BACKUP_MODE" = "REMOTE" ]; then
         if ! mountpoint -q "$BACKUP_ROOT" 2>/dev/null; then
              # Fast Check
              if ! test_remote_connection; then
@@ -407,12 +488,14 @@ check_is_job_done_cli() {
              fi
              # Capture output to determine exit code.
              # Agent v13.11 exits 0, so we must rely on the output string ("true"/"false").
-             local out=$(timeout "$NETWORK_TIMEOUT" ssh -p $REMOTE_PORT $REMOTE_SSH_OPTS -i "$REMOTE_KEY" "$REMOTE_USER@$REMOTE_HOST" \
+             local out
+             # We wrap the SSH execution itself
+             out=$(compat_run_with_timeout "$NETWORK_TIMEOUT" ssh -p $REMOTE_PORT $REMOTE_SSH_OPTS -i "$REMOTE_KEY" "$REMOTE_USER@$REMOTE_HOST" \
                  "$REMOTE_AGENT --action check-job-done --client $CLIENT_NAME \
                  --retention-hourly ${RETAIN_HOURLY:-0}" 2>/dev/null || echo "false")
                  
              echo "$out"
-             if [[ "$out" == *"true"* ]]; then
+             if [ "$out" = *"true"* ]; then
                  exit 0
              else
                  exit 1
@@ -439,21 +522,21 @@ check_is_job_done_cli() {
 ##
 # @brief Check if storage is reachable/writable (CLI Helper).
 check_has_storage_cli() {
-    if [ "$BACKUP_MODE" == "REMOTE" ]; then
+    if [ "$BACKUP_MODE" = "REMOTE" ]; then
          # Remote Check
          if ! test_remote_connection; then
              echo "false"
              exit 1
          fi
          # Ask Agent
-         timeout "$NETWORK_TIMEOUT" ssh -p $REMOTE_PORT $REMOTE_SSH_OPTS -i "$REMOTE_KEY" "$REMOTE_USER@$REMOTE_HOST" \
+         compat_run_with_timeout "$NETWORK_TIMEOUT" ssh -p $REMOTE_PORT $REMOTE_SSH_OPTS -i "$REMOTE_KEY" "$REMOTE_USER@$REMOTE_HOST" \
              "$REMOTE_AGENT --action check-storage --client $CLIENT_NAME" 2>/dev/null
          # Agent prints true/false
          exit 0
     else
          # Local Check
          # Try to touch a file to verify R/W
-         if ! timeout 5 touch "$BACKUP_ROOT/.storage_check" 2>/dev/null; then
+         if ! compat_run_with_timeout 5 touch "$BACKUP_ROOT/.storage_check" 2>/dev/null; then
              echo "false"
              exit 1
          else
@@ -468,55 +551,58 @@ check_has_storage_cli() {
 # @brief Wrapper for rsync with monitoring and logging.
 # @param ... Rsync arguments
 run_monitored_rsync() {
-    local cmd=("$@")
+    # POSIX sh does not support array arguments "$@" combined nicely with appending.
+    # We must treat arguments carefully.
     
-    # Add timeout to handle hangs (5 mins IO timeout)
-    cmd+=("--timeout=300")
-    
-    # Enable progress info for monitoring
-    cmd+=("--info=progress2")
-
     log "INFO" "Starting monitored rsync..."
     
     local last_log_time=0
     local log_interval=${LOG_PROGRESS_INTERVAL:-60}
+    local status_file="/tmp/snapshot_rsync_status.$$"
     
-    # Execute rsync with output piping
-    # We use a file descriptor redirection to capture stdout/stderr while processing it
-    # Note: treating stderr as stdout for simplicity in monitoring, or separate?
-    # Rsync --info=progress2 prints to stdout.
-    
-    {
-        "${cmd[@]}" 2>&1 | while IFS= read -r line; do
-            # Check if line contains progress stats (looks like: " 123,456 10% 1.23MB/s 0:00:05 ...")
-            # or standard output. We log everything to file, but selectively notify.
-            
-            # Simple heuristic: If it looks like a progress line (starts with space/number, contains %)
-            if [[ "$line" =~ [0-9]+% ]]; then
+    # Run rsync, capturing exit code to file
+    # We use a subshell to pipe stdout/stderr to the monitoring loop
+    ("$@" --timeout=300 $RSYNC_PROGRESS_OPTS 2>&1; echo $? > "$status_file") | while IFS= read -r line; do
+            # Check if line contains progress stats
+            if echo "$line" | grep -q "[0-9]%[ ]"; then
                 local now=$(date +%s)
                 if [ $((now - last_log_time)) -ge "$log_interval" ]; then
-                    if [ "$ENABLE_NOTIFICATIONS" = true ]; then
-                        log "INFO" "Rsync Progress: $line"
-                    fi
-                    last_log_time=$now
+                     if [ "${ENABLE_NOTIFICATIONS:-false}" = true ]; then
+                         # Extract percentage for cleaner notification
+                         local pct=$(echo "$line" | grep -o "[0-9]*%" | head -1)
+                         notify "Snapshot Backup" "Backup Progress: ${pct:-Running...}" "low"
+                     fi
+                     last_log_time=$now
                 fi
             else
-                # Log non-progress lines immediately (errors, file lists)
-                # But filter out some noise if needed
-                echo "$line"
+                # Log non-progress lines
+                # Suppress file list updates from console (spam), but keep in logfile (DEBUG).
+                # Explicitly pass errors to ERROR level.
+                # Avoid matching filenames like 'icon-error.png'. 
+                # Look for 'rsync error:', 'rsync:', or specific keywords at start/following spaces.
+                if echo "$line" | grep -qiE "^rsync:|rsync error:|ERROR:|failed:|fatal:|denied"; then
+                    log "ERROR" "$line"
+                else
+                    # File paths (from -v) or other info -> DEBUG
+                    log "DEBUG" "$line"
+                fi
             fi
-        done
-    } >> "$LOGFILE"
+    done
     
-    # Capture exit code of the PIPED process (rsync)
-    # ${PIPESTATUS[0]} is the rsync exit code
-    local rsync_status=${PIPESTATUS[0]} 
-    
-    if [ $rsync_status -ne 0 ] && [ $rsync_status -ne 24 ]; then
-        # 24 is "vanished source files", usually ignorable
-        log "ERROR" "Rsync failed with code $rsync_status"
-        return $rsync_status
+    local rsync_exit=0
+    if [ -f "$status_file" ]; then
+        rsync_exit=$(cat "$status_file")
+        rm -f "$status_file"
+    else
+        rsync_exit=1 # Should not happen
     fi
+    
+    if [ "$rsync_exit" -ne 0 ] && [ "$rsync_exit" -ne 24 ]; then
+        # 24 is "vanished source files", usually ignorable
+        log "ERROR" "Rsync failed with code $rsync_exit"
+        return "$rsync_exit"
+    fi
+    
     return 0
 }
 
@@ -524,9 +610,9 @@ run_monitored_rsync() {
 # @brief Dumps array for config generation.
 dump_config_array() {
     local var_name="$1"
-    local -n arr=$var_name
+    eval "set -- \$$var_name"
     echo "$var_name=("
-    for item in "${arr[@]}"; do
+    for item in "$@"; do
         echo "    \"$item\""
     done
     echo ")"
@@ -637,7 +723,7 @@ do_mount() {
     
     local target_client="${client_override:-$CLIENT_NAME}"
     
-    if [ "$BACKUP_MODE" == "REMOTE" ]; then
+    if [ "$BACKUP_MODE" = "REMOTE" ]; then
         if ! command -v sshfs >/dev/null 2>&1; then
             log "ERROR" "sshfs is required. Please install it."
             notify "Snapshot Mount" "Missing sshfs." "critical"
@@ -749,24 +835,13 @@ calc_time_ago() {
 }
 
 get_disk_usage() {
-    if [ ! -d "$BACKUP_ROOT" ]; then
-        echo "0"
-        return
-    fi
-    # Use -B1 to get bytes, then convert, or keep -BG. -BG is GNU specific? 
-    # Used in rest of script. Assuming GNU df.
-    local usage=$(df -BG "$BACKUP_ROOT" 2>/dev/null | awk 'NR==2 {print $4}' | tr -d 'G')
-    if [ -z "$usage" ]; then
-        echo "0"
-    else
-        echo "$usage"
-    fi
+    df -BG "$BACKUP_ROOT" 2>/dev/null | awk 'NR==2 {print $4}' | tr -d 'G' || echo "0"
 }
 
 is_backup_running() {
     if [ -f "$PIDFILE" ]; then
         local pid=$(cat "$PIDFILE")
-        if [ "$pid" == "$$" ]; then
+        if [ "$pid" = "$$" ]; then
             return 1
         fi
         if kill -0 "$pid" 2>/dev/null; then
@@ -815,13 +890,13 @@ show_status() {
         state_text="RUNNING"
         state_color="\033[1;32m"
     fi
-    echo -e "PROCESS:      ${state_color}● ${state_text}\033[0m"
+    printf "PROCESS:      ${state_color}● ${state_text}\033[0m\n"
     
     # 2. Storage Status
     local storage_desc="UNKNOWN"
     local free_space="-"
     
-    if [ "$BACKUP_MODE" == "LOCAL" ]; then
+    if [ "$BACKUP_MODE" = "LOCAL" ]; then
         if mountpoint -q "$BACKUP_ROOT" 2>/dev/null; then
             storage_desc="MOUNTED ($BACKUP_ROOT)"
             free_space=$(df -h "$BACKUP_ROOT" | awk 'NR==2 {print $4}')
@@ -831,16 +906,16 @@ show_status() {
         else
              storage_desc="NOT FOUND"
         fi
-        echo -e "STORAGE:      ● $storage_desc"
-        echo -e "FREE SPACE:   $free_space"
+        printf "STORAGE:      ● %s\n" "$storage_desc"
+        printf "FREE SPACE:   %s\n" "$free_space"
     else
         # REMOTE MODE
-        echo -e "STORAGE:      ● REMOTE ($REMOTE_USER@$REMOTE_HOST)"
+        printf "STORAGE:      ● REMOTE (%s@%s)\n" "$REMOTE_USER" "$REMOTE_HOST"
         if mountpoint -q "$BACKUP_ROOT" 2>/dev/null; then
              local fs=$(df -h "$BACKUP_ROOT" | awk 'NR==2 {print $4}')
-             echo -e "MOUNT STATUS: MOUNTED ($BACKUP_ROOT) - Free: $fs"
+             printf "MOUNT STATUS: MOUNTED (%s) - Free: %s\n" "$BACKUP_ROOT" "$fs"
         else
-             echo -e "MOUNT STATUS: NOT MOUNTED"
+             printf "MOUNT STATUS: NOT MOUNTED\n"
         fi
         # Remote Free Space comes via Agent Status below
     fi
@@ -852,14 +927,14 @@ show_status() {
         local avg_bytes=$(tail -n 10 "$stats_history" | awk -F',' '{sum+=$2; count++} END {if (count>0) printf "%d", sum/count}')
         if [ -n "$avg_bytes" ] && [ "$avg_bytes" -gt 0 ]; then
              local avg_mb=$(echo "scale=2; $avg_bytes / 1024 / 1024" | bc 2>/dev/null || echo "0")
-             echo -e "AVG NEW DATA: ~${avg_mb} MB (Last 10 runs)"
+             printf "AVG NEW DATA: ~%s MB (Last 10 runs)\n" "$avg_mb"
         fi
     fi
 
     echo ""
     echo "LATEST SNAPSHOTS:"
     
-    if [ "$BACKUP_MODE" == "REMOTE" ]; then
+    if [ "$BACKUP_MODE" = "REMOTE" ]; then
         if mountpoint -q "$BACKUP_ROOT" 2>/dev/null; then
              # Mounted -> Use local logic
              list_local_snapshots
@@ -876,9 +951,9 @@ show_status() {
                  
                  # Check/Warn Version first
                  local ver_check=$(ssh -p $REMOTE_PORT $REMOTE_SSH_OPTS -i "$REMOTE_KEY" "$REMOTE_USER@$REMOTE_HOST" "$REMOTE_AGENT --action version" 2>/dev/null | tail -n 1)
-                 if [[ "$ver_check" != "$SCRIPT_VERSION" ]]; then
+                 if [ "$ver_check" != "$SCRIPT_VERSION" ]; then
                     # Be loose on matching for status, but warn if empty (old agent)
-                    if [ -z "$ver_check" ] || [[ "$ver_check" == *"Unknown"* ]]; then
+                    if [ -z "$ver_check" ] || [ "$ver_check" = *"Unknown"* ]; then
                         echo "WARNING: Remote Agent appears outdated (Pre-v13.7) and does not support status."
                     else
                         echo "WARNING: Remote Agent version ($ver_check) mismatch."
@@ -897,14 +972,16 @@ show_status() {
 list_local_snapshots() {
     printf "%-10s %-22s %-15s\n" "Interval" "Timestamp" "Age"
     local count=0
-    for i in "${INTERVALS[@]}"; do
-        local var="RETAIN_${i^^}"
-        if [ "${!var}" -gt 0 ]; then
+    for i in $INTERVALS; do
+        local upper_i=$(echo "$i" | tr '[:lower:]' '[:upper:]')
+        local var="RETAIN_${upper_i}"
+        eval "val=\${$var}"
+        if [ "$val" -gt 0 ]; then
             local ts_file="$BACKUP_ROOT/$i.0/.backup_timestamp"
             if [ -f "$ts_file" ]; then
                 local ts=$(read_timestamp "$ts_file")
                 printf "%-10s %-22s %-15s\n" "$i.0" "$(head -n 1 "$ts_file")" "$(calc_time_ago "$ts")"
-                ((count++))
+                count=$((count+1))
             else
                 printf "%-10s %-22s %-15s\n" "$i.0" "MISSING" "-"
             fi
@@ -924,14 +1001,60 @@ log_summary() {
 
 ##
 # @brief Loads config and validates settings.
+##
+# @brief Loads config and validates settings.
+# @details Supports reading Bash-style arrays in POSIX sh via sed-parsing.
 load_config() {
     local config_file=$1
-    SOURCE_DIRS=()
-    EXCLUDE_PATTERNS=()
-    EXCLUDE_MOUNTPOINTS=()
+    SOURCE_DIRS=""
+    EXCLUDE_PATTERNS=""
+    EXCLUDE_MOUNTPOINTS=""
     
     if [ -f "$config_file" ]; then
-        source "$config_file"
+        local in_array=false
+        local array_buffer=""
+        local array_var=""
+
+        while IFS= read -r line || [ -n "$line" ]; do
+            # 1. Handling Multi-line Arrays
+            if [ "$in_array" = true ]; then
+                array_buffer="$array_buffer $line"
+                if echo "$line" | grep -q ')'; then
+                    # End of array found
+                    local content=$(echo "$array_buffer" | sed 's/^[^=]*=(//; s/)$//')
+                    eval "$array_var='$content'"
+                    in_array=false
+                    array_buffer=""
+                fi
+                continue
+            fi
+            
+            # Ignore comments/empty lines (only if not inside array)
+            case "$line" in
+                \#*) continue ;;
+                "") continue ;;
+            esac
+
+            # 2. Check for start of Multi-line Array: VAR=( ... without closing )
+            # We match '=(' but NOT ')'
+            if echo "$line" | grep -q '=.*(' && ! echo "$line" | grep -q ')'; then
+                in_array=true
+                array_buffer="$line"
+                array_var=$(echo "$line" | cut -d= -f1)
+                continue
+            fi
+            
+            # 3. Check for Single-line Array: VAR=(...)
+            if echo "$line" | grep -q '=.*(.*)'; then
+                local var_name=$(echo "$line" | cut -d= -f1)
+                local content=$(echo "$line" | sed 's/^[^=]*=(//; s/)$//')
+                eval "$var_name='$content'"
+                continue
+            fi
+            
+            # 4. Standard Assignment
+            eval "$line"
+        done < "$config_file"
     fi
 
     RETAIN_HOURLY=$(sanitize_int "${RETAIN_HOURLY:-0}")
@@ -948,8 +1071,8 @@ load_config() {
     CLIENT_NAME="${CLIENT_NAME:-$(hostname)}"
     REMOTE_PORT="${REMOTE_PORT:-22}"
 
-    if [ ${#SOURCE_DIRS[@]} -eq 0 ]; then
-        SOURCE_DIRS=("/")
+    if [ -z "$SOURCE_DIRS" ]; then
+        SOURCE_DIRS="/"
     fi
 }
 
@@ -988,6 +1111,12 @@ read_timestamp() {
         return
     fi
     local content=$(head -n 1 "$f")
+    # Try direct epoch (numeric only)
+    if echo "$content" | grep -qE "^[0-9]+$"; then
+        echo "$content"
+        return
+    fi
+    # Fallback to date parsing
     date -d "$content" +%s 2>/dev/null || echo "0"
 }
 
@@ -1000,13 +1129,14 @@ is_rotation_needed() {
     local path=$2
     
     if [ ! -f "$path/$TIMESTAMP_FILE" ]; then
-        return 0
+       # Use Epoch for robustness, falling back to ISO if needed (but we prefer Epoch now)
+       return 0
     fi
     
     local ts=$(read_timestamp "$path/$TIMESTAMP_FILE")
     
     # Fix: Only check HOURS if we are actually rotating 'hourly' snapshots
-    if [ "$int" == "hourly" ] && [ "$RETAIN_HOURLY" -gt 0 ]; then
+    if [ "$int" = "hourly" ] && [ "$RETAIN_HOURLY" -gt 0 ]; then
         # Check for changed HOUR string (YYYYMMDDHH)
         if [ "$(date -d "@$ts" +%Y%m%d%H)" != "$(date -d "@$START_TIME" +%Y%m%d%H)" ]; then
             return 0
@@ -1079,8 +1209,9 @@ is_promotion_due() {
 ##
 # @brief Promotion Helpers.
 get_retention() {
-    local var="RETAIN_${1^^}"
-    echo "${!var}"
+    local upper_int=$(echo "$1" | tr '[:lower:]' '[:upper:]')
+    local var="RETAIN_${upper_int}"
+    eval "echo \"\${$var}\""
 }
 
 get_source_interval_for() {
@@ -1122,35 +1253,29 @@ get_min_age_sec() {
 # @details Adapted from snapshot-agent.sh v14
 consolidate_snapshots() {
     local int="$1"
-    local found_indices=()
     
-    # Collect existing indices
-    while IFS= read -r -d $'\0' directory_path; do
-        local index_suffix="${directory_path##*.}"
-        
-        # Check if suffix is a valid integer
-        if [[ "$index_suffix" =~ ^[0-9]+$ ]]; then
-            found_indices+=("$index_suffix")
-        fi
-    done < <(find "$BACKUP_ROOT" -maxdepth 1 -name "$int.*" -type d -print0)
-    
-    if [[ ${#found_indices[@]} -eq 0 ]]; then
-        return
-    fi
-    
-    # Sort indices numerically ascending
-    local sorted_indices
-    IFS=$'\n' sorted_indices=($(sort -n <<<"${found_indices[*]}"))
-    unset IFS
+    # POSIX approach: collect, sort, iterate using pipe.
+    # We rely on filesystem state, so subshell is fine for 'mv'.
     
     local target_index=0
-    for current_index in "${sorted_indices[@]}"; do
-        if [[ "$current_index" -ne "$target_index" ]]; then
+    
+    # We use a temp file or just piped loop.
+    # Note: 'read' without -r might strip backslashes, but indices are numbers.
+    # 'read' behaviour with -d is bash specific? Yes. remove -d.
+    # 'find -print0' is robust but 'read -d' is bash.
+    # Since filenames are $int.INDEX and index is number, newlines are safe.
+    
+    find "$BACKUP_ROOT" -maxdepth 1 -name "$int.*" -type d | \
+    sed "s/^.*${int}\.//" | \
+    grep -E "^[0-9]+$" | \
+    sort -n | \
+    while read current_index; do
+        if [ "$current_index" -ne "$target_index" ]; then
             log "WARN" "Consolidating gap: $int.$current_index -> $int.$target_index"
             mv "$BACKUP_ROOT/$int.$current_index" "$BACKUP_ROOT/$int.$target_index"
         fi
         
-        ((target_index++))
+        target_index=$((target_index+1))
     done
 }
 ##
@@ -1164,13 +1289,18 @@ prune_snapshots() {
     
     # We iterate and delete anything >= limit
     # We use find to be robust against gaps (though consolidate usually fixes gaps)
-    while IFS= read -r -d $'\0' directory_path; do
+    find "$BACKUP_ROOT" -maxdepth 1 -name "$int.*" -type d | while read directory_path; do
         local idx="${directory_path##*.}"
-        if [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -ge "$limit" ]; then
+        # Check if idx is integer
+        case "$idx" in
+             ''|*[!0-9]*) continue ;;
+        esac
+        
+        if [ "$idx" -ge "$limit" ]; then
              log "WARN" "Retention Prune: Deleting $int.$idx (Limit: $limit)"
-             rm -rf "$directory_path"
+             safe_rm "$directory_path"
         fi
-    done < <(find "$BACKUP_ROOT" -maxdepth 1 -name "$int.*" -type d -print0)
+    done
 }
 
 ##
@@ -1181,38 +1311,38 @@ run_waterfall_logic() {
     local promotion_occurred=true
     local loop_count=0
     
+    local promoted_levels=""
+
     # Cascade Promotion (Dynamic) - Recursive Waterfall Strategy
     while [ "$promotion_occurred" = true ]; do
         promotion_occurred=false
         
-        ((loop_count++))
+        loop_count=$((loop_count+1))
         if [ "$loop_count" -gt 10 ]; then
-            log "WARN" "Cascade promotion limit reached (10 loops). Breaking infinite loop."
+            log "WARN" "Cascade promotion limit reached (10 loops). Breaking checks."
             break
         fi
         
         # We iterate INTERVALS (bottom-up: Daily->Weekly->Monthly->Yearly)
-        # Assuming INTERVALS=("hourly" "daily" "weekly" "monthly" "yearly")
-        for level in "${INTERVALS[@]}"; do
-             # Skip if this level is the base interval (source of truth)
-             # In Agent: BASE_BACKUP_INTERVAL. In Client: 'int' passed to local_backup.
-             # We should probably pass the 'base' as arg to this function or detect it.
-             # Detection: "hourly" is usually base if enabled, else "daily".
-             # If we promote FROM daily TO weekly, daily is source.
+        for level in $INTERVALS; do
+             # Optimization: Limit 1 promotion per level per run to prevent "flushing".
+             if echo "$promoted_levels" | grep -q "|$level|"; then
+                 continue
+             fi
              
-             # check_promote needs TARGET.
-             # If level is 'daily', target is 'daily'. check_promote('daily') -> promotes hourly->daily.
-             # So we iterate ALL levels.
+             local upper_level=$(echo "$level" | tr '[:lower:]' '[:upper:]')
+             local force_var="FORCE_${upper_level}"
+             eval "force_val=\${$force_var:-false}"
              
-             local force_var="FORCE_${level^^}"
-             if check_promote "$level" "${!force_var:-false}"; then
+             if check_promote "$level" "$force_val"; then
                   promotion_occurred=true
+                  promoted_levels="$promoted_levels|$level|"
                   
                   # Consolidate Source
                   local src_int=$(get_source_interval_for "$level")
                   if [ "$src_int" != "none" ]; then
                        consolidate_snapshots "$src_int"
-                  fi
+                   fi
              fi
         done
     done
@@ -1253,20 +1383,19 @@ rotate_level() {
     # We iterate from limit down to 0. Anything at limit is deleted.
     # Anything < limit is moved to +1.
     
-    for (( i=limit; i>=0; i-- )); do
+    i=$limit
+    while [ "$i" -ge 0 ]; do
         if [ -d "$BACKUP_ROOT/$int.$i" ]; then
             if [ "$i" -ge "$((limit-1))" ]; then
                 # This snapshot would move to 'limit' (or is already there), which is >= retention count.
                 # So we delete it.
-                # Example: Limit=2. Keep 0, 1.
-                # i=1: 1 -> 2 (Delete 2). So we delete 1 instead of moving? 
-                # Or move 1->2, then delete 2?
-                # Efficient: delete "$int.$i"
-                safe_rm "$BACKUP_ROOT/$int.$i"
+                log "WARN" "Retention Prune: Deleting $int.$i (Limit: $limit)"
+                rm -rf "$BACKUP_ROOT/$int.$i"
             else
                 mv "$BACKUP_ROOT/$int.$i" "$BACKUP_ROOT/$int.$((i+1))"
             fi
         fi
+        i=$((i-1))
     done
 }
 
@@ -1287,28 +1416,28 @@ find_promotion_candidate() {
     
     # We prefer promoting older snapshots first (standard waterfall), 
     # but we will scan ALL available snapshots.
-    local best_idx="-1"
+    # Collect indices via find | sort (Reverse Numeric to iterate Highest->Lowest?
+    # Original logic: i=${#indices[@]}-1 downto 0. Indices sorted 0..N.
+    # So it iterated N..0 (Newest to Oldest?).
+    # Wait, indices are suffixes. 0 is Newest. N is Oldest.
+    # Sorted 0..N means 0, 1, 2...
+    # Reverse iteration: N, N-1 ... 0. (Oldest to Newest).
+    # So we want sort -rn (Reverse Sort).
     
-    # Collect indices
-    local indices=($(find "$BACKUP_ROOT" -maxdepth 1 -name "${src}.*" -type d | sed "s/^.*${src}\.//" | grep -E "^[0-9]+$" | sort -n))
+    local indices=$(find "$BACKUP_ROOT" -maxdepth 1 -name "${src}.*" -type d | \
+                    sed "s/^.*${src}\.//" | \
+                    grep -E "^[0-9]+$" | \
+                    sort -rn)
     
-    # Iterate from Oldest (Highest Index) down to Newest (0)?
-    # Or Newest to Oldest?
-    # If we have daily.0 (Today), daily.1 (Yesterday)...
-    # If daily.1 is eligible (Week changed), we should promote it.
-    # Iterating Oldest to Newest allows us to catch up history first.
-    # Iterate in reverse order of array (indices is sorted 0..N, so reverse it manually or via loop)
+    # We assume 'indices' fits in variable (it's just numbers).
     
-    local i
-    for (( i=${#indices[@]}-1; i>=0; i-- )); do
-        local idx=${indices[$i]}
+    for idx in $indices; do
         local path="$BACKUP_ROOT/$src.$idx"
         local ts=$(read_timestamp "$path/$TIMESTAMP_FILE")
         
         if [ "$ts" -eq 0 ]; then continue; fi
         
         # Idempotency: Check if this Specific Timestamp already exists in Target
-        # (Scanning all targets is expensive, checking latest target is standard)
         local tgt_ts=0
         if [ -f "$BACKUP_ROOT/$tgt.0/$TIMESTAMP_FILE" ]; then
              tgt_ts=$(read_timestamp "$BACKUP_ROOT/$tgt.0/$TIMESTAMP_FILE")
@@ -1319,7 +1448,7 @@ find_promotion_candidate() {
              continue
         fi
         
-        if [ "$(is_promotion_due "$tgt" "$ts")" == "true" ]; then
+        if [ "$(is_promotion_due "$tgt" "$ts")" = "true" ]; then
              echo "$idx"
              return 0
         fi
@@ -1333,14 +1462,14 @@ check_promote() {
     local force=$2
     
     local src=$(get_source_interval_for "$tgt")
-    if [ "$src" == "none" ]; then
-        return 1
+    if [ "$src" = "none" ]; then
+        return
     fi
     
     # CRITICAL FIX: Do not promote if target retention is 0 (Disabled)
     local tgt_retain=$(get_retention "$tgt")
     if [ "$tgt_retain" -le 0 ] && [ "$force" != true ]; then
-         return 1
+         return
     fi
     
     local s_idx="-1"
@@ -1360,8 +1489,8 @@ check_promote() {
         fi
     fi
     
-    if [ "$s_idx" == "-1" ]; then
-        return 1
+    if [ "$s_idx" = "-1" ]; then
+        return
     fi
      
     local src_path="$BACKUP_ROOT/$src.$s_idx"
@@ -1373,13 +1502,13 @@ check_promote() {
         local tgt_ts=$(read_timestamp "$BACKUP_ROOT/$tgt.0/$TIMESTAMP_FILE")
         if [ "$src_ts" -le "$tgt_ts" ] && [ "$src_ts" -gt 0 ]; then
             log "INFO" "Target $tgt.0 is newer or same age ($tgt_ts >= $src_ts). Discarding promotion."
-            return 1
+            return
         fi
     fi
     
     if [ "$promote" = true ]; then
         local t_tmp="$BACKUP_ROOT/$tgt.0.tmp"
-        safe_rm "$t_tmp"
+        rm -rf "$t_tmp"
         
         local src_retain=$(get_retention "$src")
         local method="COPY"
@@ -1389,7 +1518,7 @@ check_promote() {
         local count=$(find "$BACKUP_ROOT" -maxdepth 1 -name "$src.*" -type d | wc -l)
         local oldest=$(find "$BACKUP_ROOT" -maxdepth 1 -name "$src.*" -type d | sed "s/^.*$src\.//" | grep -E "^[0-9]+$" | sort -rn | head -n 1)
 
-        if [ "$force" == "true" ]; then
+        if [ "$force" = "true" ]; then
             method="COPY"
         elif [ "$count" -gt "$src_retain" ] && [ "$s_idx" -eq "$oldest" ]; then
             method="MOVE"
@@ -1399,7 +1528,7 @@ check_promote() {
         
         log "INFO" "Promoting $src.$s_idx -> $tgt.0 via [$method] (Count: $count, Retain: $src_retain)."
         
-        if [ "$method" == "MOVE" ]; then
+        if [ "$method" = "MOVE" ]; then
             mv "$src_path" "$t_tmp"
         else
             cp -al "$src_path" "$t_tmp"
@@ -1458,11 +1587,11 @@ sanitize_integer() { sanitize_int "$@"; }
 
 ## @brief Agent Cleanup Handler
 agent_cleanup() {
-    if [[ -n "${CLIENT_NAME:-}" && -d "$AGENT_LOCK_DIR" ]]; then
+    if [ -n "${CLIENT_NAME:-}" ] && [ -d "$AGENT_LOCK_DIR" ]; then
         local lock_file_path="$AGENT_LOCK_DIR/$CLIENT_NAME.lock"
-        if [[ -f "$lock_file_path" ]]; then
+        if [ -f "$lock_file_path" ]; then
             local lock_pid=$(cat "$lock_file_path" 2>/dev/null)
-            if [[ "$lock_pid" == "$$" ]]; then
+            if [ "$lock_pid" = "$$" ]; then
                 rm -f "$lock_file_path"
             fi
         fi
@@ -1471,36 +1600,44 @@ agent_cleanup() {
 
 ## @brief Loads the Agent configuration file
 load_agent_configuration() {
-    if [[ -f "$AGENT_CONFIG_FILE" ]]; then
-        source "$AGENT_CONFIG_FILE"
+    if [ -f "$AGENT_CONFIG_FILE" ]; then
+        . "$AGENT_CONFIG_FILE"
         log "INFO" "Agent configuration loaded from $AGENT_CONFIG_FILE."
         
         # Map config variables (RETAIN_*) to internal variables (RETENTION_*)
-        if [[ -n "${RETAIN_HOURLY:-}" ]]; then RETENTION_HOURLY="$RETAIN_HOURLY"; fi
-        if [[ -n "${RETAIN_DAILY:-}" ]]; then RETENTION_DAILY="$RETAIN_DAILY"; fi
-        if [[ -n "${RETAIN_WEEKLY:-}" ]]; then RETENTION_WEEKLY="$RETAIN_WEEKLY"; fi
-        if [[ -n "${RETAIN_MONTHLY:-}" ]]; then RETENTION_MONTHLY="$RETAIN_MONTHLY"; fi
-        if [[ -n "${RETAIN_YEARLY:-}" ]]; then RETENTION_YEARLY="$RETAIN_YEARLY"; fi
+        if [ -n "${RETAIN_HOURLY:-}" ]; then RETENTION_HOURLY="$RETAIN_HOURLY"; fi
+        if [ -n "${RETAIN_DAILY:-}" ]; then RETENTION_DAILY="$RETAIN_DAILY"; fi
+        if [ -n "${RETAIN_WEEKLY:-}" ]; then RETENTION_WEEKLY="$RETAIN_WEEKLY"; fi
+        if [ -n "${RETAIN_MONTHLY:-}" ]; then RETENTION_MONTHLY="$RETAIN_MONTHLY"; fi
+        if [ -n "${RETAIN_YEARLY:-}" ]; then RETENTION_YEARLY="$RETAIN_YEARLY"; fi
         
-        if [[ -n "${SMART_PURGE_LIMIT:-}" ]]; then SMART_PURGE_LIMIT_GB="$SMART_PURGE_LIMIT"; fi
-        if [[ -n "${SMART_PURGE_SLOTS:-}" ]]; then SMART_PURGE_SLOTS_REDUCTION="$SMART_PURGE_SLOTS"; fi
+        if [ -n "${SMART_PURGE_LIMIT:-}" ]; then SMART_PURGE_LIMIT_GB="$SMART_PURGE_LIMIT"; fi
+        if [ -n "${SMART_PURGE_SLOTS:-}" ]; then SMART_PURGE_SLOTS_REDUCTION="$SMART_PURGE_SLOTS"; fi
     fi
     
     # Backwards compatibility
-    if [[ -n "${BASE_STORAGE:-}" ]]; then BASE_STORAGE_PATH="$BASE_STORAGE"; fi
-    if [[ -n "${LOCK_DIR:-}" ]]; then AGENT_LOCK_DIR="$LOCK_DIR"; fi
+    if [ -n "${BASE_STORAGE:-}" ]; then BASE_STORAGE_PATH="$BASE_STORAGE"; fi
+    if [ -n "${LOCK_DIR:-}" ]; then AGENT_LOCK_DIR="$LOCK_DIR"; fi
 }
 
 ## @brief Validates the client name for security
 validate_client_name() {
     local name_to_validate="$1"
-    if [[ -z "$name_to_validate" ]]; then die "No client name provided."; fi
-    if [[ ! "$name_to_validate" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+    if [ -z "$name_to_validate" ]; then die "No client name provided."; fi
+    
+    # Check for invalid characters (anything NOT a-z, A-Z, 0-9, ., _, -)
+    # Using case with "inverse" match is hard in sh.
+    # Using grep is standard.
+    if echo "$name_to_validate" | grep -q "[^a-zA-Z0-9._-]"; then
         die "Invalid client name: '$name_to_validate'. Allowed: A-Z, 0-9, '.', '_', '-'"
     fi
-    if [[ "$name_to_validate" == *".."* ]] || [[ "$name_to_validate" == *"/"* ]] || [[ "$name_to_validate" == *"\\"* ]]; then
-        die "Security Error: Path traversal detected in '$name_to_validate'."
-    fi
+    
+    # Security Checks
+    case "$name_to_validate" in
+        *".."*|*"/"*|*"\\"*)
+             die "Security Error: Path traversal detected in '$name_to_validate'."
+             ;;
+    esac
 }
 
 ## @brief Prepares the environment for a new transfer
@@ -1508,7 +1645,7 @@ do_prepare() {
     local lock_file_path="$AGENT_LOCK_DIR/$CLIENT_NAME.lock"
     local stale_reset=false
     
-    if [[ -f "$lock_file_path" ]]; then
+    if [ -f "$lock_file_path" ]; then
         local pid_in_lock=$(cat "$lock_file_path" 2>/dev/null)
         if kill -0 "$pid_in_lock" 2>/dev/null; then
             die "Process is already locked by PID $pid_in_lock."
@@ -1532,15 +1669,15 @@ do_prepare() {
 
     # Determine Base Interval (Agent uses function, Client uses var)
     # We use Client logic or Agent function? Agent function `detect_base_interval` logic:
-    if [[ "$RETENTION_HOURLY" -gt 0 ]]; then 
+    if [ "$RETENTION_HOURLY" -gt 0 ]; then 
         BASE_BACKUP_INTERVAL="hourly"
-    elif [[ "$RETENTION_DAILY" -gt 0 ]]; then 
+    elif [ "$RETENTION_DAILY" -gt 0 ]; then 
         BASE_BACKUP_INTERVAL="daily"
-    elif [[ "$RETENTION_WEEKLY" -gt 0 ]]; then 
+    elif [ "$RETENTION_WEEKLY" -gt 0 ]; then 
         BASE_BACKUP_INTERVAL="weekly"
-    elif [[ "$RETENTION_MONTHLY" -gt 0 ]]; then 
+    elif [ "$RETENTION_MONTHLY" -gt 0 ]; then 
         BASE_BACKUP_INTERVAL="monthly"
-    elif [[ "$RETENTION_YEARLY" -gt 0 ]]; then 
+    elif [ "$RETENTION_YEARLY" -gt 0 ]; then 
         BASE_BACKUP_INTERVAL="yearly"
     else 
         BASE_BACKUP_INTERVAL="daily"
@@ -1549,24 +1686,24 @@ do_prepare() {
     local temporary_work_dir="$CLIENT_ROOT_PATH/$BASE_BACKUP_INTERVAL.0.tmp"
     
     # Check for stale temporary directory (>24h)
-    if [[ -d "$temporary_work_dir" ]]; then
+    if [ -d "$temporary_work_dir" ]; then
         local tmp_mtime=$(stat -c %Y "$temporary_work_dir" 2>/dev/null || echo "0")
         local now_time=$(date +%s)
-        if (( now_time - tmp_mtime > 86400 )); then
+        if [ $((now_time - tmp_mtime)) -gt 86400 ]; then
             log "WARN" "Stale temporary directory detected (>24h). Resetting."
             safe_rm "$temporary_work_dir"
         fi
     fi
 
-    if [[ "$stale_reset" == true ]] && [[ -d "$temporary_work_dir" ]]; then 
-        safe_rm "$temporary_work_dir"
+    if [ "$stale_reset" = true ] && [ -d "$temporary_work_dir" ]; then 
+        rm -rf "$temporary_work_dir"
     fi
     
-    if [[ ! -d "$temporary_work_dir" ]]; then
+    if [ ! -d "$temporary_work_dir" ]; then
         mkdir -p "$temporary_work_dir"
         chmod 700 "$temporary_work_dir"
         local current_zero_dir="$CLIENT_ROOT_PATH/$BASE_BACKUP_INTERVAL.0"
-        if [[ -d "$current_zero_dir" ]]; then
+        if [ -d "$current_zero_dir" ]; then
             log "INFO" "Preparation: Creating incremental base via hardlinks."
             cp -al "$current_zero_dir/." "$temporary_work_dir/" 2>/dev/null || true
         fi
@@ -1585,12 +1722,12 @@ do_prepare() {
 do_commit() {
     # Re-establish context if called separately
     CLIENT_ROOT_PATH="$BASE_STORAGE_PATH/$CLIENT_NAME"
-    if [[ "$RETENTION_HOURLY" -gt 0 ]]; then BASE_BACKUP_INTERVAL="hourly"
-    elif [[ "$RETENTION_DAILY" -gt 0 ]]; then BASE_BACKUP_INTERVAL="daily"
+    if [ "$RETENTION_HOURLY" -gt 0 ]; then BASE_BACKUP_INTERVAL="hourly"
+    elif [ "$RETENTION_DAILY" -gt 0 ]; then BASE_BACKUP_INTERVAL="daily"
     else BASE_BACKUP_INTERVAL="daily"; fi
 
     local temporary_work_dir="$CLIENT_ROOT_PATH/$BASE_BACKUP_INTERVAL.0.tmp"
-    if [[ ! -d "$temporary_work_dir" ]]; then 
+    if [ ! -d "$temporary_work_dir" ]; then 
         die "Temporary directory not found."
     fi
     
@@ -1599,16 +1736,16 @@ do_commit() {
     local current_zero_dir="$CLIENT_ROOT_PATH/$BASE_BACKUP_INTERVAL.0"
     local do_rotate=true
     
-    if [[ -d "$current_zero_dir" ]]; then
+    if [ -d "$current_zero_dir" ]; then
         local last_recorded_timestamp=$(read_timestamp "$current_zero_dir/$TIMESTAMP_FILE")
         local format_string="%Y%m%d"
-        if [[ "$BASE_BACKUP_INTERVAL" == "hourly" ]]; then 
+        if [ "$BASE_BACKUP_INTERVAL" = "hourly" ]; then 
             format_string="%Y%m%d%H"
         fi
         
         local old_val=$(date -d "@$last_recorded_timestamp" +"$format_string")
         local cur_val=$(date +"$format_string")
-        if [[ "$old_val" == "$cur_val" ]]; then 
+        if [ "$old_val" = "$cur_val" ]; then 
             do_rotate=false
         fi
     fi
@@ -1619,7 +1756,7 @@ do_commit() {
     # We must set BACKUP_ROOT="$CLIENT_ROOT_PATH" for shared functions to work!
     BACKUP_ROOT="$CLIENT_ROOT_PATH"
 
-    if [[ "$do_rotate" == true ]]; then
+    if [ "$do_rotate" = true ]; then
         log "INFO" "Interval changed. Initiating rotation."
         # Use Client's functions (shift_snapshots -> rotate_level?)
         # Agent used shift_snapshots. Client uses rotate_level.
@@ -1632,14 +1769,15 @@ do_commit() {
         # Agent strategy: Shift now, Enforce Retention Later (do_purge).
     else
          log "INFO" "In-Place Update: Overwriting $BASE_BACKUP_INTERVAL.0."
-         if [[ -d "$current_zero_dir" ]]; then rm -rf "${current_zero_dir:?}"; fi
+         if [ -d "$current_zero_dir" ]; then safe_rm "$current_zero_dir"; fi
     fi
     
     mv "$temporary_work_dir" "$current_zero_dir"
     chmod 700 "$current_zero_dir"
-    date '+%Y-%m-%d %H:%M:%S %z' > "$current_zero_dir/$TIMESTAMP_FILE"
+    # Use Epoch for robustness
+    date +%s > "$current_zero_dir/$TIMESTAMP_FILE"
     
-    if [[ "$do_rotate" == true ]]; then touch "$CLIENT_ROOT_PATH/.rotation_occurred"
+    if [ "$do_rotate" = true ]; then touch "$CLIENT_ROOT_PATH/.rotation_occurred"
     else rm -f "$CLIENT_ROOT_PATH/.rotation_occurred"; fi
     
     log "INFO" "Snapshot successfully committed."
@@ -1650,15 +1788,18 @@ do_purge() {
     CLIENT_ROOT_PATH="$BASE_STORAGE_PATH/$CLIENT_NAME"
     BACKUP_ROOT="$CLIENT_ROOT_PATH" # Enable shared functions
     
-    if [[ "$SMART_PURGE_LIMIT_GB" -gt 0 ]]; then
+    if [ "$SMART_PURGE_LIMIT_GB" -gt 0 ]; then
         local avail_kb=$(df -P "$CLIENT_ROOT_PATH" | awk 'NR==2 {print $4}')
         local avail_gb=$((avail_kb / 1024 / 1024))
-        if [[ "$avail_gb" -lt "$SMART_PURGE_LIMIT_GB" ]]; then
+        if [ "$avail_gb" -lt "$SMART_PURGE_LIMIT_GB" ]; then
             log "WARN" "Smart purge triggered: Low storage ($avail_gb GB)."
             local new_daily=$((RETENTION_DAILY - SMART_PURGE_SLOTS_REDUCTION))
-            RETENTION_DAILY=$((new_daily > 1 ? new_daily : 1))
+            if [ "$new_daily" -lt 1 ]; then new_daily=1; fi
+            RETENTION_DAILY=$new_daily
+            
             local new_weekly=$((RETENTION_WEEKLY - SMART_PURGE_SLOTS_REDUCTION))
-            RETENTION_WEEKLY=$((new_weekly > 1 ? new_weekly : 1))
+            if [ "$new_weekly" -lt 1 ]; then new_weekly=1; fi
+            RETENTION_WEEKLY=$new_weekly
         fi
     fi
     
@@ -1684,15 +1825,15 @@ do_purge() {
 do_check_job_done() {
     CLIENT_ROOT_PATH="$BASE_STORAGE_PATH/$CLIENT_NAME"
     # Determine shortest enabled interval (same logic as prepare/Client)
-    if [[ "$RETENTION_HOURLY" -gt 0 ]]; then 
+    if [ "$RETENTION_HOURLY" -gt 0 ]; then 
         BASE_BACKUP_INTERVAL="hourly"
-    elif [[ "$RETENTION_DAILY" -gt 0 ]]; then 
+    elif [ "$RETENTION_DAILY" -gt 0 ]; then 
         BASE_BACKUP_INTERVAL="daily"
-    elif [[ "$RETENTION_WEEKLY" -gt 0 ]]; then 
+    elif [ "$RETENTION_WEEKLY" -gt 0 ]; then 
         BASE_BACKUP_INTERVAL="weekly"
-    elif [[ "$RETENTION_MONTHLY" -gt 0 ]]; then 
+    elif [ "$RETENTION_MONTHLY" -gt 0 ]; then 
         BASE_BACKUP_INTERVAL="monthly"
-    elif [[ "$RETENTION_YEARLY" -gt 0 ]]; then 
+    elif [ "$RETENTION_YEARLY" -gt 0 ]; then 
         BASE_BACKUP_INTERVAL="yearly"
     else 
         BASE_BACKUP_INTERVAL="daily"
@@ -1717,16 +1858,16 @@ do_status() {
     echo "Remote Free Space: ${free_space:-Unknown}"
     
     for tier in "hourly" "daily" "weekly" "monthly" "yearly"; do
-        while IFS= read -r -d $'\0' dir; do
+        find "$CLIENT_ROOT_PATH" -maxdepth 1 -name "$tier.*" -type d ! -name "*.tmp" | sort | while read dir; do
              local ts="No timestamp"
-             if [[ -f "$dir/$TIMESTAMP_FILE" ]]; then ts=$(head -n 1 "$dir/$TIMESTAMP_FILE"); fi
+             if [ -f "$dir/$TIMESTAMP_FILE" ]; then ts=$(head -n 1 "$dir/$TIMESTAMP_FILE"); fi
              printf "  %-12s | %s\n" "$(basename "$dir")" "$ts"
-        done < <(find "$CLIENT_ROOT_PATH" -maxdepth 1 -name "$tier.*" -type d -not -name "*.tmp" -print0 | sort -zV)
+        done
     done
-    if [[ -d "$CLIENT_ROOT_PATH/daily.0.tmp" ]]; then
+    if [ -d "$CLIENT_ROOT_PATH/daily.0.tmp" ]; then
         local msg=" (Interrupted - Resumable)"
         local lock_file="$AGENT_LOCK_DIR/$CLIENT_NAME.lock"
-        if [[ -f "$lock_file" ]]; then
+        if [ -f "$lock_file" ]; then
              local pid=$(cat "$lock_file" 2>/dev/null)
              if kill -0 "$pid" 2>/dev/null; then
                  msg=" (In Progress - PID $pid)"
@@ -1741,9 +1882,9 @@ do_status() {
 ## @brief Verify Storage
 do_check_storage() {
     local check_path="$BASE_STORAGE_PATH"
-    if [[ -n "$CLIENT_NAME" ]]; then check_path="$BASE_STORAGE_PATH/$CLIENT_NAME"; fi
-    if [[ ! -d "$check_path" ]]; then mkdir -p "$check_path" 2>/dev/null; fi
-    if [[ -d "$check_path" && -w "$check_path" ]]; then 
+    if [ -n "$CLIENT_NAME" ]; then check_path="$BASE_STORAGE_PATH/$CLIENT_NAME"; fi
+    if [ ! -d "$check_path" ]; then mkdir -p "$check_path" 2>/dev/null; fi
+    if [ -d "$check_path" ] && [ -w "$check_path" ]; then 
         echo "true"
     else 
         echo "false"
@@ -1755,7 +1896,7 @@ do_check_storage() {
 do_install() {
     local target_user="${1:-backup}"
     local wrapper_path="${WRAPPER_PATH:-/usr/local/bin/snapshot-wrapper.sh}"
-    if [[ "$(id -u)" -ne 0 ]]; then 
+    if [ "$(id -u)" -ne 0 ]; then 
         die "Installation requires root."
     fi
     
@@ -1844,15 +1985,18 @@ perform_remote_backup() {
     ssh -p $REMOTE_PORT $REMOTE_SSH_OPTS -i "$REMOTE_KEY" "$REMOTE_USER@$REMOTE_HOST" "$REMOTE_AGENT --action prepare --client $CLIENT_NAME $config_opts" || exit 1
 
     TEMP_EXCLUDE_FILE=$(mktemp)
-    for p in "${EXCLUDE_PATTERNS[@]}"; do
+    eval "set -- $EXCLUDE_PATTERNS"
+    for p in "$@"; do
         echo "$p" >> "$TEMP_EXCLUDE_FILE"
     done
     
     local target_path="$REMOTE_STORAGE_ROOT/$CLIENT_NAME/$BASE_INTERVAL.0.tmp"
-    local rsync_opts="-avzAXH --numeric-ids --delete --partial --stats -x ${RSYNC_EXTRA_OPTS:-}"
+    # Use dynamic ACL/Xattr options
+    local rsync_opts="-avzH $RSYNC_ACL_OPT $RSYNC_XATTR_OPT --numeric-ids --delete --partial --stats -x ${RSYNC_EXTRA_OPTS:-}"
     local verify_status=0
 
-    for src in "${SOURCE_DIRS[@]}"; do
+    eval "set -- $SOURCE_DIRS"
+    for src in "$@"; do
         if [ ! -e "$src" ]; then continue; fi
         if ! run_monitored_rsync rsync $rsync_opts -R -e "ssh -p $REMOTE_PORT $REMOTE_SSH_OPTS -i $REMOTE_KEY" --exclude-from="$TEMP_EXCLUDE_FILE" "$src" "$REMOTE_USER@$REMOTE_HOST:$target_path/"; then
             verify_status=1
@@ -1860,7 +2004,8 @@ perform_remote_backup() {
     done
     
     # Ensure Mountpoints exist (empty) for Restore
-    for mp in "${EXCLUDE_MOUNTPOINTS[@]}"; do
+    eval "set -- $EXCLUDE_MOUNTPOINTS"
+    for mp in "$@"; do
         local rel_mp="${mp#/}"
         if [ -n "$rel_mp" ]; then
              ssh -p $REMOTE_PORT $REMOTE_SSH_OPTS -i "$REMOTE_KEY" "$REMOTE_USER@$REMOTE_HOST" "mkdir -p \"$target_path/$rel_mp\"" 2>/dev/null || true
@@ -1869,11 +2014,12 @@ perform_remote_backup() {
 
     if [ "$FORCE_VERIFY" = true ]; then
         if [ "$verify_status" -eq 0 ]; then
-             log "INFO" "\e[1;32m[VERIFY] Integrity Check: OK\e[0m"
+             log "INFO" "\033[1;32m[VERIFY] Integrity Check: OK\033[0m"
              mkdir -p "$(dirname "$LAST_VERIFY_FILE")"
              date +%s > "$LAST_VERIFY_FILE"
         else
-             log "ERROR" "\e[1;31m[VERIFY] Integrity Check: FAILED\e[0m"
+             log "ERROR" "\033[1;31m[VERIFY] Integrity Check: FAILED\033[0m"
+             exit 1
         fi
     fi
 
@@ -1909,7 +2055,7 @@ perform_local_backup() {
     # 1. Prepare Temporary Target
     if [ -d "$target" ]; then
         if [ -d "$target_tmp" ]; then
-            rm -rf "$target_tmp"
+            safe_rm "$target_tmp"
         fi
         cp -al "$target" "$target_tmp"
     else
@@ -1919,17 +2065,20 @@ perform_local_backup() {
     
     # 2. Rsync Transfer
     TEMP_EXCLUDE_FILE=$(mktemp)
-    for p in "${EXCLUDE_PATTERNS[@]}"; do
+    eval "set -- $EXCLUDE_PATTERNS"
+    for p in "$@"; do
         echo "$p" >> "$TEMP_EXCLUDE_FILE"
     done
     
-    local rsync_opts="-aAXH --delete --numeric-ids -x --stats"
+    # Dynamic options based on capabilities
+    local rsync_opts="-aH $RSYNC_ACL_OPT $RSYNC_XATTR_OPT --delete --numeric-ids -x --stats"
     local verify_status=0
     if [ -n "${RSYNC_EXTRA_OPTS:-}" ]; then
         rsync_opts="$rsync_opts $RSYNC_EXTRA_OPTS"
     fi
     
-    for src in "${SOURCE_DIRS[@]}"; do
+    eval "set -- $SOURCE_DIRS"
+    for src in "$@"; do
         local rel_path="${src#/}"
         mkdir -p "$target_tmp/$rel_path"
         if ! run_monitored_rsync rsync $rsync_opts --exclude-from="$TEMP_EXCLUDE_FILE" "$src/" "$target_tmp/$rel_path/"; then
@@ -1939,7 +2088,8 @@ perform_local_backup() {
     rm -f "$TEMP_EXCLUDE_FILE"
     
     # Ensure Mountpoints exist (empty) for Restore
-    for mp in "${EXCLUDE_MOUNTPOINTS[@]}"; do
+    eval "set -- $EXCLUDE_MOUNTPOINTS"
+    for mp in "$@"; do
         local rel_mp="${mp#/}"
         if [ -n "$rel_mp" ]; then
              mkdir -p "$target_tmp/$rel_mp" 2>/dev/null || true
@@ -1948,11 +2098,12 @@ perform_local_backup() {
     
     if [ "$FORCE_VERIFY" = true ]; then
         if [ "$verify_status" -eq 0 ]; then
-             log "INFO" "\e[1;32m[VERIFY] Integrity Check: OK\e[0m"
+             log "INFO" "\033[1;32m[VERIFY] Integrity Check: OK\033[0m"
              mkdir -p "$(dirname "$LAST_VERIFY_FILE")"
              date +%s > "$LAST_VERIFY_FILE"
         else
-             log "ERROR" "\e[1;31m[VERIFY] Integrity Check: FAILED\e[0m"
+             log "ERROR" "\033[1;31m[VERIFY] Integrity Check: FAILED\033[0m"
+             exit 1
         fi
     fi
     
@@ -1968,12 +2119,13 @@ perform_local_backup() {
         rotate_level "$int" $(get_retention "$int")
     else
         log "INFO" "In-Place Update (No Rotation)."
-        safe_rm "$target"
+        rm -rf "$target"
     fi
     
     mv "$target_tmp" "$target"
     chmod 700 "$target"
-    date '+%Y-%m-%d %H:%M:%S %z' > "$target/$TIMESTAMP_FILE"
+    # Use Epoch for robustness
+    date +%s > "$target/$TIMESTAMP_FILE"
     
     check_smart_purge
     
@@ -2059,13 +2211,26 @@ do_deploy_agent() {
     
     log "INFO" "Deploying Unified Agent to $target..."
     
-    # 1. Copy Self -> snapshot-agent.sh (temp name locally?)
-    # We scp "$0" directly to destination temp path then move?
+    # 1. Copy Self -> snapshot-agent.sh
+    # Robustly identify source script path, stripping any appended arguments if $0 is corrupted
+    local self_path="$0"
+    # If $0 contains spaces, it might be corrupted (though valid paths can have spaces, script name usually doesn't here)
+    # Better: Use readlink or assumed path if $0 fails.
+    if [ ! -f "$self_path" ]; then
+        # Try to resolve relative to pwd
+        self_path="./$(basename "$0")"
+        if [ ! -f "$self_path" ]; then
+            # Last resort: assume standard name in current dir
+            self_path="./snapshot-backup.sh"
+        fi
+    fi
+    
     local remote_tmp="/tmp/snapshot-agent-upload.$$"
     local remote_dest="/usr/local/sbin/snapshot-agent.sh"
     
-    if ! scp -P $REMOTE_PORT -i "$REMOTE_KEY" $REMOTE_SSH_OPTS "$0" "$target:$remote_dest"; then
-        die "SCP failed. Ensure you have SSH access and write permissions to $remote_dest (or use root)."
+    log "INFO" "Uploading $self_path to $target:$remote_dest..."
+    if ! scp -P $REMOTE_PORT -i "$REMOTE_KEY" $REMOTE_SSH_OPTS "$self_path" "$target:$remote_dest"; then
+        die "SCP failed. Ensure you have SSH access and write permissions."
     fi
     
     # 2. Set Permissions
@@ -2102,12 +2267,11 @@ show_agent_help() {
 
 ## @brief Agent Main Entry Point
 agent_main() {
-    load_agent_configuration
     
     local action=""
     local install_target_user=""
     
-    while [[ $# -gt 0 ]]; do
+    while [ $# -gt 0 ]; do
         case $1 in
             --action) action="$2"; shift 2 ;;
             --client) CLIENT_NAME="$2"; validate_client_name "$CLIENT_NAME"; shift 2 ;;
@@ -2127,29 +2291,35 @@ agent_main() {
             *) shift ;;
         esac
     done
+
+    # Load configuration AFTER setting CLIENT_NAME to ensure correct logfile
+    load_agent_configuration
     
     # Sync Configuration: ensure RETAIN_* (from args) overrides RETENTION_* (from config/default)
-    if [[ -n "${RETAIN_HOURLY:-}" ]]; then RETENTION_HOURLY="$RETAIN_HOURLY"; fi
-    if [[ -n "${RETAIN_DAILY:-}" ]]; then RETENTION_DAILY="$RETAIN_DAILY"; fi
-    if [[ -n "${RETAIN_WEEKLY:-}" ]]; then RETENTION_WEEKLY="$RETAIN_WEEKLY"; fi
-    if [[ -n "${RETAIN_MONTHLY:-}" ]]; then RETENTION_MONTHLY="$RETAIN_MONTHLY"; fi
-    if [[ -n "${RETAIN_YEARLY:-}" ]]; then RETENTION_YEARLY="$RETAIN_YEARLY"; fi
+    if [ -n "${RETAIN_HOURLY:-}" ]; then RETENTION_HOURLY="$RETAIN_HOURLY"; fi
+    if [ -n "${RETAIN_DAILY:-}" ]; then RETENTION_DAILY="$RETAIN_DAILY"; fi
+    if [ -n "${RETAIN_WEEKLY:-}" ]; then RETENTION_WEEKLY="$RETAIN_WEEKLY"; fi
+    if [ -n "${RETAIN_MONTHLY:-}" ]; then RETENTION_MONTHLY="$RETAIN_MONTHLY"; fi
+    if [ -n "${RETAIN_YEARLY:-}" ]; then RETENTION_YEARLY="$RETAIN_YEARLY"; fi
     
     # Critical: Update BASE_STORAGE_PATH if config file overrode BASE_STORAGE
-    if [[ -n "${BASE_STORAGE:-}" ]]; then BASE_STORAGE_PATH="$BASE_STORAGE"; fi
-    if [[ -n "${LOCK_DIR:-}" ]]; then AGENT_LOCK_DIR="$LOCK_DIR"; fi
+    if [ -n "${BASE_STORAGE:-}" ]; then BASE_STORAGE_PATH="$BASE_STORAGE"; fi
+    if [ -n "${LOCK_DIR:-}" ]; then AGENT_LOCK_DIR="$LOCK_DIR"; fi
     
-    # Update Logging for Concurrency (User Request)
-    if [[ -n "$CLIENT_NAME" ]]; then
-        LOGTAG="snapshot-backup-$CLIENT_NAME"
-        
-        # If LOGFILE is default, append client name. 
-        # If user manually set LOGFILE in config, we might overwrite it or append?
-        # Safe approach: If default LOGFILE is used OR if we want to enforce separation:
-        # We assume agent-system-log usually means the default log file.
-        # Let's direct it to a client-specific file in the same dir.
-        local log_dir=$(dirname "$LOGFILE")
-        LOGFILE="$log_dir/snapshot-backup-$CLIENT_NAME.log"
+    # Feature: Log Segregation & Tagging (Agent Mode)
+    if [ -n "$CLIENT_NAME" ]; then
+         # 1. Update Syslog Tag for filtering (journal -t snapshot-backup-CLIENT)
+         LOGTAG="${LOGTAG}-${CLIENT_NAME}"
+         
+         # 2. Redirect Logfile if using default (Segregate file logs)
+         # Relaxed check: Matches any path ending in snapshot-backup.log (good for tests/custom paths)
+         case "$LOGFILE" in
+             */snapshot-backup.log)
+                 # Strip .log suffix and append -CLIENT.log
+                 # Using sed for POSIX safety vs bash substitution if unsure, but ${var%.log} is POSIX.
+                 LOGFILE="${LOGFILE%.log}-${CLIENT_NAME}.log"
+                 ;;
+         esac
     fi
     
     case "$action" in
@@ -2194,17 +2364,29 @@ client_main() {
     fi
     
     # 1. Pre-scan for config file to ensure it's loaded BEFORE other args (Precedence Fix)
-    local argv=("$@")
-    for ((i=0; i<${#argv[@]}; i++)); do
-        if [[ "${argv[i]}" == "-c" ]] || [[ "${argv[i]}" == "--config" ]]; then
-            # Ensure next arg exists
-            if [ $((i+1)) -lt ${#argv[@]} ]; then
-                 CONFIG_FILE="${argv[i+1]}"
-            fi
+    # 1. Pre-scan for config file to ensure it's loaded BEFORE other args (Precedence Fix)
+    # POSIX approach: Iterate over "$@" manually
+    local next_is_conf=false
+    for arg in "$@"; do
+        if [ "$next_is_conf" = true ]; then
+            CONFIG_FILE="$arg"
+            next_is_conf=false
+            continue
+        fi
+        if [ "$arg" = "-c" ] || [ "$arg" = "--config" ]; then
+            next_is_conf=true
+        fi
+        if [ "$arg" = "--debug" ]; then
+            DEBUG_MODE="true"
         fi
     done
     
     load_config "$CONFIG_FILE"
+    
+    # Re-apply CLI debug override if set (config might override it otherwise)
+    for arg in "$@"; do
+        if [ "$arg" = "--debug" ]; then DEBUG_MODE="true"; fi
+    done
     
     local do_is_running=false
     local do_is_job_done=false
@@ -2225,7 +2407,7 @@ client_main() {
     
 
     
-    while [[ $# -gt 0 ]]; do
+    while [ $# -gt 0 ]; do
         case $1 in
             --show-config) show_conf=true; shift ;;
             --version) echo "Snapshot Backup Client v$SCRIPT_VERSION"; exit 0 ;;
@@ -2242,11 +2424,11 @@ client_main() {
             -y|--force-yearly) FORCE_YEARLY=true; shift ;;
             -k|--kill) do_kill=true; shift ;;
             -s|--service) explicit_service=true; shift ;;
-            --mount) do_mount_cmd=true; mount_path="${2:-}"; if [[ "$mount_path" == -* ]]; then mount_path=""; else shift; fi; shift ;;
-            --umount) do_umount_cmd=true; mount_path="${2:-}"; if [[ "$mount_path" == -* ]]; then mount_path=""; else shift; fi; shift ;;
+            --mount) do_mount_cmd=true; mount_path="${2:-}"; if [ "$mount_path" = -* ]; then mount_path=""; else shift; fi; shift ;;
+            --umount) do_umount_cmd=true; mount_path="${2:-}"; if [ "$mount_path" = -* ]; then mount_path=""; else shift; fi; shift ;;
             --client) mount_client="$2"; shift 2 ;;
-            --deploy-agent) do_deploy_cmd=true; deploy_target="${2:-}"; if [[ "$deploy_target" == -* || -z "$deploy_target" ]]; then deploy_target=""; else shift; fi; shift ;;
-            --install) do_install_cmd=true; install_user="${2:-}"; if [[ "$install_user" == -* || -z "$install_user" ]]; then install_user=""; else shift; fi; shift ;;
+            --deploy-agent) do_deploy_cmd=true; deploy_target="${2:-}"; if [ -z "$deploy_target" ] || [ "${deploy_target#-}" != "$deploy_target" ]; then deploy_target=""; else shift; fi; shift ;;
+            --install) do_install_cmd=true; install_user="${2:-}"; if [ -z "$install_user" ] || [ "${install_user#-}" != "$install_user" ]; then install_user=""; else shift; fi; shift ;;
             -h|--help) show_help ;;
             *) echo "Unknown option: $1"; exit 1 ;;
         esac
@@ -2286,6 +2468,7 @@ client_main() {
         exit 0
     fi
     
+    check_rsync_capabilities
     acquire_lock
 
     if [ "$FORCE_VERIFY" = true ]; then
@@ -2316,7 +2499,7 @@ client_main() {
     # Determine Base Interval (Local Only)
     BASE_INTERVAL="daily"
     # Iterate INTERVALS to find lowest enabled
-    for i in "${INTERVALS[@]}"; do
+    for i in $INTERVALS; do
         if [ "$(get_retention "$i")" -gt 0 ]; then
             BASE_INTERVAL="$i"
             break
@@ -2324,7 +2507,7 @@ client_main() {
     done
     [ -z "$BASE_INTERVAL" ] && BASE_INTERVAL="daily"
 
-    if [ "$BACKUP_MODE" == "REMOTE" ]; then
+    if [ "$BACKUP_MODE" = "REMOTE" ]; then
         # Remote currently supports 'daily' as base only. (Historical comment, now actually 'hourly' supported in logic)
         log "INFO" "Starting Dynamic Remote Backup..."
         
@@ -2340,14 +2523,19 @@ client_main() {
 
 main() {
     # Check for Agent Mode Trigger
-    if [[ "${1:-}" == "--agent-mode" ]] || [[ "$(basename "$0")" == *"snapshot-agent"* ]]; then
-        AGENT_MODE=true
+    # Pattern matching for basename
+    case "${1:-}" in
+        --agent-mode) AGENT_MODE=true ;;
+    esac
+    case "$(basename "$0")" in
+        *snapshot-agent*) AGENT_MODE=true ;;
+    esac
+    
+    if [ "$AGENT_MODE" = true ]; then
         agent_main "$@"
     else
         client_main "$@"
     fi
 }
 
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    main "$@"
-fi
+main "$@"
