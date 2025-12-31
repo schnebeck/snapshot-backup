@@ -1278,6 +1278,100 @@ test_98_check_job_done() {
 }
 
 # ==============================================================================
+# New Regression Tests (v14.1 Fixes)
+# ==============================================================================
+
+test_42_inf_loop_fix() {
+    # Bug: Infinite Loop in run_waterfall_logic if retention is 0 for a level.
+    # Cause: check_promote returned success (0) because of bare returns, treating failure as success.
+    # Fix: Return 1 explicitly if retention <= 0.
+    
+    pre_test_cleanup
+    setup_env
+
+    # Config: Hourly=1, Daily=0, Weekly=0.
+    # We create hourly backups.
+    # Then we trigger "daily" promotion logic.
+    # With Daily=0, check_promote("daily") should return 1 (Fail).
+    # If it returned 0 (Success), waterfall would continue looping.
+    
+    export TEST_RETAIN_HOURLY=2
+    export TEST_RETAIN_DAILY=0
+    export TEST_RETAIN_WEEKLY=0
+    export TEST_RETAIN_MONTHLY=0
+    export TEST_RETAIN_YEARLY=0
+    generate_local_config
+    
+    # Create hourly.0, hourly.1
+    mkdir -p "$MNT_BACKUP/hourly.0"
+    mkdir -p "$MNT_BACKUP/hourly.1"
+    
+    # We fake hourly.1 to be old enough for daily promotion (if daily was enabled)
+    # But daily is disabled (0).
+    # So check_promote "daily" must NOT promote.
+    
+    # Run the backup tool (local mode)
+    # We use 'timeout' to detect infinite loop if fix fails.
+    # Run the backup tool (purge action triggers waterfall)
+    # Use timeout to detect infinite loop
+    # NOTE: Purge action is for Agent. Client uses standard run.
+    # But standard run triggers rsync. We just want to test promotion logic.
+    # If we run with purge action (as Agent Mode?), we need --agent-mode.
+    # If we run Client Mode, we run full backup.
+    # Let's run Client Mode full backup.
+    timeout 10s ./snapshot-backup.sh --config "$CONF_FILE" >/dev/null 2>&1
+    local ret=$?
+    
+    if [ "$ret" -eq 124 ]; then
+        log "FAIL: Timeout reached (Infinite Loop Detected)."
+        return 1
+    elif [ "$ret" -ne 0 ]; then
+        log "FAIL: Command failed with exit code $ret (Not a loop, but error)."
+        return 1
+    else
+        # Success (Exit 0)
+        # Check that daily.0 does NOT exist
+        if [ -d "$MNT_BACKUP/daily.0" ]; then
+             log "FAIL: Promoted to daily.0 despite Retention=0."
+             return 1
+        fi
+        return 0
+    fi
+}
+
+test_43_log_segregation() {
+    # Feature: Concurrent Agent Logging (Segregation by Client Name)
+    # We run the agent with --client
+    # We verify that a logfile named snapshot-backup-<client>.log is created.
+    
+    local log_dir="./test_logs"
+    mkdir -p "$log_dir"
+    
+    # Modify config to point logfile to this dir
+    # We can't easily change LOGFILE variable via config in Client Check mode unless we mock.
+    # But Agent Main respects LOGFILE var or defaults.
+    # We can pass config file.
+    
+    local agent_conf="./test_agent.conf"
+    echo "LOGFILE=\"$log_dir/agent.log\"" > "$agent_conf"
+    
+    # Run Agent in Status mode (harmless)
+    # Why Status? It logs.
+    mkdir -p "./storage/clientA"
+    chmod 700 "./storage/clientA"
+    
+    ./snapshot-backup.sh --agent-mode --config "$agent_conf" --client "clientA" --action status --base-storage "./storage" >/dev/null 2>&1
+    
+    if [ -f "$log_dir/snapshot-backup-clientA.log" ]; then
+        return 0
+    else
+        log "FAIL: Log file snapshot-backup-clientA.log not found in $log_dir."
+        ls -l "$log_dir"
+        return 1
+    fi
+}
+
+# ==============================================================================
 # 4. RUNNER
 # ==============================================================================
 
@@ -1297,7 +1391,6 @@ echo "--------------------------------------------------"
 echo "Tests matched to Historical Requirements."
 echo "=================================================="
 
-echo ""
 echo "--- [ LOCAL TESTS ] ---"
 run test_01 "Basic Backup Creation"
 run test_02 "Weekly Rotation Logic"
@@ -1339,6 +1432,8 @@ run test_38 "Regressive Promotion Protection"
 run test_39 "Security Hardening (Agent)"
 run test_40 "Helper Functions"
 run test_41 "Snapshot Permissions (700)"
+run test_42_inf_loop_fix "Regression: Infinite Loop (Retain=0)"
+run test_43_log_segregation "Feature: Agent Log Segregation"
 
 # 3. Dynamic Matrix Test (Remote)
 run test_98_check_job_done "Remote Job Done Checks"

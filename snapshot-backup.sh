@@ -46,7 +46,7 @@ set -o pipefail
 
 ## @var SCRIPT_VERSION
 #  @brief Version string for compatibility and logging.
-SCRIPT_VERSION="14.0"
+SCRIPT_VERSION="14.1"
 
 EXPECTED_CONFIG_VERSION="1.8"
 CONFIG_FILE="/etc/snapshot-backup.conf"
@@ -113,6 +113,20 @@ NETWORK_TIMEOUT=10
 # ==============================================================================
 # 2. UTILITY FUNCTIONS
 # ==============================================================================
+
+##
+# @brief Safe recursive delete wrapper
+safe_rm() {
+    local target="$1"
+    if [[ -z "$target" ]] || [[ "$target" == "/" ]]; then
+        die "CRITICAL SAFETY ERROR: Attempted to delete execution root or empty path: '$target'"
+    fi
+     # Prevent deleting common system roots just in case
+    if [[ "$target" == "/bin" ]] || [[ "$target" == "/usr" ]] || [[ "$target" == "/etc" ]] || [[ "$target" == "/home" ]]; then
+         die "CRITICAL SAFETY ERROR: Attempted to delete system directory: '$target'"
+    fi
+    rm -rf "$target"
+}
 
 ##
 # @brief Standardized logging to file, console and syslog.
@@ -735,7 +749,18 @@ calc_time_ago() {
 }
 
 get_disk_usage() {
-    df -BG "$BACKUP_ROOT" 2>/dev/null | awk 'NR==2 {print $4}' | tr -d 'G' || echo "0"
+    if [ ! -d "$BACKUP_ROOT" ]; then
+        echo "0"
+        return
+    fi
+    # Use -B1 to get bytes, then convert, or keep -BG. -BG is GNU specific? 
+    # Used in rest of script. Assuming GNU df.
+    local usage=$(df -BG "$BACKUP_ROOT" 2>/dev/null | awk 'NR==2 {print $4}' | tr -d 'G')
+    if [ -z "$usage" ]; then
+        echo "0"
+    else
+        echo "$usage"
+    fi
 }
 
 is_backup_running() {
@@ -1237,7 +1262,7 @@ rotate_level() {
                 # i=1: 1 -> 2 (Delete 2). So we delete 1 instead of moving? 
                 # Or move 1->2, then delete 2?
                 # Efficient: delete "$int.$i"
-                rm -rf "$BACKUP_ROOT/$int.$i"
+                safe_rm "$BACKUP_ROOT/$int.$i"
             else
                 mv "$BACKUP_ROOT/$int.$i" "$BACKUP_ROOT/$int.$((i+1))"
             fi
@@ -1309,13 +1334,13 @@ check_promote() {
     
     local src=$(get_source_interval_for "$tgt")
     if [ "$src" == "none" ]; then
-        return
+        return 1
     fi
     
     # CRITICAL FIX: Do not promote if target retention is 0 (Disabled)
     local tgt_retain=$(get_retention "$tgt")
     if [ "$tgt_retain" -le 0 ] && [ "$force" != true ]; then
-         return
+         return 1
     fi
     
     local s_idx="-1"
@@ -1336,7 +1361,7 @@ check_promote() {
     fi
     
     if [ "$s_idx" == "-1" ]; then
-        return
+        return 1
     fi
      
     local src_path="$BACKUP_ROOT/$src.$s_idx"
@@ -1348,13 +1373,13 @@ check_promote() {
         local tgt_ts=$(read_timestamp "$BACKUP_ROOT/$tgt.0/$TIMESTAMP_FILE")
         if [ "$src_ts" -le "$tgt_ts" ] && [ "$src_ts" -gt 0 ]; then
             log "INFO" "Target $tgt.0 is newer or same age ($tgt_ts >= $src_ts). Discarding promotion."
-            return
+            return 1
         fi
     fi
     
     if [ "$promote" = true ]; then
         local t_tmp="$BACKUP_ROOT/$tgt.0.tmp"
-        rm -rf "$t_tmp"
+        safe_rm "$t_tmp"
         
         local src_retain=$(get_retention "$src")
         local method="COPY"
@@ -1529,12 +1554,12 @@ do_prepare() {
         local now_time=$(date +%s)
         if (( now_time - tmp_mtime > 86400 )); then
             log "WARN" "Stale temporary directory detected (>24h). Resetting."
-            rm -rf "$temporary_work_dir"
+            safe_rm "$temporary_work_dir"
         fi
     fi
 
     if [[ "$stale_reset" == true ]] && [[ -d "$temporary_work_dir" ]]; then 
-        rm -rf "$temporary_work_dir"
+        safe_rm "$temporary_work_dir"
     fi
     
     if [[ ! -d "$temporary_work_dir" ]]; then
@@ -1943,7 +1968,7 @@ perform_local_backup() {
         rotate_level "$int" $(get_retention "$int")
     else
         log "INFO" "In-Place Update (No Rotation)."
-        rm -rf "$target"
+        safe_rm "$target"
     fi
     
     mv "$target_tmp" "$target"
@@ -2113,6 +2138,19 @@ agent_main() {
     # Critical: Update BASE_STORAGE_PATH if config file overrode BASE_STORAGE
     if [[ -n "${BASE_STORAGE:-}" ]]; then BASE_STORAGE_PATH="$BASE_STORAGE"; fi
     if [[ -n "${LOCK_DIR:-}" ]]; then AGENT_LOCK_DIR="$LOCK_DIR"; fi
+    
+    # Update Logging for Concurrency (User Request)
+    if [[ -n "$CLIENT_NAME" ]]; then
+        LOGTAG="snapshot-backup-$CLIENT_NAME"
+        
+        # If LOGFILE is default, append client name. 
+        # If user manually set LOGFILE in config, we might overwrite it or append?
+        # Safe approach: If default LOGFILE is used OR if we want to enforce separation:
+        # We assume agent-system-log usually means the default log file.
+        # Let's direct it to a client-specific file in the same dir.
+        local log_dir=$(dirname "$LOGFILE")
+        LOGFILE="$log_dir/snapshot-backup-$CLIENT_NAME.log"
+    fi
     
     case "$action" in
         prepare) do_prepare ;;
@@ -2310,4 +2348,6 @@ main() {
     fi
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
