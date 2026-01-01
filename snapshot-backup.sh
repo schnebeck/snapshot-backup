@@ -1860,7 +1860,19 @@ do_status() {
     for tier in "hourly" "daily" "weekly" "monthly" "yearly"; do
         find "$CLIENT_ROOT_PATH" -maxdepth 1 -name "$tier.*" -type d ! -name "*.tmp" | sort | while read dir; do
              local ts="No timestamp"
-             if [ -f "$dir/$TIMESTAMP_FILE" ]; then ts=$(head -n 1 "$dir/$TIMESTAMP_FILE"); fi
+             if [ -f "$dir/$TIMESTAMP_FILE" ]; then 
+                 ts=$(head -n 1 "$dir/$TIMESTAMP_FILE")
+                 # Check if ts is purely numeric (Epoch)
+                 case "$ts" in
+                     ""|*[!0-9]*) ;; # Legacy or empty: Keep as is
+                     *) 
+                        # Convert Epoch to readable format (try GNU date syntax)
+                        # Fallback to raw if date fails
+                        ts_human=$(date -d "@$ts" "+%Y-%m-%d %H:%M:%S %z" 2>/dev/null)
+                        if [ -n "$ts_human" ]; then ts="$ts_human"; fi
+                        ;;
+                 esac
+             fi
              printf "  %-12s | %s\n" "$(basename "$dir")" "$ts"
         done
     done
