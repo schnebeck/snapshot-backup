@@ -5,7 +5,7 @@
 
 ## Overview
 
-`snapshot-backup.sh` is a modern, Perl-free replacement for the `rsnapshot` backup system. It was developed extensively using **Gemini AI v3.0** within Google's Antigravity AI-enabled editor. Notably, version 14.0 marks the first public release as the result of a single, continuous development session.
+`snapshot-backup.sh` is a modern, Perl-free replacement for the `rsnapshot` backup system. It was developed extensively using **Gemini AI v3.0** within Google's Antigravity AI-enabled editor. Notably, version 15.0 marks the first fully **POSIX sh compliant** release, supporting generic Linux and BusyBox environments.
 
 To mitigate validity issues common in AI development, the project relies on a comprehensive **Integration Test Suite** (`integration-test.sh`). This suite validates logic, error handling, and expected behavior at every step, ensuring a robust and reliable codebase. 
 
@@ -20,16 +20,24 @@ To mitigate validity issues common in AI development, the project relies on a co
 
 - **Unified Architecture**: One script handles client orchestration and server-side agent duties.
 - **Waterfall Rotation**: Implements a cascading retention policy. When a new backup is created, older backups are promoted down the chain (Hourly -> Daily -> Weekly -> Monthly -> Yearly) to maintain history efficiently.
+- **Calendar-Based Promotion ("Road Warrior" Logic)**: The system recalculates promotion eligibility on every run based on the **timestamp of the snapshot**, not just the run time. 
+    - *Example*: If a laptop backup runs once a month, the script correctly recognizes that a "Weekly" and "Monthly" promotion is due, even if 30 days have passed since the last run. This ensures gaps are handled gracefully and history is strictly preserved according to actual dates.
+- **Single Trigger Logic**: Unlike `rsnapshot` which requires separate entries for each interval, this script requires only **one** generic trigger (e.g. Cron, Systemd Timer, or Network Dispatcher). It intelligently evaluates all rotation and promotion rules on every single run.
 - **Atomic Updates**: Backups are first created in a temporary directory (`.tmp`). Only after a successful transfer are they moved to their final name. This guarantees that you never have broken or incomplete snapshots in your history.
 - **Smart Purge**: Automatically reduces retention depth if storage space falls below a defined threshold.
 - **Remote & Local**: Supports checking backing up local directories or pushing/pulling to remote servers via SSH.
 - **Self-Deployment**: Can install itself to remote agents with a single command.
+- **Parallel Agent Support**: Automatically segregates log files (`snapshot-backup-CLIENT.log`) and syslog tags based on client name, ensuring clean logs even when multiple agents run simultaneously.
 
 ## Requirements
 
 ### Client (The machine running the backup job)
-- **OS**: Linux / Unix-like
-- **Dependencies**: `rsync`, `ssh`, `logger` (usually in bsdutils/util-linux), `bash` (v4+)
+- **OS**: Linux / Unix-like / BusyBox (Embedded Systems)
+- **Shell**: POSIX `sh` compatible (Bash is NOT required).
+- **Dependencies**: 
+    - Essential: `rsync`, `ssh`
+    - Recommended: `logger` (for syslog), `notify-send` (for desktop notifications)
+    - Fallbacks: Script automatically handles missing `timeout` command on minimal systems.
 - **Access**: SSH access to the backup server (if remote).
 
 ### Server (The machine validating/storing backups)
@@ -141,6 +149,13 @@ The agent (remote side) also uses a configuration file, typically located at `/e
 BASE_STORAGE="/var/backups/snapshots"
 ```
 
+#### 4. Automatic Log Segregation & Syslog
+The Agent (v15.0+) is designed for high-concurrency environments.
+- **File Logging**: If the default log path (`/var/log/snapshot-backup.log`) is used, the Agent automatically redirects its output to `/var/log/snapshot-backup-<CLIENT_NAME>.log`. This ensures that logs from different clients are kept in separate files on the server.
+- **Syslog Tagging**: All syslog messages are tagged with `snapshot-backup-<CLIENT_NAME>`, allowing you to filter logs easily using `journalctl -t snapshot-backup-<CLIENT_NAME>`.
+
+No manual configuration is required for this feature; it activates automatically based on the Client Name.
+
 ## Usage
 
 ### 1. Best Practices & Filesystem Boundaries
@@ -170,8 +185,6 @@ SOURCE_DIRS=(
 
 ### 2. Running Backups
 The script is designed to be run by the `root` user (or a privileged backup user) via Cron or a Systemd Timer.
-The repo has a script example to start snapshot-backup.sh via a Network Manager dispatcher script when the machine
-is connected to your favorite network and is not running on battery.
 
 #### Manual Run (Testing)
 To verify the configuration and run an immediate backup:
@@ -181,7 +194,8 @@ sudo snapshot-backup.sh --config /etc/snapshot-backup.conf
 ```
 
 #### Automation (Cron)
-Add a job to `/etc/crontab` to run hourly:
+Add a job to `/etc/crontab` to run hourly. 
+**Migration Note**: Unlike rsnapshot, do NOT add separate lines for daily/weekly/etc. One line handles everything!
 
 ```bash
 # Run backup at minute 0 of every hour
@@ -322,6 +336,11 @@ Usage: `snapshot-backup.sh [OPTIONS]`
 *   **Function:** Show a summary of existing backup snapshots and storage usage.
 *   **Context:** local/remote
 *   **Example:** `snapshot-backup.sh --status`
+
+#### `--debug`
+*   **Function:** Enable verbose debug logging to console and logfile (includes full rsync file lists).
+*   **Context:** local/remote
+*   **Example:** `snapshot-backup.sh --debug`
 
 #### `--help`, `-h`
 *   **Function:** Show the help message and exit.
@@ -527,6 +546,8 @@ Use `integration-test.sh` for all changes. It creates a self-contained environme
 - Remote simulation.
 
 ## Version History
+- **v15.0**: POSIX sh Rewrite. BusyBox capability (fallback for timeout/ACLs). Debug mode.
+- **v14.1**: Integration Suite improvements.
 - **v14.0**: Unified Client & Agent. Added self-deployment and help functionality.
 - **v13.xx**: Legacy split-script architecture.
 
