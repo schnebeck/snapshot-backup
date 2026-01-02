@@ -13,6 +13,7 @@ To mitigate validity issues common in AI development, the project relies on a co
 
 **Flexible Deployment:**
 
+
 - **Local**: Back up directly to internal drives, USB storage, or mounted volumes (e.g., iSCSI).
 - **Remote**: Use the embedded Agent to push/pull backups via SSH. This simplifies remote backups over VPNs or the internet, removing the need for complex networked storage protocols.  
 
@@ -28,6 +29,21 @@ To mitigate validity issues common in AI development, the project relies on a co
 - **Remote & Local**: Supports checking backing up local directories or pushing/pulling to remote servers via SSH.
 - **Self-Deployment**: Can install itself to remote agents with a single command.
 - **Parallel Agent Support**: Automatically segregates log files (`snapshot-backup-CLIENT.log`) and syslog tags based on client name, ensuring clean logs even when multiple agents run simultaneously.
+
+## Scope & Limitations (Intended Use)
+This tool is designed for **simplicity and robustness** in trusted environments.
+
+### ✅ Perfect Implementation For:
+*   **Homelabs / SOHO**: Backing up Laptops, Raspberry Pis, and Servers in a private LAN/VPN.
+*   **Trusted Networks**: Where clients are managed by the same administrator as the backup server.
+*   **"Road Warriors"**: Laptops that connect sporadically via VPN.
+
+### ❌ NOT Designed For:
+*   **Zero-Trust Environments**: Backing up untrusted third-party clients.
+*   **Public Internet**: Exposing the SSH backup port directly to the internet (use a VPN!).
+*   **Multi-Tenant Hosting**: Where "Client A" must be mathematically prevented from hacking "Client B" even if they gain root on the backup server.
+
+*Reason*: The "Push" architecture via `rsync` requires root access, which inherently implies trust. For Zero-Trust, look at "Pull" architectures or tools like BorgBackup.
 
 ## Requirements
 
@@ -45,102 +61,127 @@ To mitigate validity issues common in AI development, the project relies on a co
 - **Dependencies**: `rsync`, `bash` (v4+), `logger`, `openssh-server`, `sftp-server`
 - **User**: Dedicated backup user (recommended) or root.
 
-## Installation
+## Installation & Configuration
 
-### Manual Installation
-Copy the script to your system path:
+### 1. Installation (Client)
+*Perform this on every machine you want to back up.*
+
+Copy the script to your system path and make it executable:
 
 ```bash
 sudo cp snapshot-backup.sh /usr/local/sbin/snapshot-backup.sh
 sudo chmod 700 /usr/local/sbin/snapshot-backup.sh
 ```
 
-### Remote Agent Deployment
+### 2. Configuration
+**CRITICAL**: You must create a valid configuration file before proceeding.
 
-#### Prerequisites: SSH Keys
-The backup process is non-interactive. You must set up SSH Key authentication first:
-
-```bash
-# Syntax: ssh-keygen -t [TYPE]
-ssh-keygen -t ed25519
-
-# Syntax: ssh-copy-id [USER]@[HOST]
-ssh-copy-id root@backup-server.local
-```
-
-#### Deploy Agent
-To install the agent on a remote server:
-
-```bash
-# Syntax: snapshot-backup.sh --deploy-agent [USER]@[HOST]
-sudo snapshot-backup.sh --deploy-agent root@backup-server.local
-```
-This will:
-
-1. Copy the script to `/usr/local/sbin/snapshot-agent.sh`.
-2. Set permissions (`chmod 700`, `chown 0:0`).
-3. Generate a security wrapper (`/usr/local/bin/snapshot-wrapper.sh`) restricting valid commands.
-
-**Note:**
-
-- **One-Time Server Setup:** You only need to run this command **once** (e.g. from your first client) to prepare the server. You do **NOT** need to run it for every client.
-- **Connectivity Check:** However, running it again is safe and serves as an excellent test to verify your SSH key setup works correctly.
-
-### Configuration
-
-#### 1. General Settings
-
-To see all available options and default values, run:
+**Tip**: To see all available options and default values (useful for generating a initial config), run:
 
 ```bash
 snapshot-backup.sh --show-config
 ```
 
-#### 2. Client Configuration
-
-Create a configuration file (e.g., `/etc/snapshot-backup.conf`) for the backup job:
+#### Option A: Local Backup (USB/NAS Mount)
+*Template for local backups.*
+Adapt `BACKUP_ROOT` and `SOURCE_DIRS` to your system.
 
 ```bash
-# /etc/snapshot-backup.conf
+# /etc/snapshot-backup.conf (Local Example)
 
-# Storage Location (Local or Remote Path)
-BACKUP_ROOT="/mnt/backup_drive"
-
-# Backup Mode (LOCAL or REMOTE)
 BACKUP_MODE="LOCAL"
+BACKUP_ROOT="/mnt/external_drive"
 
-# Retention Policy (How many snapshots to keep)
+# Retention: Keep 7 dailies, 4 weeklies...
 RETAIN_HOURLY=24
 RETAIN_DAILY=7
 RETAIN_WEEKLY=4
 RETAIN_MONTHLY=12
 RETAIN_YEARLY=5
 
-# Smart Purge (Optional)
-# Reduce retention if free space < 50GB
-SMART_PURGE_LIMIT_GB=50
-
-# Source Directories (What to back up)
-SOURCE_DIRS=(
-    "/etc"
-    "/home"
-    "/var/www"
-)
-
-# Excludes (Rsync patterns)
-EXCLUDE_PATTERNS=(
-    "*.tmp"
-    "*.iso"
-    ".cachev/"
-    "Downloads/"
-)
+SOURCE_DIRS=( "/etc" "/home" "/var/www" )
+EXCLUDE_PATTERNS=( "*.tmp" "*.iso" "Downloads/" )
 ```
 
-#### 3. Agent Configuration
+#### Option B: Remote Backup (over SSH)
+*Template for remote backups.*
+Adapt `REMOTE_HOST`, `SSH_KEY`, and `CLIENT_NAME` to your environment.
 
-The agent (remote side) also uses a configuration file, typically located at `/etc/snapshot-agent.conf` on the remote server. This allows you to override storage paths or retention policies specifically for the agent.
+```bash
+# /etc/snapshot-backup.conf (Remote Example)
 
-**Note:** This configuration is **client-agnostic**. You only need one file for all incoming clients. The agent automatically creates subdirectories for each client based on the `CLIENT_NAME` variable defined in the **Client's** configuration (e.g. `CLIENT_NAME="my-laptop"` becomes `/var/backups/snapshots/my-laptop`).
+BACKUP_MODE="REMOTE"
+
+# Remote Connection Details
+REMOTE_USER="root"
+REMOTE_HOST="backup.lan"
+REMOTE_PORT="22"
+SSH_KEY="/root/.ssh/id_ed25519"
+
+# Unique ID for this machine (REQUIRED for Setup Wizard)
+CLIENT_NAME="laptop-bedroom"
+
+# Retention
+RETAIN_HOURLY=0   # Laptops might skip hourly
+RETAIN_DAILY=7
+RETAIN_WEEKLY=4
+RETAIN_MONTHLY=12
+RETAIN_YEARLY=2
+
+SOURCE_DIRS=( "/etc" "/home" )
+EXCLUDE_PATTERNS=( "*.tmp" "Cache/" )
+```
+
+### 3. Remote Server Setup (Optional)
+*Perform this ONLY if you are backing up to a remote server.*
+
+Once your `CLIENT_NAME` is configured (Step 2), use the wizard to prepare the server.
+
+#### Remote Agent Deployment (Wizard)
+
+**Recommended Method**: Use the built-in wizard.
+
+```bash
+# Syntax: snapshot-backup.sh --setup-remote [USER]@[HOST]
+sudo ./snapshot-backup.sh --setup-remote root@backup-server.local
+```
+
+**What this does:**
+
+1.  **Duplicate Check**: Verifies if `CLIENT_NAME` conflicts with existing data.
+2.  **SSH Check**: Checks/Generates SSH keys and copies them to the server (`ssh-copy-id`).
+3.  **Deployment**: Installs the `snapshot-agent.sh` script on the server.
+4.  **Auto-Hardening**: Locks the SSH key in `authorized_keys` to this specific `CLIENT_NAME`.
+
+---
+
+#### Manual Remote Setup (Advanced)
+
+*For manual setups or scripts.*
+
+1.  **SSH Keys**:
+
+    ```bash
+    ssh-keygen -t ed25519
+    ssh-copy-id root@backup-server.local
+    ```
+2.  **Install Agent**:
+
+    ```bash
+    # Legacy command for batch scripts
+    sudo ./snapshot-backup.sh --deploy-agent root@backup-server.local
+    ```
+3.  **Security Hardening**:
+    Edit `/root/.ssh/authorized_keys` on the server manually:
+
+    ```text
+    command="/usr/local/bin/snapshot-wrapper.sh my-client-name" ssh-ed25519 ...
+    ```
+
+#### 3. Agent Configuration (Optional)
+The agent (remote side) also uses a configuration file, typically located at `/etc/snapshot-agent.conf`. This allows you to override storage paths specifically for the server.
+
+**Note:** This file is **client-agnostic**. You only need one file for all incoming clients.
 
 ```bash
 # /etc/snapshot-agent.conf on Remote Server
@@ -151,6 +192,7 @@ BASE_STORAGE="/var/backups/snapshots"
 
 #### 4. Automatic Log Segregation & Syslog
 The Agent (v15.0+) is designed for high-concurrency environments.
+
 - **File Logging**: If the default log path (`/var/log/snapshot-backup.log`) is used, the Agent automatically redirects its output to `/var/log/snapshot-backup-<CLIENT_NAME>.log`. This ensures that logs from different clients are kept in separate files on the server.
 - **Syslog Tagging**: All syslog messages are tagged with `snapshot-backup-<CLIENT_NAME>`, allowing you to filter logs easily using `journalctl -t snapshot-backup-<CLIENT_NAME>`.
 
@@ -162,6 +204,8 @@ No manual configuration is required for this feature; it activates automatically
 The script **mandatorily** uses `rsync -x` (`--one-file-system`). This means rsync will count the "borders" of your filesystems but not cross them.
 
 **Effect on Mount Points:**
+
+
 - If you back up `/`, and `/boot` is a separate partition, the backup will contain an empty `/boot` directory.
 - This is a **feature**: It preserves your full directory structure so you can simply mount file systems into these empty folders during a restore.
 
@@ -169,12 +213,14 @@ The script **mandatorily** uses `rsync -x` (`--one-file-system`). This means rsy
 For a restore-friendly setup, look at your `/etc/fstab` and add every real partition (ext4, xfs) to `SOURCE_DIRS`.
 
 *Example Fstab:*
+
 ```text
 /dev/sda1  /      ext4 ...
 /dev/sda2  /home  ext4 ...
 ```
 
 *Matching Backup Config:*
+
 ```bash
 SOURCE_DIRS=(
     "/"
@@ -294,25 +340,6 @@ To verify the wrapper:
 /usr/local/bin/snapshot-wrapper.sh --help
 ```
 
-## Security Considerations (Advanced)
-
-### Why Root?
-The default installation sets the agent script to `700` owned by `root:root`. This ensures that:
-
-1. Only the highest-privilege user can modify execution logic.
-2. The agent has unrestricted access to read/write all filesystem locations for backup.
-
-### Risks
-- **SSH Root Login**: Requires permitting root login over SSH (at least with keys).
-- **Compromise**: If the client key is stolen, an attacker gains root access to the backup server.
-
-### Hardening (Dedicated User)
-To mitigate these risks, advanced users can configure a dedicated `backup` user:
-
-1. Create user on server: `useradd -m backup`
-2. Install agent manually using `chown backup:backup`.
-3. Configure `sudo` to allow `backup` to run `rsync` or the agent script with privileges if needed (e.g. to preserve ownership of files).
-4. **Warning**: This configuration is manual and not automated by the `--deploy-agent` command.
 
 ## Full Reference
 
@@ -402,11 +429,14 @@ Usage: `snapshot-backup.sh [OPTIONS]`
 
 ### Deployment & Agent
 
-#### `--deploy-agent`
-*   **Function:** Deploy the script to a remote server setup. Copies the script and installs the wrapper.
+#### `--setup-remote`
+*   **Function:** Remote Setup Wizard. Handles SSH Keys, installs the agent script, and applies Security Hardening (Client Locking).
 *   **Context:** local (sending to remote)
 *   **Options:** `[USER]@[HOST]`
-*   **Example:** `snapshot-backup.sh --deploy-agent root@backup.local`
+*   **Example:** `snapshot-backup.sh --setup-remote root@backup.local`
+
+#### `--deploy-agent` (Legacy)
+*   **Function:** Alias for `--setup-remote`. Kept for backward compatibility.
 
 #### `--mount`
 *   **Function:** Mount the backup directory to `/tmp/mnt_backup` (or custom path). Uses `mount --bind` for local and `sshfs` for remote.
@@ -539,6 +569,21 @@ The Client does not run arbitrary commands on the server. Instead, it triggers s
 2. **Transfer**: Client `rsync`s data directly into `daily.0.tmp`.
 3. **Commit**: Agent rotates old snapshots and renames `.tmp` to `daily.0`.
 
+### Root Requirement & Security Trade-Off
+This tool is designed for **System Backups**, which inherently requires `root` privileges on both ends:
+- **Client**: To read all files (`/etc/shadow`, `/home/*`) and preserve their ownership/permission attributes.
+- **Server**: To write those files and `chown` them to their original users (UIDs/GIDs).
+
+**Security Implication**: Since the backup process requires a `root` SSH connection (albeit wrapped), a compromised client technically possesses elevated privileges on the backup server (via `rsync`).
+
+**Mitigation Strategies**:
+1.  **Trusted Networks (Primary Defense)**: Use this tool only in LANs or VPNs where you trust the clients. It is **not** designed for Zero-Trust environments.
+2.  **Security Wrapper (Logical Defense)**: Use the wrapper to lock SSH keys to specific client names. This prevents accidental overwrites or "spoofing" of other clients.
+3.  **Dedicated User (Defense in Depth)**: Advanced users can configure a dedicated `backup` user on the server (manual setup required).
+    - Create user: `useradd -m backup`
+    - Configure `sudo` to allow `backup` to run specific execution logic as root.
+    - *Limitation*: Even with a dedicated user, `sudo` access for `rsync` is effectively root file access. This adds a layer of defense (no direct root login), but does NOT sandbox the file system access.
+
 ### Testing
 Use `integration-test.sh` for all changes. It creates a self-contained environment (no root needed for local tests) and verifies:
 - Retention logic (waterfall).
@@ -546,6 +591,7 @@ Use `integration-test.sh` for all changes. It creates a self-contained environme
 - Remote simulation.
 
 ## Version History
+- **v15.1**: Security & Usability Update. Added `--setup-remote` wizard with strict client-name checks and auto-hardening (SSH `authorized_keys` lock).
 - **v15.0**: POSIX sh Rewrite. BusyBox capability (fallback for timeout/ACLs). Debug mode.
 - **v14.1**: Integration Suite improvements.
 - **v14.0**: Unified Client & Agent. Added self-deployment and help functionality.

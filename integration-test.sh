@@ -114,6 +114,7 @@ setup_env() {
 
     # Agent Config
     cat > "$AGENT_CONF" <<EOF
+CONFIG_VERSION="2.0"
 BASE_STORAGE="$SERVER_ROOT"
 LOCK_DIR="$TEST_BASE/agent_locks"
 EOF
@@ -121,9 +122,10 @@ EOF
 
     # Client Config
     cat > "$CONF_FILE" <<EOF
+CONFIG_VERSION="2.0"
 BACKUP_MODE="LOCAL"
 BACKUP_ROOT="$MNT_BACKUP"
-SOURCE_DIRS=("$MNT_SOURCE")
+SOURCE_DIRS="$MNT_SOURCE"
 LOGFILE="$SUITE_LOG"
 LOGTAG="test-suite"
 REMOTE_USER="root"
@@ -135,7 +137,7 @@ REMOTE_AGENT="$TEST_REMOTE_BIN --config $AGENT_CONF"
 CLIENT_NAME="test-client"
 ENABLE_NOTIFICATIONS=false
 SPACE_LOW_LIMIT_GB=0
-EXCLUDE_PATTERNS=(".cache" "*.tmp" "lost+found")
+EXCLUDE_PATTERNS='".cache" "*.tmp" "lost+found"'
 EOF
 }
 
@@ -154,7 +156,7 @@ setup_ssh() {
 ##
 # @brief Manipulates file modification time.
 shift_time() {
-    [ ! -d "$1" ] && date -d "$2" '+%Y-%m-%d %H:%M:%S %z' > "$1"
+    [ ! -d "$1" ] && date -d "$2" '+%s' > "$1"
     touch -d "$2" "$1"
 }
 
@@ -190,7 +192,7 @@ generate_remote_config() {
     echo "REMOTE_SSH_OPTS=\"-o StrictHostKeyChecking=no -o BatchMode=yes\"" >> "$CONF_FILE"
     
     [ -n "${TEST_RSYNC_OPTS:-}" ] && echo "RSYNC_EXTRA_OPTS=\"$TEST_RSYNC_OPTS\"" >> "$CONF_FILE"
-    [ -n "${TEST_EXCLUDES:-}" ] && echo "EXCLUDE_PATTERNS=($TEST_EXCLUDES)" >> "$CONF_FILE"
+    [ -n "${TEST_EXCLUDES:-}" ] && echo "EXCLUDE_PATTERNS='$TEST_EXCLUDES'" >> "$CONF_FILE"
     
     # Ensure Agent finds correct storage path in shared config
     echo "BASE_STORAGE=\"$SERVER_ROOT\"" >> "$CONF_FILE"
@@ -261,9 +263,18 @@ test_05() {
 
 test_06() {
     setup_infrastructure; generate_local_config
+    # Mock Atomic Lock: Create Dir AND PID
+    mkdir -p "/var/run/snapshot-backup.lock"
     echo "$$" > "/var/run/snapshot-backup.pid"
-    if $SCRIPT --config "$CONF_FILE" >> "$SUITE_LOG" 2>&1; then rm -f "/var/run/snapshot-backup.pid"; return 1; fi
+    
+    if $SCRIPT --config "$CONF_FILE" >> "$SUITE_LOG" 2>&1; then 
+        rm -f "/var/run/snapshot-backup.pid"
+        rmdir "/var/run/snapshot-backup.lock"
+        return 1
+    fi
+    
     rm -f "/var/run/snapshot-backup.pid"
+    rmdir "/var/run/snapshot-backup.lock"
     return 0
 }
 
@@ -326,7 +337,7 @@ test_19() {
     
     # 1. Run Deploy Command
     echo "Running --deploy-agent to root@127.0.0.1..." >> "$TEST_LOG"
-    $SCRIPT --config "$CONF_FILE" --deploy-agent "root@127.0.0.1" >> "$TEST_LOG" 2>&1
+    $SCRIPT --config "$CONF_FILE" --deploy-agent "root@127.0.0.1" < /dev/null >> "$TEST_LOG" 2>&1
     if [ $? -ne 0 ]; then
         echo "  [FAIL] Deployment command failed." >> "$TEST_LOG"
         return 1
@@ -942,6 +953,7 @@ test_40() {
     BACKUP_ROOT="$TEST_BASE/helpers"
     mkdir -p "$BACKUP_ROOT"
     cat > "$CONF_FILE" <<EOF
+CONFIG_VERSION="2.0"
 BACKUP_ROOT="$BACKUP_ROOT"
 BACKUP_MODE="LOCAL"
 RETAIN_DAILY=3
@@ -978,6 +990,7 @@ EOF
     mount -o remount,ro,bind "$BACKUP_ROOT/ro_check"
     
     cat > "$CONF_FILE" <<EOF
+CONFIG_VERSION="2.0"
 BACKUP_ROOT="$BACKUP_ROOT/ro_check"
 BACKUP_MODE="LOCAL"
 RETAIN_DAILY=3
@@ -996,114 +1009,55 @@ EOF
 
 test_37() {
     description="Hybrid Promotion (Early Copy)"
-    
-    # Needs root
-    setup_infrastructure root
-    
-    # 1. Create a chain of dailies where the oldest are NOT eligible, but a middle one IS.
-    # We pretend current date is 2025-01-10 (Friday).
-    # daily.6: 2025-01-01 (Wed) - Week 01
-    # daily.5: 2025-01-02 (Thu) - Week 01
-    # daily.1: 2025-01-08 (Wed) - Week 02 (Eligible vs last weekly of Week 52)
-    # daily.0: 2025-01-10 (Fri) - Week 02
-    
-    # Assuming Oldest (daily.6) is checked: 
-    #   Jan 01 vs Last Weekly (Dec 25). Week changed (01 vs 52). Age 7 days.
-    #   Wait, daily.6 WOULD be promoted in standard waterfall too if it's eligible.
-    
-    # We need a case where Oldest FAILs, but Middle PASSES.
-    # Case: Oldest is "Too close" to last weekly?
-    # Last Weekly: Jan 01 (Wed).
-    # daily.6: Jan 02 (Thu). Age 1 day. Fails.
-    # daily.5: Jan 03 (Fri). Age 2 days. Fails.
-    # daily.0: Jan 08 (Wed). Age 7 days. Week changed (02 vs 01). PASSES.
-    
-    # If we run promotion, daily.0 (or daily.x) should be promoted via COPY.
-    
-    local int="daily"
-    mkdir -p "$SERVER_ROOT/test-client"
-    
-    # Create Last Weekly (Jan 01 2025)
-    mkdir -p "$SERVER_ROOT/test-client/weekly.0"
-    date -d "2025-01-01 12:00:00" '+%Y-%m-%d %H:%M:%S' > "$SERVER_ROOT/test-client/weekly.0/.backup_timestamp"
-    
-    # Create Daily.2 (Jan 02) - Too close (1d)
-    mkdir -p "$SERVER_ROOT/test-client/daily.2"
-    date -d "2025-01-02 12:00:00" '+%Y-%m-%d %H:%M:%S' > "$SERVER_ROOT/test-client/daily.2/.backup_timestamp"
-    
-    # Create Daily.1 (Jan 03) - Too close (2d)
-    mkdir -p "$SERVER_ROOT/test-client/daily.1"
-    date -d "2025-01-03 12:00:00" '+%Y-%m-%d %H:%M:%S' > "$SERVER_ROOT/test-client/daily.1/.backup_timestamp"
 
-    # Create Daily.0 (Jan 08) - Week 02. Age 7d. Valid.
-    mkdir -p "$SERVER_ROOT/test-client/daily.0"
-    date -d "2025-01-08 12:00:00" '+%Y-%m-%d %H:%M:%S' > "$SERVER_ROOT/test-client/daily.0/.backup_timestamp"
-    
-    # Configure Agent to checking
-    # We call Agent directly with --action commit which triggers purge->waterfall
-    # Or just run backup script.
-    # Let's run backup script in Remote Mode (simulation).
-    # But easiest is just running checking logic?
-    # No, integration test runs full script.
-    
-    generate_remote_config
-    # Force minimal retention to trigger logic? check_promote runs always on client?
-    # Wait, check_promote logic is in Agent for Remote.
-    # Test 37 uses Remote Agent logic via direct call?
-    
-    # Let's verify LOCAL logic first (snapshot-backup.sh)
-    # Then reuse for Remote.
-    
-    # Run Script (Local).
-    BACKUP_ROOT="$SERVER_ROOT/test-client"
-    export BACKUP_ROOT
-    
-    # We must patch check_promote or rely on perform logic which calls it.
-    # perform_local_backup calls check_promote.
-    # But checking promotion usually happens AFTER backup.
-    
-    # Let's just create a dummy backup that triggers the flow.
-    # date needs to be AFTER Jan 08. Say Jan 09.
-    $SCRIPT --agent-mode --config "$CONF_FILE" --client "test-client" --action commit >> "$SUITE_LOG" 2>&1
-    # Wait, SCRIPT is backup script. It doesn't have --action.
-    # We want to test local hybrid promotion.
-    
-    # Clean env for Local test
+    setup_infrastructure root
+
+    # 1. Clean env for Local test
     sudo rm -rf "$TEST_BASE/local_root"
     mkdir -p "$TEST_BASE/local_root/daily.2" "$TEST_BASE/local_root/daily.1" "$TEST_BASE/local_root/daily.0" "$TEST_BASE/local_root/weekly.0"
-    
+
+    # 2. Setup Dummy Source (Important: so rsync doesn't delete file_d0)
+    mkdir -p "$MNT_SOURCE/src"
+    touch "$MNT_SOURCE/src/file_d0"
+
     local root="$TEST_BASE/local_root"
+    # weekly.0: 2025-01-01 (Wed)
     date -d "2025-01-01 12:00:00" '+%Y-%m-%d %H:%M:%S' > "$root/weekly.0/.backup_timestamp"
+
+    # daily.2: 2025-01-02 (Thu) - 1 day after weekly. Too close?
     date -d "2025-01-02 12:00:00" '+%Y-%m-%d %H:%M:%S' > "$root/daily.2/.backup_timestamp"
     touch "$root/daily.2/file_d2"
+
+    # daily.1: 2025-01-03 (Fri) - 2 days after.
     date -d "2025-01-03 12:00:00" '+%Y-%m-%d %H:%M:%S' > "$root/daily.1/.backup_timestamp"
+
+    # daily.0: 2025-01-08 (Wed) - 7 days after weekly. Valid for promotion?
     date -d "2025-01-08 12:00:00" '+%Y-%m-%d %H:%M:%S' > "$root/daily.0/.backup_timestamp"
-    touch "$root/daily.0/file_d0" # The one to promote
-    
+
+    # IMPORTANT: Put the file in the source, so it lands in daily.0 after sync!
+    # And we also put it in daily.0 manually to simulate pre-existing state if needed,
+    # but rsync will preserve it only if it's in source.
+    touch "$root/daily.0/file_d0"
+
     # Config
     cat > "$CONF_FILE" <<EOF
+CONFIG_VERSION="2.0"
 BACKUP_ROOT="$root"
 BACKUP_MODE="LOCAL"
 RETAIN_DAILY=3
 RETAIN_WEEKLY=3
+SOURCE_DIRS="$MNT_SOURCE/src"
 EOF
-    
+
     # Run Backup
     # Script creates daily.0 (Today). Shifts others -> daily.3 (deleted), daily.2, daily.1.
     # Then checks promotion.
-    # daily.3 (was daily.2 Jan 02) -> Oldest. Failed (Too close).
     # daily.1 (was daily.0 Jan 08) -> Middle. Valid.
-    # Expect: daily.1 promoted to weekly.0. 
-    # Current weekly.0 (Jan 01) shifts to weekly.1.
-    
+    # Expect: daily.1 promoted to weekly.0.
+
     $SCRIPT --config "$CONF_FILE" >/dev/null 2>&1
-    
+
     # Verify
-    # Due to recursive waterfall, multiple promotions might occur if dailies cover multiple weeks.
-    # daily.1 (Jan 08) is promoted to weekly.0.
-    # If daily.0 (Simulation Date) is much later, it might ALSO be promoted, shifting Jan 08 to weekly.1.
-    # So we check if file_d0 exists in ANY weekly snapshot.
-    
     if find "$root" -path "*/weekly.*/file_d0" | grep -q "file_d0"; then
          return 0
     else
@@ -1410,6 +1364,7 @@ test_44_waterfall_backlog() {
     
     local conf="$t_root/backup.conf"
     cat > "$conf" <<EOF
+CONFIG_VERSION="2.0"
 BACKUP_ROOT="$t_root/backups"
 BACKUP_MODE="LOCAL"
 RETAIN_HOURLY=24
@@ -1417,7 +1372,7 @@ RETAIN_DAILY=7
 RETAIN_WEEKLY=4
 RETAIN_MONTHLY=12
 RETAIN_YEARLY=5
-SOURCE_DIRS=("$t_root/source")
+SOURCE_DIRS="$t_root/source"
 EOF
 
     # Helper: Create Fake Snapshot
@@ -1495,6 +1450,69 @@ clean_logs() {
     pre_test_cleanup
 }
 
+
+##
+# @brief Verifies Configuration Priority: Defaults < Config < CLI
+test_99_config_hierarchy() {
+
+    echo "Test 99: Configuration Hierarchy Check" >> "$SUITE_LOG"
+    setup_env
+    
+    # 1. Defaults (Empty Config)
+    echo "CONFIG_VERSION=\"2.0\"" > "$CONF_FILE" # Minimal valid config
+    
+    # Check Default (NETWORK_TIMEOUT=10)
+    # Since we are root in integration test, we can just run the script.
+    # Note: SCRIPT var usually points to ./snapshot-backup.sh
+    
+    local out=$($SCRIPT --show-config -c "$CONF_FILE" 2>/dev/null)
+    local val=$(echo "$out" | grep "^NETWORK_TIMEOUT=" | cut -d= -f2)
+    
+    # If using local mock bin/environment, defaults might differ if not carefully set?
+    # But strict defaults of script are tested.
+    if [ "$val" != "10" ]; then
+
+        echo "  [FAIL] Default NETWORK_TIMEOUT expected 10, got '${val:-empty}'" >> "$SUITE_LOG"
+        return 1
+    fi
+     
+    # 2. Config Override
+    echo "CONFIG_VERSION=\"2.0\"" > "$CONF_FILE"
+    echo "NETWORK_TIMEOUT=20" >> "$CONF_FILE"
+    local out=$($SCRIPT --show-config -c "$CONF_FILE" 2>/dev/null)
+    local val=$(echo "$out" | grep "^NETWORK_TIMEOUT=" | cut -d= -f2)
+    if [ "$val" != "20" ]; then
+
+        echo "  [FAIL] Config Override expected 20, got '${val:-empty}'" >> "$SUITE_LOG"
+        return 1
+    fi
+
+    # 3. CLI Override
+    # Config has 20. CLI passes --timeout 30.
+    local out=$($SCRIPT --show-config -c "$CONF_FILE" --timeout 30 2>/dev/null)
+    local val=$(echo "$out" | grep "^NETWORK_TIMEOUT=" | cut -d= -f2)
+    if [ "$val" != "30" ]; then
+
+        echo "  [FAIL] CLI Override expected 30, got '${val:-empty}'" >> "$SUITE_LOG"
+        return 1
+    fi
+    
+    # 4. FORCE_VERIFY Check (Boolean Override)
+    echo "CONFIG_VERSION=\"2.0\"" > "$CONF_FILE"
+    echo "FORCE_VERIFY=false" >> "$CONF_FILE"
+    local out=$($SCRIPT --show-config -c "$CONF_FILE" --verify 2>/dev/null)
+    local val=$(echo "$out" | grep "^FORCE_VERIFY=" | cut -d= -f2)
+    if [ "$val" != "true" ]; then
+        echo "  [FAIL] CLI FORCE_VERIFY expected true, got '${val:-empty}'" >> "$SUITE_LOG"
+        return 1
+    fi
+    
+    # Cleanup config
+    echo -n "" > "$CONF_FILE"
+    
+    return 0
+}
+
 run_suite() {
     echo "=================================================="
     echo "SNAPSHOT BACKUP INTEGRATION SUITE v14.1 (Unified)"
@@ -1549,10 +1567,8 @@ run_suite() {
     run test_42_inf_loop_fix "Regression: Infinite Loop (Retain=0)" "$@"
     run test_43_log_segregation "Feature: Agent Log Segregation" "$@"
     run test_44_waterfall_backlog "Regression: Waterfall Backlog Flushing" "$@"
-
-    # 3. Dynamic Matrix Test (Remote)
     run test_98_check_job_done "Remote Job Done Checks" "$@"
-    # run test_99_remote "Remote Matrix Cascade" "$@"
+    run test_99_config_hierarchy "Configuration Hierarchy" "$@"
 }
 
 clean_logs
