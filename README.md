@@ -5,7 +5,7 @@
 
 ## Overview
 
-`snapshot-backup.sh` is a modern, Perl-free replacement for the `rsnapshot` backup system. It was developed extensively using **Gemini AI v3.0** within Google's Antigravity AI-enabled editor. Notably, version 15.0 marks the first fully **POSIX sh compliant** release, supporting generic Linux and BusyBox environments.
+`snapshot-backup.sh` is a modern, Perl-free replacement for the `rsnapshot` backup system. It was developed extensively using **Gemini AI v3.0** within Google's Antigravity AI-enabled editor. Notably, version 16.0 marks a mature **POSIX sh compliant** release, supporting generic Linux and BusyBox environments.
 
 To mitigate validity issues common in AI development, the project relies on a comprehensive **Integration Test Suite** (`integration-test.sh`). This suite validates logic, error handling, and expected behavior at every step, ensuring a robust and reliable codebase. 
 
@@ -88,19 +88,29 @@ Adapt `BACKUP_ROOT` and `SOURCE_DIRS` to your system.
 
 ```bash
 # /etc/snapshot-backup.conf (Local Example)
+CONFIG_VERSION="2.0"
 
 BACKUP_MODE="LOCAL"
 BACKUP_ROOT="/mnt/external_drive"
 
 # Retention: Keep 7 dailies, 4 weeklies...
-RETAIN_HOURLY=24
+RETAIN_HOURLY=0
 RETAIN_DAILY=7
 RETAIN_WEEKLY=4
 RETAIN_MONTHLY=12
 RETAIN_YEARLY=5
 
-SOURCE_DIRS=( "/etc" "/home" "/var/www" )
-EXCLUDE_PATTERNS=( "*.tmp" "*.iso" "Downloads/" )
+SOURCE_DIRS='
+    "/etc"
+    "/home"
+    "/var/www"
+'
+
+EXCLUDE_PATTERNS='
+    "*.tmp"
+    "*.iso"
+    "Downloads/"
+'
 ```
 
 #### Option B: Remote Backup (over SSH)
@@ -109,6 +119,7 @@ Adapt `REMOTE_HOST`, `SSH_KEY`, and `CLIENT_NAME` to your environment.
 
 ```bash
 # /etc/snapshot-backup.conf (Remote Example)
+CONFIG_VERSION="2.0"
 
 BACKUP_MODE="REMOTE"
 
@@ -128,8 +139,15 @@ RETAIN_WEEKLY=4
 RETAIN_MONTHLY=12
 RETAIN_YEARLY=2
 
-SOURCE_DIRS=( "/etc" "/home" )
-EXCLUDE_PATTERNS=( "*.tmp" "Cache/" )
+SOURCE_DIRS='
+    "/etc"
+    "/home"
+'
+
+EXCLUDE_PATTERNS='
+    "*.tmp"
+    "Cache/"
+'
 ```
 
 ### 3. Remote Server Setup (Optional)
@@ -222,10 +240,10 @@ For a restore-friendly setup, look at your `/etc/fstab` and add every real parti
 *Matching Backup Config:*
 
 ```bash
-SOURCE_DIRS=(
+SOURCE_DIRS='
     "/"
     "/home"
-)
+'
 ```
 *Note: Because of `-x`, backing up `/` will NOT duplicate `/home` content, even though `/home` is technically inside `/`.*
 
@@ -507,23 +525,33 @@ Usage: `snapshot-backup.sh [OPTIONS]`
 *   **Function:** Interval in days to force a deep checksum verification. Supports "Road Warriors" by catching up on verification if machine was offline.
 *   **Default:** `35` (Set to `0` to disable)
 
-#### `SMART_PURGE_LIMIT_GB`
+#### `SPACE_LOW_LIMIT_GB`
 *   **Function:** Low disk space threshold (in GB). If free space is below this limit, retention is reduced.
 *   **Default:** `0` (Disabled)
+
+#### `SMART_PURGE_SLOTS`
+*   **Function:** Number of slots to reduce from retention rules when low space is detected.
+*   **Default:** `0`
 
 ### Sources & Filters
 
 #### `SOURCE_DIRS`
-*   **Function:** Bash array of local directory paths to back up.
-*   **Example:** `SOURCE_DIRS=("/etc" "/home" "/var/www")`
+*   **Function:** Multi-line string of local directory paths to back up.
+*   **Example:**
+    ```bash
+    SOURCE_DIRS='
+        "/etc"
+        "/home"
+    '
+    ```
 
 #### `EXCLUDE_PATTERNS`
-*   **Function:** Bash array of rsync exclude patterns.
-*   **Example:** `EXCLUDE_PATTERNS=("*.tmp" ".cache/")`
+*   **Function:** Multi-line string of rsync exclude patterns.
+*   **Example:** `EXCLUDE_PATTERNS=' "*.tmp" ".cache/" '`
 
 #### `EXCLUDE_MOUNTPOINTS`
-*   **Function:** Bash array of mountpoints to exclude from content backup but **force creation** as empty directories.
-*   **Example:** `EXCLUDE_MOUNTPOINTS=("/proc" "/sys" "/dev")`
+*   **Function:** Multi-line string of mountpoints to exclude.
+*   **Example:** `EXCLUDE_MOUNTPOINTS=' "/proc" "/sys" '`
 
 ### System Config
 
@@ -539,6 +567,10 @@ Usage: `snapshot-backup.sh [OPTIONS]`
 *   **Function:** Send desktop notifications via `notify-send` for start/finish/error events.
 *   **Options:** `true` / `false`
 *   **Default:** `false`
+
+#### `LOG_PROGRESS_INTERVAL`
+*   **Function:** Seconds between progress updates for long-running rsync operations.
+*   **Default:** `60`
 
 #### `RSYNC_EXTRA_OPTS`
 *   **Function:** Additional flags to pass directly to the `rsync` command.
@@ -591,6 +623,7 @@ Use `integration-test.sh` for all changes. It creates a self-contained environme
 - Remote simulation.
 
 ## Version History
+- **v16.0**: Strict POSIX compliance refactoring. Configuration schema v2.0. Improved variable scoping.
 - **v15.1**: Security & Usability Update. Added `--setup-remote` wizard with strict client-name checks and auto-hardening (SSH `authorized_keys` lock).
 - **v15.0**: POSIX sh Rewrite. BusyBox capability (fallback for timeout/ACLs). Debug mode.
 - **v14.1**: Integration Suite improvements.
