@@ -1569,12 +1569,12 @@ do_setup_remote() {
          fi
     fi
     
+    do_deploy_agent "$target"
     if ssh -q -o BatchMode=yes -o ConnectTimeout=5 -i "$key_file" "$target" "exit 0" >/dev/null 2>&1; then
         log "INFO" "Checking for existing client data..."
         if ssh -i "$key_file" "$target" "[ -d \"$REMOTE_STORAGE_ROOT/$CLIENT_NAME\" ]" 2>/dev/null; then
              log "WARN" "Note: Client directory '$CLIENT_NAME' seems to already exist on target."
         fi
-        do_deploy_agent "$target"
         log "INFO" "Hardening SSH access..."
         local pub_key_content; pub_key_content=$(cat "$key_file.pub")
         local wrapper_cmd="/usr/local/bin/snapshot-wrapper.sh $CLIENT_NAME"
@@ -1583,8 +1583,7 @@ do_setup_remote() {
         ssh -i "$key_file" "$target" "sed -i.bak '/$key_body/ s|^ssh-ed25519|$restriction ssh-ed25519|' ~/.ssh/authorized_keys"
         log "SUCCESS" "Remote setup complete. Access restricted."
     else
-        log "INFO" "Target is already restricted/hardened. Updating Agent via Wrapper..."
-        log "SUCCESS" "Remote system already setup and restricted."
+        log "SUCCESS" "Remote system updated. Access already restricted."
     fi
 }
 
