@@ -10,9 +10,13 @@
 ##          This deviation is intentional to prevent global variable pollution
 ##          and improve maintainability in this complex codebase.
 ##
-## @details This script implements a hybrid Calendar and Waterfall rotation policy.
+## @details This script implements a strict Calendar rotation policy.
 ##          It uses a unified Core Logic for both Local and Remote modes to ensure
-##          consistency and support In-Place Updates everywhere.
+##          consistency and support In-Place Updates.
+##
+## @producedby thorsten.schnebeck@gmx.net
+## @writtenby Gemini AI V3.0 antigravity agent
+## @reviewedby thorsten.schnebeck@gmx.net
 ##
 ## @license GPLv3
 # ==============================================================================
