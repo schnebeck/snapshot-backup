@@ -1,649 +1,452 @@
-# **snapshot-backup.sh \- An Incremental Backup System**
+# snapshot-backup.sh - Intelligent Incremental Backup
 
-**⚠️ STATUS: STABLE / PRODUCTION READY**  
-Version 17.00 markiert einen signifikanten Meilenstein in Stabilität und Logik-Konsistenz.
+⚠️ **STATUS: STABLE / PRODUCTION READY (v18.2)**
 
-## **Overview**
+### ⚖️ DISCLAIMER / LIMITATION OF LIABILITY
 
-snapshot-backup.sh is a modern, Perl-free replacement for the rsnapshot backup system. It was developed extensively using **Gemini AI** within Google's Antigravity AI-enabled editor. Notably, version 17.0 marks a mature **POSIX sh compliant** release, supporting generic Linux and BusyBox environments with a unified core logic.  
-To mitigate validity issues common in AI development, the project relies on a comprehensive **Integration Test Suite** (integration-test.sh). This suite validates logic, error handling, and expected behavior at every step, ensuring a robust and reliable codebase.  
-snapshot-backup.sh is a robust, incremental snapshot backup solution featuring waterfall rotation, atomic updates, and a unified agent architecture. It leverages **hardlinks** to ensure efficiency: snapshots share data for unchanged files, meaning a full file history is preserved while only occupying storage space for actual changes.  
-**Flexible Deployment:**
+> **THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED.** This script executes critical system commands (`rm`, `mv`, `rsync`) with root privileges. While it includes extensive safety mechanisms (Integration Tests, Strict Mode, Atomic Updates), use it at your own risk. **Please test your restore procedure before relying on this backup!**
 
-* **Local**: Back up directly to internal drives, USB storage, or mounted volumes (e.g., iSCSI).  
-* **Remote**: Use the embedded Agent to push/pull backups via SSH. This simplifies remote backups over VPNs or the internet, removing the need for complex networked storage protocols.
+## 📖 About This Tool
 
-## **Key Features**
+***snapshot-backup.sh*** is a modern, POSIX-compliant shell script designed as a robust alternative to `rsnapshot`. It creates incremental backups using hardlinks to save space and manages history intelligently based on **calendar logic** rather than simple rotation counts.
 
-* **Unified Architecture**: One script handles client orchestration and server-side agent duties.  
-* **Unified Core Logic**: Identical rotation and promotion logic for both Local and Remote modes ensures consistent behavior regardless of the target.  
-* **Seeding & Healing**: Automatically fills gaps in the retention hierarchy (e.g., creating a missing .0 directory from the next available snapshot) during initialization.  
-* **Waterfall Rotation**: Implements a cascading retention policy. When a new backup is created, older backups are promoted down the chain (Hourly \-\> Daily \-\> Weekly \-\> Monthly \-\> Yearly) to maintain history efficiently.  
-* **Recursive Promotion**: Advanced logic ensures that snapshots ripple through the retention chain correctly in a single run if multiple promotions are due.  
-* **Calendar-Based Promotion ("Road Warrior" Logic)**: The system recalculates promotion eligibility on every run based on the **timestamp of the snapshot**, not just the run time.  
-  * *Example*: If a laptop backup runs once a month, the script correctly recognizes that a "Weekly" and "Monthly" promotion is due, even if 30 days have passed since the last run. This ensures gaps are handled gracefully and history is strictly preserved according to actual dates.  
-* **Single Trigger Logic**: Unlike rsnapshot which requires separate entries for each interval, this script requires only **one** generic trigger (e.g. Cron, Systemd Timer, or Network Dispatcher). It intelligently evaluates all rotation and promotion rules on every single run.  
-* **Atomic Updates**: Backups are first created in a temporary directory (.tmp). Only after a successful transfer are they moved to their final name. This guarantees that you never have broken or incomplete snapshots in your history.  
-* **Smart Purge**: Automatically reduces retention depth if storage space falls below a defined threshold.  
-* **Remote & Local**: Supports checking backing up local directories or pushing/pulling to remote servers via SSH.  
-* **Self-Deployment**: Can install itself to remote agents with a single command.  
-* **Parallel Agent Support**: Automatically segregates log files (snapshot-backup-CLIENT.log) and syslog tags based on client name, ensuring clean logs even when multiple agents run simultaneously.
+It features a **Unified Core Logic** for:
 
-## **Scope & Limitations (Intended Use)**
+- **Local Backups:** USB drives, NAS mounts, and internal disks.
 
-This tool is designed for **simplicity and robustness** in trusted environments.
+- **Remote Backups:** Push via SSH (automatically deploys and manages its own agent on the server).
 
-### **✅ Perfect Implementation For:**
+## ⚙️ System Requirements
 
-* **Homelabs / SOHO**: Backing up Laptops, Raspberry Pis, and Servers in a private LAN/VPN.  
-* **Trusted Networks**: Where clients are managed by the same administrator as the backup server.  
-* **"Road Warriors"**: Laptops that connect sporadically via VPN.
+- **Operating System:** Linux, BSD, macOS, or Embedded Systems (BusyBox/Synology).
 
-### **❌ NOT Designed For:**
+- **Shell:** Standard POSIX `/bin/sh` compatible (Bash is **not** required).
 
-* **Zero-Trust Environments**: Backing up untrusted third-party clients.  
-* **Public Internet**: Exposing the SSH backup port directly to the internet (use a VPN\!).  
-* **Multi-Tenant Hosting**: Where "Client A" must be mathematically prevented from hacking "Client B" even if they gain root on the backup server.
+- **Dependencies:**
+  
+  - *Essential:* `rsync`, `ssh` (OpenSSH), and standard coreutils (`cp`, `mv`, `rm`, `stat`).
+  
+  - *Recommended:* `logger` (for syslog integration), `notify-send` (for desktop notifications).
 
-*Reason*: The "Push" architecture via rsync requires root access, which inherently implies trust. For Zero-Trust, look at "Pull" architectures or tools like BorgBackup.
+- **Compatibility:** The script is built for resilience. It automatically detects missing features on minimal systems (e.g., if the `timeout` command is unavailable) and degrades gracefully without crashing.
 
-## **Requirements**
+## 🌟 Core Concepts (Key Features)
 
-### **Client (The machine running the backup job)**
+### 1. Push-Agent Architecture (Remote Backups)
 
-* **OS**: Linux / Unix-like / BusyBox (Embedded Systems)  
-* **Shell**: POSIX sh compatible (Bash is NOT required).  
-* **Dependencies**:  
-  * Essential: rsync, ssh  
-  * Recommended: logger (for syslog), notify-send (for desktop notifications)  
-  * Fallbacks: Script automatically handles missing timeout command on minimal systems.  
-* **Access**: SSH access to the backup server (if remote).
+A local backup is better than no backup, but it does not protect against fire or theft. Off-site backups are essential.
+Unlike traditional systems where a central server "pulls" data from clients (requiring the server to have root access to your laptop), **snapshot-backup.sh** uses a "Push" model.
+The client connects to the server and starts a temporary, unprivileged agent. This agent manages the storage logic locally on the server. There is no background daemon waiting on the server; the client is in full control.
 
-### **Server (The machine validating/storing backups)**
+### 2. The "Base Retention Level"
 
-* **OS**: Linux / Unix-like  
-* **Dependencies**: rsync, bash (v4+), logger, openssh-server, sftp-server  
-* **User**: Dedicated backup user (recommended) or root.
+The script supports five stacked **Retention Levels**:
 
-## **Installation & Configuration**
+1. `hourly`
 
-### **1\. Installation (Client)**
+2. `daily`
 
-*Perform this on every machine you want to back up.*  
-Copy the script to your system path and make it executable:  
-sudo cp snapshot-backup.sh /usr/local/sbin/snapshot-backup.sh  
+3. `weekly`
+
+4. `monthly`
+
+5. `yearly`
+
+You define how many snapshots to keep for each level. Setting a level to `0` disables it.
+The script automatically detects your shortest configured level (usually `daily`). The newest snapshot of this level (e.g., `daily.0`) is **protected**. It represents the state of the *last successful run*. It is never immediately promoted or rotated away, ensuring the admin always knows exactly where the most recent data is.
+
+### 3. Calendar-Based Promotion
+
+Backups are not copied; they are **promoted**.
+The script distinguishes between a simple "Rotation" (shifting numbers) and a "Promotion" (moving up a level).
+When the system detects that a backup represents the start of a new **Calendar Period** (e.g., a Monday for "Weekly", or the 1st day of the month for "Monthly"), that snapshot is moved directly from the Base Level to the higher level.
+
+- **Benefit:** A specific snapshot physically exists in only *one* folder at a time. This eliminates duplicates and maximizes storage efficiency.
+
+### 4. In-Place Updates (Smart Refresh)
+
+If the backup runs multiple times within the same **Time Period** (e.g., a laptop backing up 5 times on the same day), the script detects that a backup for "today" already exists.
+Instead of creating a redundant `daily.0` and rotating the previous one, it performs an **rsync update** into the existing folder.
+
+- **Result:** A clean history (1 day = 1 snapshot), regardless of how often the script triggers.
+
+### 5. Smart Purge (Disk Space Protection)
+
+To prevent the backup drive from filling up completely, you can define a `SPACE_LOW_LIMIT_GB`. If the destination storage drops below this threshold, the script proactively deletes the oldest snapshots from the Base Retention Level *before* starting the new transfer. This ensures the process does not crash due to a full disk.
+
+### 6. Self-Healing & Gap Closing
+
+Before every run, the system checks the consistency of the backup chain. If a snapshot is manually deleted (e.g., `daily.2` is missing), the script automatically renames older snapshots (`daily.3` becomes `daily.2`) to close the gap. The sequence remains continuous.
+
+## 🎯 Scope & Limitations (Intended Use)
+
+This tool is designed for simplicity and robustness in trusted environments.
+
+✅ **Perfect Implementation For:**
+
+- **Homelabs / SOHO:** Backing up Laptops, Raspberry Pis, and Servers in a private LAN/VPN.
+
+- **Trusted Networks:** Where clients are managed by the same administrator as the backup server.
+
+- **"Road Warriors":** Laptops that connect sporadically via VPN or SSH.
+
+❌ **NOT Designed For:**
+
+- **Zero-Trust Environments:** Backing up untrusted third-party clients.
+
+- **Public Internet:** Exposing the SSH backup port directly to the internet (please use a VPN like oPenVPN or WireGuard).
+
+- **Multi-Tenant Hosting:** Where "Client A" must be mathematically prevented from accessing "Client B" even if they gain root access to the backup server.
+
+*Reason: The "Push" architecture via rsync generally requires trusted access. For Zero-Trust, consider "Pull" architectures or encryption-at-rest tools like BorgBackup.*
+
+## 🚀 Quick Start
+
+### 1. Installation
+
+Run this on the machine you want to back up (Client):
+
+```
+# 1. Copy the script
+sudo cp snapshot-backup.sh /usr/local/sbin/snapshot-backup.sh
 sudo chmod 700 /usr/local/sbin/snapshot-backup.sh
+```
 
-### **2\. Configuration**
+### 2. Configuration
 
-**CRITICAL**: You must create a valid configuration file before proceeding.  
-**Tip**: To see all available options and default values (useful for generating a initial config), run:  
-snapshot-backup.sh \--show-config
+Create `/etc/snapshot-backup.conf`. You can generate a template using `--show-config`.
 
-#### **Option A: Local Backup (USB/NAS Mount)**
+**Example A: Local Backup (USB/NAS)**
 
-Template for local backups.  
-Adapt BACKUP\_ROOT and SOURCE\_DIRS to your system.  
-\# /etc/snapshot-backup.conf (Local Example)  
-CONFIG\_VERSION="2.0"
+```
+CONFIG_VERSION="2.0"
+BACKUP_MODE="LOCAL"
+BACKUP_ROOT="/mnt/backup"
 
-BACKUP\_MODE="LOCAL"  
-BACKUP\_ROOT="/mnt/external\_drive"
+# Retention Settings (How many to keep?)
+RETAIN_HOURLY=0   # Set >0 to make 'hourly' the Base Level
+RETAIN_DAILY=7    # Standard Base Level
+RETAIN_WEEKLY=4
+RETAIN_MONTHLY=12
+RETAIN_YEARLY=2
 
-\# Retention: Keep 7 dailies, 4 weeklies...  
-RETAIN\_HOURLY=0  
-RETAIN\_DAILY=7  
-RETAIN\_WEEKLY=4  
-RETAIN\_MONTHLY=12  
-RETAIN\_YEARLY=5
+# Safety Features
+SPACE_LOW_LIMIT_GB=50   # Trigger Smart Purge if free space < 50GB
+SMART_PURGE_SLOTS=2     # Delete 2 oldest dailies to free up space
 
-SOURCE\_DIRS='  
-    "/etc"  
-    "/home"  
-    "/var/www"  
-'
+SOURCE_DIRS=' "/etc" "/home" '
+EXCLUDE_PATTERNS=' "*.tmp" "Cache/" ".git/" '
+ENABLE_NOTIFICATIONS=true
+```
 
-EXCLUDE\_PATTERNS='  
-    "\*.tmp"  
-    "\*.iso"  
-    "Downloads/"  
-'
+**Example B: Remote Backup (SSH)**
 
-#### **Option B: Remote Backup (over SSH)**
+```
+CONFIG_VERSION="2.0"
+BACKUP_MODE="REMOTE"
+CLIENT_NAME="my-laptop"   # Important: Unique ID for this machine
+REMOTE_HOST="192.168.1.10"
+REMOTE_USER="root"
+REMOTE_PORT="22"
+REMOTE_KEY="/root/.ssh/id_ed25519"
 
-Template for remote backups.  
-Adapt REMOTE\_HOST, SSH\_KEY, and CLIENT\_NAME to your environment.  
-\# /etc/snapshot-backup.conf (Remote Example)  
-CONFIG\_VERSION="2.0"
+# ... Retention & Sources as above ...
+```
 
-BACKUP\_MODE="REMOTE"
+*Only for Remote:* Run the setup wizard once to exchange keys and prepare the server:
 
-\# Remote Connection Details  
-REMOTE\_USER="root"  
-REMOTE\_HOST="backup.lan"  
-REMOTE\_PORT="22"  
-SSH\_KEY="/root/.ssh/id\_ed25519"
+```
+sudo snapshot-backup.sh --setup-remote root@192.168.1.10
+```
 
-\# Unique ID for this machine (REQUIRED for Setup Wizard)  
-CLIENT\_NAME="laptop-bedroom"
+*Note: This command is idempotent. It installs/updates the agent on the server without creating unnecessary directories.*
 
-\# Retention  
-RETAIN\_HOURLY=0   \# Laptops might skip hourly  
-RETAIN\_DAILY=7  
-RETAIN\_WEEKLY=4  
-RETAIN\_MONTHLY=12  
-RETAIN\_YEARLY=2
+## 🎮 Usage & Automation
 
-SOURCE\_DIRS='  
-    "/etc"  
-    "/home"  
-'
+The script is designed for automation but can be controlled manually.
 
-EXCLUDE\_PATTERNS='  
-    "\*.tmp"  
-    "Cache/"  
-'
+| Command                                   | Description                                               |
+| ----------------------------------------- | --------------------------------------------------------- |
+| `sudo snapshot-backup.sh`                 | Starts the backup (runs Smart Logic).                     |
+| `sudo snapshot-backup.sh --status`        | Shows a table of all snapshots & their age.               |
+| `sudo snapshot-backup.sh --mount`         | Temporarily mounts the backup (Local or SSHFS).           |
+| `sudo snapshot-backup.sh --verify`        | Forces a deep checksum verification (Bit-Rot protection). |
+| `sudo snapshot-backup.sh --version`, `-v` | Show script version.                                      |
 
-### **3\. Remote Server Setup (Optional)**
+### Automation (Cron)
 
-*Perform this ONLY if you are backing up to a remote server.*  
-Once your CLIENT\_NAME is configured (Step 2), use the wizard to prepare the server.
+A single line handles all retention levels (Daily, Weekly, Monthly...):
 
-#### **Remote Agent Deployment (Wizard)**
+```
+# /etc/cron.d/snapshot-backup
+# Run every day at 04:00
+0 4 * * * root /usr/local/sbin/snapshot-backup.sh
+```
 
-**Recommended Method**: Use the built-in wizard.  
-\# Syntax: snapshot-backup.sh \--setup-remote \[USER\]@\[HOST\]  
-sudo ./snapshot-backup.sh \--setup-remote root@backup-server.local
+### Automation (NetworkManager / Laptop)
 
-**What this does:**
+Ideal for laptops: Starts backup automatically when home and on AC power.
+Create `/etc/NetworkManager/dispatcher.d/99-backup`:
 
-1. **Duplicate Check**: Verifies if CLIENT\_NAME conflicts with existing data.  
-2. **SSH Check**: Checks/Generates SSH keys and copies them to the server (ssh-copy-id).  
-3. **Deployment**: Installs the snapshot-agent.sh script on the server.  
-4. **Auto-Hardening**: Locks the SSH key in authorized\_keys to this specific CLIENT\_NAME.
+```
+#!/bin/bash
+INTERFACE="$1"
+ACTION="$2"
+MY_SSID="Home-WiFi"
 
-#### **Manual Remote Setup (Advanced)**
+if [ "$ACTION" = "up" ]; then
+    CURRENT=$(nmcli -t -f GENERAL.CONNECTION dev show "$INTERFACE" | cut -d: -f2)
+    if [ "$CURRENT" = "$MY_SSID" ] && on_ac_power; then
+         /usr/local/sbin/snapshot-backup.sh &
+    fi
+fi
+```
 
-*For manual setups or scripts.*
+## 📂 Restore
 
-1. **SSH Keys**:  
-   ssh-keygen \-t ed25519  
-   ssh-copy-id root@backup-server.local
+Since backups are standard file systems, you can use any file manager or `cp`.
 
-2. **Install Agent**:  
-   \# Legacy command for batch scripts  
-   sudo ./snapshot-backup.sh \--deploy-agent root@backup-server.local
+**Local Restore:**
 
-3. Security Hardening:  
-   Edit /root/.ssh/authorized\_keys on the server manually:  
-   command="/usr/local/bin/snapshot-wrapper.sh my-client-name" ssh-ed25519 ...
+```
+cp -a /mnt/backup/daily.0/home/user/file.txt ~/Desktop/
+```
 
-#### **3\. Agent Configuration (Optional)**
+**Remote Restore (via Mount):**
 
-The agent (remote side) also uses a configuration file, typically located at /etc/snapshot-agent.conf. This allows you to override storage paths specifically for the server.  
-**Note:** This file is **client-agnostic**. You only need one file for all incoming clients.  
-\# /etc/snapshot-agent.conf on Remote Server
+```
+# 1. Mount the remote storage locally
+sudo snapshot-backup.sh --mount /tmp/restore_point
 
-\# Override storage root for this agent  
-BASE\_STORAGE="/var/backups/snapshots"
+# 2. Copy files
+cp -a /tmp/restore_point/daily.0/home/user/file.txt ~/
 
-#### **4\. Automatic Log Segregation & Syslog**
+# 3. Unmount
+sudo snapshot-backup.sh --umount /tmp/restore_point
+```
 
-The Agent (v15.0+) is designed for high-concurrency environments.
+## 🧠 Appendix: Deep Dive & Details
 
-* **File Logging**: If the default log path (/var/log/snapshot-backup.log) is used, the Agent automatically redirects its output to /var/log/snapshot-backup-\<CLIENT\_NAME\>.log. This ensures that logs from different clients are kept in separate files on the server.  
-* **Syslog Tagging**: All syslog messages are tagged with snapshot-backup-\<CLIENT\_NAME\>, allowing you to filter logs easily using journalctl \-t snapshot-backup-\<CLIENT\_NAME\>.
+### A. Strict Side-Effect Isolation
 
-No manual configuration is required for this feature; it activates automatically based on the Client Name.
+The remote agent is designed to be "clean". Commands like `--version`, `--status`, or `--check-storage` do **not** create directories or modify the filesystem on the server. Storage folders are only initialized when a write operation (like `prepare` or `commit`) is explicitly requested.
 
-## **Usage**
+### B. Why are snapshots missing from the Base Level?
 
-### **1\. Best Practices & Filesystem Boundaries**
+You might notice that Monday backups are often missing from the `daily` folder. **Reason:** Monday is usually the start of a new week. The script detects this via "Calendar Promotion" and immediately moves that backup to `weekly.0`. It is not missing; it has simply been promoted to the next logical level.
 
-The script **mandatorily** uses rsync \-x (--one-file-system). This means rsync will count the "borders" of your filesystems but not cross them.  
-**Effect on Mount Points:**
+### C. Road-Warrior Logic
 
-* If you back up /, and /boot is a separate partition, the backup will contain an empty /boot directory.  
-* This is a **feature**: It preserves your full directory structure so you can simply mount file systems into these empty folders during a restore.
+If a laptop has been offline for 3 weeks:
 
-From fstab to Config:  
-For a restore-friendly setup, look at your /etc/fstab and add every real partition (ext4, xfs) to SOURCE\_DIRS.  
-*Example Fstab:*  
-/dev/sda1  /      ext4 ...  
-/dev/sda2  /home  ext4 ...
+1. The script runs.
 
-*Matching Backup Config:*  
-SOURCE\_DIRS='  
-    "/"  
-    "/home"  
-'
+2. It detects: "The last `weekly` snapshot is 3 weeks old."
 
-*Note: Because of \-x, backing up / will NOT duplicate /home content, even though /home is technically inside /.*
+3. The *new* backup is created and immediately cascades up the chain to fill the oldest missing gap in `weekly` or `monthly`.
 
-### **2\. Running Backups**
+### D. Desktop Notifications
 
-The script is designed to be run by the root user (or a privileged backup user) via Cron or a Systemd Timer.
+The script automatically detects the currently logged-in GUI user and sends status notifications (`libnotify`), even if the script is running as root in the background. This can be disabled via `ENABLE_NOTIFICATIONS=false`.
 
-#### **Manual Run (Testing)**
+### E. CLI Options Reference
 
-To verify the configuration and run an immediate backup:  
-sudo snapshot-backup.sh \--config /etc/snapshot-backup.conf
+**`--status`** Connects to the storage (local or remote) and displays a formatted table of all existing snapshots, their timestamps, and age. Also shows storage usage and mount status.
 
-#### **Automation (Cron)**
+**`--config [FILE]`, `-c [FILE]`** Loads a custom configuration file instead of the default `/etc/snapshot-backup.conf`. Useful for managing multiple backup jobs or testing.
 
-Add a job to /etc/crontab to run hourly.  
-Migration Note: Unlike rsnapshot, do NOT add separate lines for daily/weekly/etc. One line handles everything\!  
-\# Run backup at minute 0 of every hour  
-0 \* \* \* \* root /usr/local/sbin/snapshot-backup.sh \--config /etc/snapshot-backup.conf
+**`--version`, `-v`** Displays the current version of the script and exits.
 
-*Note: The script's locking mechanism prevents overlapping runs.*
+**`--verify`** Forces a deep checksum verification (`rsync --checksum`) for this run. This reads every file on both source and destination to detect bit-rot or silent corruption. Significantly slower than standard metadata checks.
 
-### **3\. Monitoring & Status**
+**`--mount [PATH]`** Mounts the backup storage to the specified `[PATH]` (or defaults to the configured `BACKUP_ROOT`).
 
-You can check the current status of snapshots (local or remote) at any time. This command is safe to run and does not interfere with active backups.  
-sudo snapshot-backup.sh \--status
+- **Local Mode:** Performs a bind mount.
 
-*Output includes: Process state, Storage usage, and a list of all snapshots per interval.*
+- **Remote Mode:** Uses `sshfs` to mount the remote storage locally.
 
-### **4\. Integrity Check (--verify)**
+**`--umount [PATH]`** Unmounts the backup storage from `[PATH]`. Safe wrapper around `umount` or `fusermount`.
 
-By default, the backup script relies on file size and modification time to detect changes (standard rsync behavior).  
-However, "Bit Rot" or silent filesystem corruption can go unnoticed.  
-The \--verify flag forces a **full checksum calculation** of all files in the base snapshot.
+**`--deploy-agent [TARGET]`** Manually deploys or updates the agent script on a remote host. `TARGET` is usually `user@host`. Useful for upgrading the agent without running the full setup wizard.
 
-* **Why it's important:** It ensures that the file content on the disk exactly matches your source, detecting corruption that metadata checks might miss.  
-* **Can I skip it?** Yes, for daily runs. It is very I/O intensive and slow.  
-* **Recommendation:** Run it once a week or once a month.
+**`--setup-remote [TARGET]`** Interactive wizard that handles SSH key generation, key exchange (`ssh-copy-id`), and agent deployment to the remote server.
 
-**Automatic "Road Warrior" Verification:**  
-You can configure DEEP\_VERIFY\_INTERVAL\_DAYS="35" (Default: 35\) in your config.  
-The script tracks the last successful verification timestamp locally. If more than 35 days have passed since the last verify, the next run will automatically force a verification, even if not explicitly requested. This ensures that laptops which miss their scheduled "1st of month" cron job will still be verified upon their next backup.  
-To disable, set DEEP\_VERIFY\_INTERVAL\_DAYS="0".  
-**Cron Example (Explicit Monthly Verify)**:  
-\# Run a deep verification on the 1st of every month at 02:00  
-0 2 1 \* \* root /usr/local/sbin/snapshot-backup.sh \--config /etc/snapshot-backup.conf \--verify
+**`--is-running`** Checks if a backup process is currently active. Returns exit code `0` if running, `1` if idle. Useful for monitoring scripts or status bars.
 
-**Scope & Feedback:**
+**`--is-job-done`** Checks if a valid backup for the current Base Interval (e.g., today for `daily`) already exists. Returns exit code `0` (true) if done, `1` (false) if a backup is needed.
 
-* **Works safely** for both **Local** and **Remote** modes.  
-* **Positive Feedback (Exit Code 0):** The run was successful. If corruption was found, rsync **automatically healed** it by re-transferring the correct data from the source. Check the logs: if "Total transferred file size" is 0, your data was perfect. If \> 0, changes (or corruption) were fixed.  
-* **Negative Feedback (Exit Code \!= 0):** A "Hard Failure" occurred (e.g. Disk could not be read, Network dropped). This requires manual intervention (Hardware check).
+**`--has-storage`** Checks if the backup storage is accessible and writable. Returns exit code `0` (true) on success, `1` (false) on failure.
 
-**Troubleshooting Verify Failure (Exit Code \!= 0):**
+**`--install [USER]`** Installs a convenience symlink (wrapper) to `/usr/local/bin/snapshot-backup` and ensures the script is executable.
 
-1. **Check Logs:** Look for I/O errors in dmesg or /var/log/syslog.  
-2. **Retry:** Run the command again to rule out transient network issues.
+**`--kill`, `-k`** Safely stops running backup processes. It attempts a SIGTERM first to allow cleanup, then force kills if necessary. Removes stale lock files.
 
-### **6\. Restoration (Mounting & Recovery)**
+**`--debug`** Enables verbose logging to stdout and the log file. Useful for troubleshooting connection or rsync issues.
 
-To restore individual files, you simply "mount" the backup directory.
+**`--timeout [SEC]`** Sets a custom timeout for network operations and checks. Overrides the default `NETWORK_TIMEOUT` (10s).
 
-* **Local Mode**: The directory is already accessible at BACKUP\_ROOT.  
-* **Remote Mode**: You can mount the remote storage via SSHFS or simply browse via SFTP/SCP.
+### F. Configuration Reference
 
-#### **Full System Recovery**
+**`BACKUP_MODE`** (Default: `LOCAL`)
+Defines the operation mode. `LOCAL` for direct disk access, `REMOTE` for SSH push.
 
-If you are restoring a full OS partition (e.g. from a Live USB), remember to verify fstab and recreate excluded system files.  
-EXCLUDED FILES Checklist:  
-If you used EXCLUDE\_PATTERNS to save space (e.g. swapfile), the system may warn on boot ("Timed out waiting for device"). This is safe but annoying.  
-**Fix (Post-Restore):**
+**`BACKUP_ROOT`** (Default: `/mnt/backup`)
 
-1. Boot into the system (Wait for timeout).  
-2. Recreate the Swapfile:  
-   sudo fallocate \-l 2G /swapfile  
-   sudo chmod 600 /swapfile  
-   sudo mkswap /swapfile  
-   sudo swapon /swapfile
+- **Local:** The directory where snapshots are stored.
 
-3. Recreate missing empty directories (/proc, /sys) if they were not auto-created by the script's EXCLUDE\_MOUNTPOINTS feature.
+- **Remote:** Used only as a default mountpoint for `--mount`.
 
-\*\* Tip for Laptop Users:\*\*  
-If you are on a laptop and checking backups remotely, you can use the status command to verify the last successful run. Since the script uses atomic commits, incomplete backups (e.g. if the laptop went to sleep) are held in a .tmp state and resumed automatically next time.
+**`CLIENT_NAME`** (Default: `hostname`)
+Unique identifier for this machine. On the remote server, backups are stored in `$REMOTE_STORAGE_ROOT/$CLIENT_NAME`.
 
-### **6\. Desktop User Context**
+**`REMOTE_USER`** (Default: `root`)
+SSH username for connecting to the backup server.
 
-The core backup runs as root in the background. Desktop users do not have permission to modify or mount backups directly.
+**`REMOTE_HOST`** (Default: `backup.server.local`)
+Hostname or IP address of the backup server.
 
-* **Notifications**: If enabled in config (ENABLE\_NOTIFICATIONS=true), desktop users (logged into GUI) will receive pop-up notifications for defined events (Failures, Success, etc.).
+**`REMOTE_PORT`** (Default: `22`)
+SSH port of the backup server.
 
-### **7\. Advanced: Debugging & Reference**
+**`REMOTE_KEY`** (Default: `/root/.ssh/id_ed25519`)
+Path to the private SSH key used for authentication.
 
-#### **Agent Mode (Direct Invocation)**
+**`REMOTE_STORAGE_ROOT`** (Default: `/var/backups/snapshots`)
+Absolute path on the *remote server* where all client backups are stored.
 
-The script automatically switches to Agent Mode when invoked as snapshot-agent.sh or with \--agent-mode.  
-To see available agent commands:  
-/usr/local/sbin/snapshot-agent.sh \--help
+**`RETAIN_HOURLY`** (Default: `0`)
+Number of hourly snapshots to keep. Set > 0 to enable hourly backups as the Base Level.
 
-#### **Wrapper Security Check**
+**`RETAIN_DAILY`** (Default: `7`)
+Number of daily snapshots to keep. Usually the Base Level.
 
-The installed wrapper restricts SSH commands to only allowed operations (rsync, checking status, agent logic).  
-To verify the wrapper:  
-/usr/local/bin/snapshot-wrapper.sh \--help
+**`RETAIN_WEEKLY`** (Default: `4`)
+Number of weekly snapshots (promoted from daily).
 
-## **Full Reference**
+**`RETAIN_MONTHLY`** (Default: `12`)
+Number of monthly snapshots (promoted from weekly).
 
-### **1\. Command Line Options (snapshot-backup.sh)**
+**`RETAIN_YEARLY`** (Default: `0`)
+Number of yearly snapshots (promoted from monthly).
 
-Usage: snapshot-backup.sh \[OPTIONS\]
+**`SOURCE_DIRS`** (Default: `/`)
+Space-separated list of local directories to back up. Example: `"/etc" "/home"`.
 
-### **General**
+**`EXCLUDE_PATTERNS`** (Default: `.cache *.tmp ...`)
+Space-separated list of file/folder patterns to exclude from rsync.
 
-#### **\--config**
+**`EXCLUDE_MOUNTPOINTS`** (Default: `/proc /sys /dev ...`)
+List of paths to exclude to prevent recursion or backing up virtual filesystems.
 
-* **Function:** Load a specific configuration file instead of the default /etc/snapshot-backup.conf.  
-* **Context:** local/remote  
-* **Options:** FILE (Path to config)  
-* **Example:** snapshot-backup.sh \--config /home/user/myconfig.conf
+**`SPACE_LOW_LIMIT_GB`** (Default: `0`)
+Minimum free space (in GB) required on the target. If free space is below this limit, the oldest snapshots are purged *before* backup. `0` disables this feature.
 
-#### **\--show-config**
+**`SMART_PURGE_SLOTS`** (Default: `0`)
+Number of oldest snapshots to delete when `SPACE_LOW_LIMIT_GB` is reached.
 
-* **Function:** Dump the currently loaded configuration and defaults to stdout. Useful for debugging or creating a new config file.  
-* **Context:** local  
-* **Example:** snapshot-backup.sh \--show-config \> /etc/snapshot-backup.conf
+**`DEEP_VERIFY_INTERVAL_DAYS`** (Default: `35`)
+Automatically force a `--verify` run every N days to detect bit-rot.
 
-#### **\--status**
+**`ENABLE_NOTIFICATIONS`** (Default: `true`)
+Send desktop notifications via `libnotify`.
 
-* **Function:** Show a summary of existing backup snapshots and storage usage.  
-* **Context:** local/remote  
-* **Example:** snapshot-backup.sh \--status
+**`NETWORK_TIMEOUT`** (Default: `10`)
+Timeout in seconds for SSH connection tests and status checks.
 
-#### **\--debug**
+**`RSYNC_EXTRA_OPTS`** (Default: empty)
+Additional flags to pass directly to the `rsync` command.
 
-* **Function:** Enable verbose debug logging to console and logfile (includes full rsync file lists).  
-* **Context:** local/remote  
-* **Example:** snapshot-backup.sh \--debug
+###The client connects to the server and starts a temporary, unprivileged agent. 
 
-#### **\--help, \-h**
+### G. Agent Configuration (Server-Side)
 
-* **Function:** Show the help message and exit.
+When running in Agent Mode (on the backup server), the script optionally reads `/etc/snapshot-agent.conf`. This file is not created by default but can be used to override server-side defaults.
 
-#### **\--version**
+**Key Variables:**
 
-* **Function:** Show script version.
+- `BASE_STORAGE_PATH`: (Default: `/var/backups/snapshots`) The root directory where all client backups are stored.
 
-#### **\--desktop**
+- `AGENT_LOCK_DIR`: (Default: `/var/run/snapshot-agent`) Directory for lock files to prevent concurrent access to the same client store.
 
-* **Function:** Send a desktop notification (via notify-send) with the current status. Useful for verifying notification setup.  
-* **Context:** local  
-* **Example:** snapshot-backup.sh \--desktop
+**Example `/etc/snapshot-agent.conf`:**
 
-### **Execution Control**
+```
+CONFIG_VERSION="2.0"
+BASE_STORAGE_PATH="/mnt/bigraid/backups"
+```
 
-#### **\--force-weekly, \-f**
-
-* **Function:** Force a weekly promotion run immediately, regardless of the current date.  
-* **Context:** local/remote
-
-#### **\--force-monthly, \-m**
-
-* **Function:** Force a monthly promotion run immediately.  
-* **Context:** local/remote
-
-#### **\--force-yearly, \-y**
-
-* **Function:** Force a yearly promotion run immediately.  
-* **Context:** local/remote
-
-#### **\--verify, \-v**
-
-* **Function:** Force a deep checksum verification relative to the previous snapshot.  
-* **Context:** local/remote  
-* **Note:** This is an expensive operation (reads all files). Defaults to metadata check (size/mtime) otherwise.
-
-#### **\--kill, \-k**
-
-* **Function:** Kill any currently running backup process for this client (identified by lockfile).  
-* **Context:** local  
-* **Example:** snapshot-backup.sh \--kill
-
-#### **\--timeout**
-
-* **Function:** Set network timeout in seconds for SSH/Rsync operations.  
-* **Default:** 10  
-* **Example:** snapshot-backup.sh \--timeout 120
-
-#### **\--service, \-s**
-
-* **Function:** Force Service Mode. Logs are directed to the logfile/syslog instead of stdout, even if run interactively.  
-* **Context:** local/remote
-
-### **Helpers & Status Checks**
-
-#### **\--is-running**
-
-* **Function:** Check if a backup is currently running. Returns exit code 0 (True) if running, 1 (False) otherwise.  
-* **Context:** local
-
-#### **\--is-job-done**
-
-* **Function:** Check if a valid backup already exists for the current interval (preventing duplicate runs).  
-* **Context:** local/remote
-
-#### **\--has-storage**
-
-* **Function:** Check if the backup storage is reachable and writable.  
-* **Context:** local/remote
-
-### **Deployment & Agent**
-
-#### **\--setup-remote**
-
-* **Function:** Remote Setup Wizard. Handles SSH Keys, installs the agent script, and applies Security Hardening (Client Locking).  
-* **Context:** local (sending to remote)  
-* **Options:** \[USER\]@\[HOST\]  
-* **Example:** snapshot-backup.sh \--setup-remote root@backup.local
-
-#### **\--deploy-agent (Legacy)**
-
-* **Function:** Alias for \--setup-remote. Kept for backward compatibility.
-
-#### **\--mount**
-
-* **Function:** Mount the backup directory to /tmp/mnt\_backup (or custom path). Uses mount \--bind for local and sshfs for remote.  
-* **Context:** local/remote  
-* **Options:** \[PATH\] (Optional target mountpoint), \--client \[NAME\] (For remote mode)  
-* **Example:** snapshot-backup.sh \--mount /mnt/restore
-
-#### **\--umount**
-
-* **Function:** Unmount the backup directory.  
-* **Context:** local/remote  
-* **Options:** \[PATH\] (Optional argument to specify what to unmount)
-
-#### **\--agent-mode**
-
-* **Function:** Run in agent mode (server-side logic). Usually invoked automatically via SSH or symlink.  
-* **Context:** remote (server-side)
-
-### **2\. Configuration Variables**
-
-#### **2a. Client Configuration (/etc/snapshot-backup.conf)**
-
-### **Storage & Logic**
-
-#### **BACKUP\_ROOT**
-
-* **Function:** Destination path for **LOCAL** mode. Ignored if BACKUP\_MODE="REMOTE".  
-* **Default:** /mnt/backup  
-* **Example:** BACKUP\_ROOT="/media/usb-drive/backups"
-
-#### **BACKUP\_MODE**
-
-* **Function:** Defines operation mode.  
-* **Options:** LOCAL (write to disk), REMOTE (SSH to agent)  
-* **Default:** LOCAL
-
-#### **CLIENT\_NAME**
-
-* **Function:** Unique identifier for this client. Used for folder naming on the remote server.  
-* **Default:** hostname
-
-### **Remote Connectivity**
-
-#### **REMOTE\_HOST**
-
-* **Function:** IP or Hostname of the backup server.
-
-#### **REMOTE\_USER**
-
-* **Function:** SSH user for the backup server.  
-* **Default:** root
-
-#### **REMOTE\_PORT**
-
-* **Function:** SSH port.  
-* **Default:** 22
-
-#### **REMOTE\_AGENT**
-
-* **Function:** Absolute path to the snapshot-agent.sh script on the remote server.  
-* **Default:** /usr/local/sbin/snapshot-agent.sh
-
-#### **SSH\_KEY**
-
-* **Function:** Private key file for SSH authentication.  
-* **Default:** \~/.ssh/id\_ed25519
-
-### **Retention Policy**
-
-#### **RETAIN\_${INTERVAL}**
-
-* **Function:** Number of snapshots to keep for each interval.  
-* **Variables:** RETAIN\_HOURLY, RETAIN\_DAILY, RETAIN\_WEEKLY, RETAIN\_MONTHLY, RETAIN\_YEARLY  
-* **Default:** Daily: 7, Weekly: 4, Monthly: 12, Yearly: 5
-
-#### **DEEP\_VERIFY\_INTERVAL\_DAYS**
-
-* **Function:** Interval in days to force a deep checksum verification. Supports "Road Warriors" by catching up on verification if machine was offline.  
-* **Default:** 35 (Set to 0 to disable)
-
-#### **SPACE\_LOW\_LIMIT\_GB**
-
-* **Function:** Low disk space threshold (in GB). If free space is below this limit, retention is reduced.  
-* **Default:** 0 (Disabled)
-
-#### **SMART\_PURGE\_SLOTS**
-
-* **Function:** Number of slots to reduce from retention rules when low space is detected.  
-* **Default:** 0
-
-### **Sources & Filters**
-
-#### **SOURCE\_DIRS**
-
-* **Function:** Multi-line string of local directory paths to back up.  
-* **Example:**  
-  SOURCE\_DIRS='  
-      "/etc"  
-      "/home"  
-  '
-
-#### **EXCLUDE\_PATTERNS**
-
-* **Function:** Multi-line string of rsync exclude patterns.  
-* **Example:** EXCLUDE\_PATTERNS=' "\*.tmp" ".cache/" '
-
-#### **EXCLUDE\_MOUNTPOINTS**
-
-* **Function:** Multi-line string of mountpoints to exclude.  
-* **Example:** EXCLUDE\_MOUNTPOINTS=' "/proc" "/sys" '
-
-### **System Config**
-
-#### **LOGFILE**
-
-* **Function:** Path to the log file.  
-* **Default:** /var/log/snapshot-backup.log
-
-#### **PIDFILE**
-
-* **Function:** Path to the lock file. Prevents multiple backup instances from running simultaneously (which could corrupt data or thrash IO). The \--kill command uses this file to identify the process ID of the running job.  
-* **Default:** /var/run/snapshot-backup.pid
-
-#### **ENABLE\_NOTIFICATIONS**
-
-* **Function:** Send desktop notifications via notify-send for start/finish/error events.  
-* **Options:** true / false  
-* **Default:** false
-
-#### **LOG\_PROGRESS\_INTERVAL**
-
-* **Function:** Seconds between progress updates for long-running rsync operations.  
-* **Default:** 60
-
-#### **RSYNC\_EXTRA\_OPTS**
-
-* **Function:** Additional flags to pass directly to the rsync command.  
-* **Example:** RSYNC\_EXTRA\_OPTS="--bwlimit=1000"
-
-#### **2b. Agent Configuration (/etc/snapshot-agent.conf)**
-
-#### **BASE\_STORAGE**
-
-* **Function:** **Overwrites the storage root.** Where the agent stores incoming backups on the server.  
-* **Default:** /var/backups/snapshots (if not set)
-
-#### **LOCK\_DIR**
-
-* **Function:** Directory for lock files.  
-* **Default:** /var/run/snapshot-agent
-
-## **Developer & Architecture Notes**
-
-### **Unified Single-File Design**
-
-The project uses a single file snapshot-backup.sh to simplify distribution and versioning.
-
-* **Client Logic**: Runs when executed as snapshot-backup.sh. Handles configuration, locking, and orchestration of rsync.  
-* **Agent Logic**: Runs when executed as snapshot-agent.sh (symlink) or with \--agent-mode. Handles local filesystem operations on the server side (prepare, commit, purge).
-
-### **Remote Protocol (Command Pattern)**
-
-The Client does not run arbitrary commands on the server. Instead, it triggers specific **Actions** via SSH:
-
-1. **Prepare**: Agent creates \<backup\_root\>/daily.0.tmp.  
-2. **Transfer**: Client rsyncs data directly into daily.0.tmp.  
-3. **Commit**: Agent rotates old snapshots and renames .tmp to daily.0.
-
-### **Root Requirement & Security Trade-Off**
+### H. Root Requirement & Security Trade-Off
 
 This tool is designed for **System Backups**, which inherently requires root privileges on both ends:
 
-* **Client**: To read all files (/etc/shadow, /home/\*) and preserve their ownership/permission attributes.  
-* **Server**: To write those files and chown them to their original users (UIDs/GIDs).
+1. **Client:** To read all files (e.g., `/etc/shadow`, `/home/*`) and preserve their ownership/permission attributes.
 
-**Security Implication**: Since the backup process requires a root SSH connection (albeit wrapped), a compromised client technically possesses elevated privileges on the backup server (via rsync).  
-**Mitigation Strategies**:
+2. **Server:** To write those files and `chown` them to their original users (UIDs/GIDs).
 
-1. **Trusted Networks (Primary Defense)**: Use this tool only in LANs or VPNs where you trust the clients. It is **not** designed for Zero-Trust environments.  
-2. **Security Wrapper (Logical Defense)**: Use the wrapper to lock SSH keys to specific client names. This prevents accidental overwrites or "spoofing" of other clients.  
-3. **Dedicated User (Defense in Depth)**: Advanced users can configure a dedicated backup user on the server (manual setup required).  
-   * Create user: useradd \-m backup  
-   * Configure sudo to allow backup to run specific execution logic as root.  
-   * *Limitation*: Even with a dedicated user, sudo access for rsync is effectively root file access. This adds a layer of defense (no direct root login), but does NOT sandbox the file system access.
+**Security Implication:** Since the backup process requires a root SSH connection (albeit wrapped), a compromised client technically possesses elevated privileges on the backup server (via rsync).
 
-### **Testing**
+**Mitigation Strategies:**
 
-Use integration-test.sh for all changes. It creates a self-contained environment (no root needed for local tests) and verifies:
+- **Trusted Networks (Primary Defense):** Use this tool only in LANs or VPNs where you trust the clients. It is not designed for Zero-Trust environments.
 
-* Retention logic (waterfall).  
-* Error handling (locking, timeout).  
-* Remote simulation.
+- **Security Wrapper (Logical Defense):** Use the wrapper (`snapshot-wrapper.sh`) to restrict SSH keys to specific commands. This prevents interactive logins.
 
-## **Version History**
+- **Dedicated User (Defense in Depth):** Advanced users can configure a dedicated backup user on the server (manual setup required).
+  
+  - Create user: `useradd -m backup`
+  
+  - Configure `sudo` to allow the backup user to run the agent/rsync as root.
+  
+  - *Limitation:* Even with a dedicated user, sudo access for rsync is effectively root file access. This adds a layer of defense (no direct root login), but does NOT sandbox the file system access.
 
-* **v17.00**: Major Release.  
-  * Unified Core Logic (Local/Remote parity).  
-  * Robust Seeding of missing intervals (automatic gap filling).  
-  * Recursive Calendar/Waterfall promotion for better consistency.  
-  * Strict integer sanitization & Shell hardening.  
-* **v16.0**: Strict POSIX compliance refactoring. Configuration schema v2.0. Improved variable scoping.  
-* **v15.1**: Security & Usability Update. Added \--setup-remote wizard with strict client-name checks and auto-hardening (SSH authorized\_keys lock).  
-* **v15.0**: POSIX sh Rewrite. BusyBox capability (fallback for timeout/ACLs). Debug mode.  
-* **v14.1**: Integration Suite improvements.  
-* **v14.0**: Unified Client & Agent. Added self-deployment and help functionality.  
-* **v13.xx**: Legacy split-script architecture.
+### I. The Security Wrapper
 
-## **License**
+When `snapshot-backup.sh` installs itself on the server (via `--setup-remote`), it configures the SSH key to execute a **Wrapper Script** instead of a raw shell.
 
-GPLv3
+**How it works:** The `authorized_keys` file on the server will look like this: `command="/usr/local/bin/snapshot-wrapper.sh",no-port-forwarding,... ssh-ed25519 AAAA...`
+
+The wrapper script (`snapshot-wrapper.sh`):
+
+1. Intercepts the incoming SSH command.
+
+2. **Validates** against a whitelist of allowed commands (e.g., `rsync`, `snapshot-agent.sh`).
+
+3. **Blocks** dangerous commands (like `/bin/bash`, `rm -rf /`).
+
+4. **Executes** the allowed command.
+
+This ensures that even if the SSH key is leaked, an attacker cannot easily get a full root shell on the server, but is restricted to the backup functions.
+
+---
+
+## 📆 Version History
+
+- **v18.2:** * Fix: Strict Side-Effect Isolation (prevents folder creation on non-write actions).
+  
+  - Fix: Wrapper logic alignment.
+  
+  - New: `--timeout` configuration and fallback handling.
+  
+  - New: Smart Purge logic for low disk space.
+  
+  - Changed: Removed short `-v` for verify (now `--version`).
+
+- **v18.00:** Drop waterfall promotion for cleaner Calendar Logic. Complete rewrite of Test Framework.
+
+- **v17.00:** Major Release. Unified Core Logic (Local/Remote parity). Robust Seeding of missing intervals. Recursive Calendar/Waterfall promotion. Strict integer sanitization.
+
+- **v16.0:** Strict POSIX compliance refactoring. Configuration schema v2.0. Improved variable scoping.
+
+- **v15.1:** Security & Usability Update. Added `--setup-remote` wizard with strict client-name checks and auto-hardening (SSH authorized_keys lock).
+
+- **v15.0:** POSIX sh Rewrite. BusyBox capability (fallback for timeout/ACLs). Debug mode.
+
+- **v14.1:** Integration Suite improvements.
+
+- **v14.0:** Unified Client & Agent. Added self-deployment and help functionality.
+
+- **v13.xx:** Legacy split-script architecture.
+
+---
+
+**License:** GPLv3 **Developed with:** ☕ and Shell-Love.

@@ -3,7 +3,7 @@
 # ==============================================================================
 ## @file    snapshot-backup.sh
 ## @brief   Unified Snapshot Backup Client & Agent (POSIX sh)
-## @version 17.00
+## @version 18.2
 ##
 ## @note    DEVIATION FROM STRICT POSIX:
 ##          This script utilizes the 'local' keyword for variable scoping.
@@ -25,7 +25,7 @@ umask 0077
 # 1. CONSTANTS & CONFIGURATION DEFAULTS
 # ==============================================================================
 
-SCRIPT_VERSION="17.00"
+SCRIPT_VERSION="18.2"
 EXPECTED_CONFIG_VERSION="2.0"
 
 # --- System Paths ---
@@ -373,6 +373,29 @@ notify() {
     ) || true
 }
 
+log_startup_summary() {
+    log "INFO" "--- Starting Backup Session (v$SCRIPT_VERSION) ---"
+    
+    if [ "$BACKUP_MODE" = "REMOTE" ]; then
+        log "INFO" "Target Remote: $REMOTE_USER@$REMOTE_HOST:$REMOTE_STORAGE_ROOT"
+        log "INFO" "Client ID:     ${CLIENT_NAME:-$(hostname)}"
+        
+        if [ -n "$BACKUP_ROOT" ] && [ "$BACKUP_ROOT" != "/" ]; then
+             log "INFO" "Local Mount:   $BACKUP_ROOT (only used for --mount actions)"
+        fi
+    else
+        log "INFO" "Target Local:  $BACKUP_ROOT"
+    fi
+
+    local space=""
+    if [ "$BACKUP_MODE" = "LOCAL" ] && [ -d "$BACKUP_ROOT" ]; then
+         space=$(df -hP "$BACKUP_ROOT" 2>/dev/null | awk 'NR==2 {print $4}')
+         log "INFO" "Disk Space:    $space available."
+    fi
+
+    log "INFO" "Retention:     H=$RETAIN_HOURLY D=$RETAIN_DAILY W=$RETAIN_WEEKLY M=$RETAIN_MONTHLY Y=$RETAIN_YEARLY"
+}
+
 # ==============================================================================
 # 3. CORE SHARED LOGIC
 # ==============================================================================
@@ -498,39 +521,6 @@ consolidate_directory_indices() {
     done
 }
 
-## @brief Populates empty higher intervals from the max of lower intervals.
-seed_missing_intervals() {
-    local prev_int=""
-    
-    # CRITICAL FIX: Use 'loop_int' instead of 'int' for iteration.
-    # In POSIX sh, loop variables are global. Using 'int' here would overwrite
-    # the 'int' variable in the parent function (core_prepare_backup_target),
-    # causing the backup to potentially run in the wrong interval (e.g. 'yearly').
-    for loop_int in $INTERVALS; do
-        local retain
-        retain=$(get_retention "$loop_int")
-        [ "$retain" -le 0 ] && continue
-
-        if [ -n "$prev_int" ]; then
-            if [ ! -d "$BACKUP_ROOT/$loop_int.0" ]; then
-                local prev_max
-                prev_max=$(get_max_index "$prev_int")
-                
-                # Check directly for -1 before sanitization/arithmetic
-                if [ "$prev_max" != "-1" ]; then
-                    prev_max=$(sanitize_int "$prev_max")
-                    if [ "$prev_max" -ge 0 ]; then
-                        log "INFO" "Seeding missing $loop_int.0 from $prev_int.$prev_max"
-                        cp -al "$BACKUP_ROOT/$prev_int.$prev_max" "$BACKUP_ROOT/$loop_int.0"
-                    fi
-                fi
-            fi
-        fi
-        prev_int="$loop_int"
-    done
-}
-
-## @brief Rotates all backups in an interval up by one index.
 rotate_period_up() {
     local int="$1"
     local raw_max
@@ -541,22 +531,19 @@ rotate_period_up() {
     local max_idx
     max_idx=$(sanitize_int "$raw_max")
     
+    # NEU: Info, dass wir rotieren
+    log "INFO" "Rotating interval '$int': Shifting $max_idx existing snapshots up..."
+
     local i=$max_idx
     while [ "$i" -ge 0 ]; do
         if [ -d "$BACKUP_ROOT/$int.$i" ]; then
+            # Optional: Jede einzelne Verschiebung loggen? 
+            # Das wären bei 30 Dailies 30 Zeilen. Vielleicht zu viel.
+            # log "DEBUG" "mv $int.$i -> $int.$((i+1))" 
             mv "$BACKUP_ROOT/$int.$i" "$BACKUP_ROOT/$int.$((i+1))"
         fi
         i=$((i-1))
     done
-}
-
-## @brief Moves a backup directory to index 0 of the target interval.
-promote_directory() {
-    local src_path="$1"
-    local target_int="$2"
-    log "INFO" "Promoting $(basename "$src_path") to $target_int.0"
-    rotate_period_up "$target_int"
-    mv "$src_path" "$BACKUP_ROOT/$target_int.0"
 }
 
 ## @brief Prepares the target directory for a new backup logic.
@@ -569,10 +556,6 @@ core_prepare_backup_target() {
     for i in $INTERVALS; do
         consolidate_directory_indices "$i"
     done
-    
-    # 2. Seed missing intervals (Initialize hierarchy)
-    # Redirect stdout to stderr to avoid polluting the function return value
-    seed_missing_intervals 1>&2
     
     local target_0
     target_0=$(get_interval_path "$int" 0)
@@ -630,6 +613,7 @@ core_prepare_backup_target() {
             safe_rm "$target_tmp"
         fi
         cp -al "$target_0" "$target_tmp"
+        chmod 700 "$target_tmp"
         echo "$target_tmp"
     fi
 }
@@ -641,36 +625,115 @@ core_commit_backup() {
     local target_0
     target_0=$(get_interval_path "$int" 0)
     
+    # 1. Commit/Rotate logic
     if [ "${target_used%.tmp}" != "$target_used" ]; then
-        log "DEBUG" "Commit: Rotating and moving .tmp to .0"
+        log "INFO" "Commit: Rotating and moving .tmp to .0"
         rotate_period_up "$int"
         mv "$target_used" "$target_0"
     else
-        log "DEBUG" "Commit: In-Place update completed."
+        log "INFO" "Commit: In-Place update completed."
     fi
     
+    # 2. Timestamp & Permissions for the primary target
     if [ -d "$target_0" ]; then
         date +%s > "$target_0/$TIMESTAMP_FILE"
+        chmod 700 "$target_0"
     fi
 
-    local is_initial=true
-    for other_int in $INTERVALS; do
-        if [ "$other_int" != "$int" ] && [ "$(get_max_index "$other_int")" -ge 0 ]; then
-            is_initial=false
-            break
+    # 3. FORCE POPULATE (The "Must Exist" Rule)
+    # Iterate through ALL defined intervals. If an interval is active (Retain > 0)
+    # but currently empty (missing .0), immediately seed it from the current backup.
+    for check_int in $INTERVALS; do
+        if [ "$(get_retention "$check_int")" -gt 0 ]; then
+            local check_path
+            check_path=$(get_interval_path "$check_int" 0)
+            
+            # Is the .0 folder missing?
+            if [ ! -d "$check_path" ]; then
+                log "INFO" ">>> SEEDING REQUIRED: Interval '$check_int' is empty but active."
+                log "INFO" ">>> Action: Creating $check_int.0 as a hardlink copy of $int.0"                
+                # Create Hardlink Copy from the just-finished backup
+                # This recursively links EVERYTHING, including the timestamp file.
+                cp -al "$target_0" "$check_path"
+                
+                # Ensure permissions (timestamp file is already there via hardlink)
+                chmod 700 "$check_path"
+            fi
         fi
     done
+}
+
+## @brief Evaluates promotion for a single backup slot.
+## @param 1 Source Interval (e.g. daily)
+## @param 2 Source Index (e.g. 0)
+## @param 3 Target Interval (e.g. weekly)
+## @param 4 Base Interval (The shortest interval, e.g. hourly/daily)
+check_and_promote_single_item() {
+    local src_int="$1"
+    local src_idx="$2"
+    local tgt_int="$3"
+    local base_int="$4"
     
-    if [ "$is_initial" = "true" ]; then
-        log "INFO" "Initial backup detected. Populating other intervals..."
-        for other_int in $INTERVALS; do
-            if [ "$other_int" != "$int" ] && [ "$(get_retention "$other_int")" -gt 0 ]; then
-                local other_target
-                other_target=$(get_interval_path "$other_int" 0)
-                [ ! -d "$other_target" ] && cp -al "$target_0" "$other_target"
-            fi
-        done
+    local src_path="$BACKUP_ROOT/$src_int.$src_idx"
+    if [ ! -d "$src_path" ]; then return 0; fi
+
+    # --- RULE 1: ADMIN VIEW PROTECTION ---
+    # The newest snapshot (.0) of the base interval is untouchable.
+    # It serves as the immediate restore point and status indicator.
+    if [ "$src_int" = "$base_int" ] && [ "$src_idx" -eq 0 ]; then
+        return 0
     fi
+
+    # If no target defined (e.g. yearly has no parent), skip promotion logic.
+    if [ -z "$tgt_int" ]; then return 0; fi
+
+    local tgt_path_0="$BACKUP_ROOT/$tgt_int.0"
+    local src_ts
+    src_ts=$(read_timestamp "$src_path/$TIMESTAMP_FILE")
+    local promote=false
+    
+    # --- RULE 2: PROMOTION CHECK ---
+    # Condition A: Seeding (Target does not exist)
+    if [ ! -d "$tgt_path_0" ]; then
+        log "INFO" "Promotion [$src_int.$src_idx -> $tgt_int.0]: Initializing empty target."
+        promote=true
+    else
+        # Condition B: Calendar Check
+        local tgt_ts
+        tgt_ts=$(read_timestamp "$tgt_path_0/$TIMESTAMP_FILE")
+        local src_sig
+        src_sig=$(get_sortable_date "$tgt_int" "$src_ts")
+        local tgt_sig
+        tgt_sig=$(get_sortable_date "$tgt_int" "$tgt_ts")
+        
+        if [ "$src_sig" -gt "$tgt_sig" ]; then
+            log "INFO" "Promotion [$src_int.$src_idx -> $tgt_int.0]: New period detected ($src_sig > $tgt_sig)."
+            promote=true
+        fi
+    fi
+
+    if [ "$promote" = "true" ]; then
+        # Condition C: Last Man Standing Check
+        # (Only relevant for non-base intervals or indices > 0, since base.0 is protected above)
+        if [ "$src_idx" -eq 0 ] && [ ! -d "$BACKUP_ROOT/$src_int.1" ]; then
+            log "INFO" "Promotion postponed: $src_int.$src_idx is the only remaining snapshot."
+            return 0
+        fi
+
+        rotate_period_up "$tgt_int"
+        
+        log "INFO" "Promoting via MOVE (Cleaning up $src_path)."
+        mv "$src_path" "$tgt_path_0"
+        
+        if [ ! -f "$tgt_path_0/$TIMESTAMP_FILE" ] && [ -n "$src_ts" ]; then
+            echo "$src_ts" > "$tgt_path_0/$TIMESTAMP_FILE"
+        fi
+        chmod 700 "$tgt_path_0"
+        
+        return 1 # Status: Promoted
+    fi
+
+    return 0 # Status: Kept
 }
 
 ## @brief Deletes oldest daily backups if disk space is low.
@@ -688,149 +751,74 @@ apply_smart_retention_policy() {
     fi
 }
 
-## @brief Promotes overflow backups to the next interval (Waterfall Logic).
-perform_waterfall_promotion() {
-    log "DEBUG" "Running Waterfall Promotion..."
-    local recurse=false
+## @brief Deletes backups that exceed the configured retention limit.
+enforce_retention_limit() {
+    local int="$1"
+    local limit
+    limit=$(get_retention "$int")
     
-    for int in $INTERVALS; do
-        local retain
-        retain=$(get_retention "$int")
-        [ "$retain" -le 0 ] && continue
+    # Safety check: Never delete everything. Assume 0 means 'keep all' or 'disabled interval' logic handled elsewhere.
+    if [ "$limit" -le 0 ]; then return; fi
+    
+    local max_idx
+    max_idx=$(get_max_index "$int")
+    
+    if [ "$max_idx" != "-1" ]; then
+        max_idx=$(sanitize_int "$max_idx")
         
-        local raw_max
-        raw_max=$(get_max_index "$int")
-        if [ "$raw_max" = "-1" ]; then continue; fi
-        
-        local max_idx
-        max_idx=$(sanitize_int "$raw_max")
-
-        if [ "$max_idx" -ge "$retain" ]; then
-            local next_int
-            next_int=$(get_next_interval "$int")
-            local overflow_path="$BACKUP_ROOT/$int.$max_idx"
-            
-            if [ "$next_int" != "none" ]; then
-                log "INFO" "[Waterfall] Overflow $int.$max_idx >= RETAIN ($retain). Promoting to $next_int."
-                promote_directory "$overflow_path" "$next_int"
-                consolidate_directory_indices "$int"
-                recurse=true
-            else
-                log "INFO" "[Waterfall] End of retention chain for $int ($max_idx >= $retain). Deleting."
-                safe_rm "$overflow_path"
+        # Delete everything strictly greater than or equal to the limit.
+        # Example: Limit 7. Indices 0..6 allowed. Index 7+ deleted.
+        local i=$max_idx
+        while [ "$i" -ge "$limit" ]; do
+            local path="$BACKUP_ROOT/$int.$i"
+            if [ -d "$path" ]; then
+                log "INFO" "Retention [$int]: Removing overflow backup $int.$i (Limit: $limit)"
+                safe_rm "$path"
             fi
-        fi
-    done
-    
-    if [ "$recurse" = "true" ]; then
-        perform_waterfall_promotion
+            i=$((i-1))
+        done
     fi
 }
 
-## @brief Promotes the newest backup of an interval to the next one if it's from a new period.
-perform_calendar_promotion() {
-    log "DEBUG" "Running Calendar Promotion..."
-    local safety_counter=0
-    
-    for int in $INTERVALS; do
-        local period_done=false
-        safety_counter=0
-        
-        while [ "$period_done" = "false" ]; do
-            # SAFETY BRAKE PER PERIOD
-            safety_counter=$((safety_counter+1))
-            if [ "$safety_counter" -gt 100 ]; then
-                 log "WARN" "Safety Brake: Calendar promotion loop for $int exceeded 100 iterations. Breaking."
-                 break
-            fi
-            
-            local retain
-            retain=$(get_retention "$int")
-            if [ "$retain" -le 0 ]; then
-                period_done=true
-                continue
-            fi
-            
-            local raw_max
-            raw_max=$(get_max_index "$int")
-            if [ "$raw_max" = "-1" ]; then
-                period_done=true
-                continue
-            fi
-            local max_idx
-            max_idx=$(sanitize_int "$raw_max")
-            
-            local next_int
-            next_int=$(get_next_interval "$int")
-            if [ "$next_int" = "none" ]; then
-                period_done=true
-                continue
-            fi
-            
-            local src_path="$BACKUP_ROOT/$int.$max_idx"
-            local tgt_path="$BACKUP_ROOT/$next_int.0"
-            
-            local src_ts
-            src_ts=$(read_timestamp "$src_path/$TIMESTAMP_FILE")
-            src_ts=$(sanitize_int "$src_ts")
-            
-            local tgt_ts
-            tgt_ts=$(read_timestamp "$tgt_path/$TIMESTAMP_FILE")
-            tgt_ts=$(sanitize_int "$tgt_ts")
-            
-            local seed_mode=false
-            if [ ! -f "$tgt_path/$TIMESTAMP_FILE" ]; then seed_mode=true; fi
-            
-            local promoted=false
-            
-            # Robust integer check for src_ts using parameter expansion default
-            if [ "${src_ts:-0}" -gt 0 ]; then
-                local src_sig
-                src_sig=$(get_sortable_date "$next_int" "$src_ts")
-                
-                local tgt_sig
-                tgt_sig=$(get_sortable_date "$next_int" "$tgt_ts")
-                
-                if echo "$src_sig" | grep -qvE "^[0-9]+$"; then src_sig=0; fi
-                if echo "$tgt_sig" | grep -qvE "^[0-9]+$"; then tgt_sig=0; fi
-                
-                if [ "$src_sig" -gt "$tgt_sig" ]; then
-                    if [ "$seed_mode" = "true" ]; then
-                        log "INFO" "[Calendar] Seeding empty $next_int from $int.$max_idx."
-                    else
-                        log "INFO" "[Calendar] $int.$max_idx ($src_sig) is newer than $next_int.0 ($tgt_sig)."
-                    fi
-                    
-                    if [ "$max_idx" -eq 0 ]; then
-                        log "DEBUG" "[Calendar] Candidate $int.0 is the current active backup. Waiting for rotation."
-                        period_done=true
-                        continue
-                    else
-                        log "INFO" "[Calendar] Moving $int.$max_idx to $next_int.0"
-                        promote_directory "$src_path" "$next_int"
-                        consolidate_directory_indices "$int"
-                        promoted=true
-                    fi
-                fi
-            fi
-            
-            if [ "$promoted" = "true" ]; then
-                # Immediate waterfall check as requested to clear space in target
-                perform_waterfall_promotion
-                # Continue loop to check if next oldest in THIS period also needs promotion
-            else
-                # No promotion occurred for this interval -> Done with this period
-                period_done=true
-            fi
-        done
-    done
-}
-
-## @brief Wrapper to execute all retention promotion logic.
+## @brief Executes strict chain promotion (recursive propagation from bottom to top).
 core_perform_all_promotions() {
+    log "DEBUG" "Starting Strict-Chain Promotion..."
+    
     apply_smart_retention_policy
-    perform_waterfall_promotion
-    perform_calendar_promotion
+    
+    for current_int in $INTERVALS; do
+        local current_retain
+        current_retain=$(get_retention "$current_int")
+        
+        if [ "$current_retain" -le 0 ]; then
+            continue
+        fi
+
+        local next_int
+        next_int=$(get_next_interval "$current_int")
+        [ "$next_int" = "none" ] && next_int=""
+        
+        local max_idx
+        max_idx=$(get_max_index "$current_int")
+        
+        # 1. PROMOTION PHASE (Reverse Loop)
+        if [ "$max_idx" != "-1" ]; then
+            max_idx=$(sanitize_int "$max_idx")
+            local i=$max_idx
+            
+            while [ "$i" -ge 0 ]; do
+                # HIER: Übergebe BASE_INTERVAL als 4. Parameter
+                check_and_promote_single_item "$current_int" "$i" "$next_int" "$BASE_INTERVAL"
+                i=$((i-1))
+            done
+            
+            # 2. CONSOLIDATION PHASE
+            consolidate_directory_indices "$current_int"
+            
+            # 3. RETENTION PHASE
+            enforce_retention_limit "$current_int"
+        fi
+    done
 }
 
 # ==============================================================================
@@ -852,6 +840,48 @@ check_rsync_capabilities() {
     if rsync -X --dry-run --version >/dev/null 2>&1; then
         RSYNC_XATTR_OPT="-X"
     fi
+}
+
+## @brief Wrapper for rsync with retry logic (Remote only).
+run_with_retry() {
+    local max_retries=3
+    local cooldown_time=300
+    local failures=0
+    local exit_code=0
+    
+    while true; do
+        local start_ts
+        start_ts=$(date +%s)
+        
+        run_monitored_rsync "$@"
+        exit_code=$?
+        
+        # 0=Success, 24=Vanished files (Success for backup)
+        if [ "$exit_code" -eq 0 ] || [ "$exit_code" -eq 24 ]; then
+            return "$exit_code"
+        fi
+        
+        local end_ts
+        end_ts=$(date +%s)
+        local duration=$((end_ts - start_ts))
+        
+        if [ "$duration" -ge "$cooldown_time" ]; then
+            log "WARN" "Rsync failed after $duration sec (stable run). Reducing failure count."
+            if [ "$failures" -gt 0 ]; then
+                failures=$((failures - 1))
+            fi
+        else
+            failures=$((failures + 1))
+        fi
+        
+        if [ "$failures" -ge "$max_retries" ]; then
+            log "ERROR" "Too many consecutive failures ($failures). Aborting."
+            return "$exit_code"
+        fi
+        
+        log "WARN" "Retrying in 30s... (Consecutive Failures: $failures/$max_retries)"
+        sleep 30
+    done
 }
 
 ## @brief Runs rsync and logs progress periodically.
@@ -944,7 +974,7 @@ core_backup_execution() {
         [ ! -e "$src" ] && return
         
         if [ "$_CTX_MODE" = "REMOTE" ]; then
-             if ! run_monitored_rsync rsync $_CTX_RSYNC_OPTS -e "$_CTX_SSH_CMD_OPTS" --exclude-from="$TEMP_EXCLUDE_FILE" -R "$src" "$_CTX_DEST_BASE/"; then
+             if ! run_with_retry rsync $_CTX_RSYNC_OPTS -e "$_CTX_SSH_CMD_OPTS" --exclude-from="$TEMP_EXCLUDE_FILE" -R "$src" "$_CTX_DEST_BASE/"; then
                  _CTX_VERIFY_STATUS=1
              fi
         else
@@ -1013,7 +1043,7 @@ _perform_remote_backup_logic() {
     
     local t_ssh="$REMOTE_USER@$REMOTE_HOST:$REMOTE_STORAGE_ROOT/$CLIENT_NAME/$target_suffix"
     local t_raw_unused="$REMOTE_STORAGE_ROOT/$CLIENT_NAME/$target_suffix" 
-    local ssh_cmd="ssh -p $REMOTE_PORT $REMOTE_SSH_OPTS -i $REMOTE_KEY"
+    local ssh_cmd="ssh -p $REMOTE_PORT $REMOTE_SSH_OPTS -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -i $REMOTE_KEY"
     
     local r_opts="-avzH $RSYNC_ACL_OPT $RSYNC_XATTR_OPT --numeric-ids --delete --stats -x"
     [ -n "${RSYNC_EXTRA_OPTS:-}" ] && r_opts="$r_opts $RSYNC_EXTRA_OPTS"
@@ -1089,14 +1119,33 @@ agent_main() {
         esac
     done
     
+    case "$action" in
+        version) echo "$SCRIPT_VERSION"; exit 0 ;;
+        install) do_install_agent; exit 0 ;;
+        "") die "Error: No action specified." ;;
+    esac
+
     [ -n "${CLIENT_NAME:-}" ] && {
         case "$LOGFILE" in */snapshot-backup.log) LOGFILE="${LOGFILE%.log}-${CLIENT_NAME}.log" ;; esac
         LOGTAG="${LOGTAG}-${CLIENT_NAME}"
     }
     
     BACKUP_ROOT="$BASE_STORAGE_PATH/${CLIENT_NAME:-unknown}"
-    mkdir -p "$BACKUP_ROOT"
+    
+    if [ ! -d "$BACKUP_ROOT" ]; then
+        log "INFO" "Creating new client root: $BACKUP_ROOT"
+        log "DEBUG" "used by action: $action"
+        mkdir -p "$BACKUP_ROOT"
+    else
+        for snap_dir in "$BACKUP_ROOT"/*; do
+            if [ -d "$snap_dir" ]; then
+                # chmod ist schnell bei Verzeichnissen (Metadaten-Operation)
+                chmod 700 "$snap_dir"
+            fi
+        done
+    fi
     chmod 700 "$BACKUP_ROOT"
+    
     BASE_INTERVAL=$(detect_base_interval)
     
     if [ "$action" = "prepare" ] || [ "$action" = "commit" ] || [ "$action" = "purge" ] || [ "$action" = "check-storage" ]; then
@@ -1146,13 +1195,6 @@ agent_main() {
             fi
             exit 0 
             ;;
-        install)
-            do_install_agent
-            ;;
-        version)
-            echo "$SCRIPT_VERSION"
-            exit 0
-            ;;
     esac
 }
 
@@ -1177,7 +1219,7 @@ do_install_agent() {
 export LC_ALL=C
 CMD="\${SSH_ORIGINAL_COMMAND:-\$*}"
 case "\$CMD" in
-    *snapshot-agent.sh*|*--action*|exit) exec $install_path \$CMD ;;
+    *snapshot-agent.sh*|*--action*) exec $install_path \$CMD ;;
     *sftp-server*) exec /usr/lib/openssh/sftp-server ;;
     rsync*) exec \$CMD ;;
     *) echo "Access Denied."; exit 1 ;;
@@ -1226,15 +1268,6 @@ load_config() {
     fi
     
     if [ -n "${LOCK_DIR:-}" ]; then AGENT_LOCK_DIR="$LOCK_DIR"; fi
-    
-    RETAIN_HOURLY=$(sanitize_int "$RETAIN_HOURLY")
-    RETAIN_DAILY=$(sanitize_int "$RETAIN_DAILY")
-    RETAIN_WEEKLY=$(sanitize_int "$RETAIN_WEEKLY")
-    RETAIN_MONTHLY=$(sanitize_int "$RETAIN_MONTHLY")
-    RETAIN_YEARLY=$(sanitize_int "$RETAIN_YEARLY")
-    SPACE_LOW_LIMIT_GB=$(sanitize_int "$SPACE_LOW_LIMIT_GB")
-    SMART_PURGE_SLOTS=$(sanitize_int "$SMART_PURGE_SLOTS")
-    NETWORK_TIMEOUT=$(sanitize_int "$NETWORK_TIMEOUT")
     
     BACKUP_ROOT="${BACKUP_ROOT:-$DEFAULT_BACKUP_ROOT}"
     BACKUP_MODE="${BACKUP_MODE:-LOCAL}"
@@ -1495,7 +1528,7 @@ check_agent_version() {
 
 ## @brief Tests connectivity to the remote server.
 test_remote_connection() {
-    run_remote_cmd_with_timeout "$NETWORK_TIMEOUT" "echo OK" >/dev/null 2>&1
+    run_remote_cmd_with_timeout "$NETWORK_TIMEOUT" "$REMOTE_AGENT --agent-mode --action version" >/dev/null 2>&1
 }
 
 ## @brief Deploys the script as an agent to a remote host.
@@ -1564,11 +1597,29 @@ check_is_running_cli() {
 
 ## @brief CLI Check: Is the backup for the current interval done?
 check_is_job_done_cli() {
+    # 1. REMOTE MODE: Delegate the check to the remote agent
+    if [ "$BACKUP_MODE" = "REMOTE" ]; then
+        local res
+        # Query the agent using the configured timeout to prevent hanging on network issues.
+        # We filter the output (tail/tr) to strip potential SSH banners or MOTD noise.
+        res=$(run_remote_cmd_with_timeout "$NETWORK_TIMEOUT" "$REMOTE_AGENT --action check-job-done --client $CLIENT_NAME" 2>/dev/null | tail -n 1 | tr -d '[:space:]')
+
+        if [ "$res" = "true" ]; then
+            echo "true"
+            exit 0
+        else
+            echo "false"
+            exit 1
+        fi
+    fi
+
+    # 2. LOCAL MODE: Check the local filesystem directly
     if [ ! -d "$BACKUP_ROOT/$BASE_INTERVAL.0" ]; then
         echo "false"
         exit 1
     fi
     
+    # Verify if the existing snapshot covers the current period (In-Place Logic)
     local ts
     ts=$(read_timestamp "$BACKUP_ROOT/$BASE_INTERVAL.0/$TIMESTAMP_FILE")
     if [ "$(is_backup_older_than_current_period "$BASE_INTERVAL" "$ts" "$START_TIME")" = "false" ]; then
@@ -1605,9 +1656,10 @@ show_help() {
     cat << EOF
 Usage: $(basename "$0") [OPTIONS]
 Options:
+  --version, -v          Print version.
   --show-config          Print configuration.
   --status               Show status report.
-  --verify, -v           Force Deep-Checksum Verification.
+  --verify               Force Deep-Checksum Verification.
   --kill, -k             Stop running backups.
   --mount [PATH]         Mount backup storage.
   --umount [PATH]        Unmount backup storage.
@@ -1636,6 +1688,7 @@ client_main() {
     while [ $# -gt 0 ]; do
         case $1 in
             --help|-h) show_help ;; 
+            --version|-v) echo "$SCRIPT_VERSION"; exit 0 ;;
             --status) action="STATUS" ;; 
             --mount) 
                 action="MOUNT"
@@ -1655,11 +1708,15 @@ client_main() {
             --show-config) action="SHOW_CONFIG" ;;
             
             # Configuration Overrides
-            --verify|-v) cli_force_verify="true" ;; 
+            --verify) cli_force_verify="true" ;; 
             --timeout) cli_timeout=$(sanitize_int "$2"); shift ;;
-            -c|--config) load_config "$2"; shift ;;
-            
-            *) ;;
+            --config|-c) load_config "$2"; shift ;;
+            --debug) DEBUG_MODE="true" ;;            
+            *) 
+                echo "Error: Unknown option '$1'" >&2
+                show_help
+                exit 1 
+                ;;
         esac
         shift
     done
@@ -1684,7 +1741,8 @@ client_main() {
             check_dependencies
             check_rsync_capabilities
             acquire_lock
-            
+            log_startup_summary
+
             for i in $INTERVALS; do
                 consolidate_directory_indices "$i"
             done
