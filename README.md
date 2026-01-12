@@ -108,7 +108,7 @@ Run this on the machine you want to back up (Client):
 
 ```
 # 1. Copy the script
-sudo cp snapshot-backup.sh /usr/local/sbin/snapshot-backup.sh
+sudo mv -f snapshot-backup.sh /usr/local/sbin/snapshot-backup.sh
 sudo chmod 700 /usr/local/sbin/snapshot-backup.sh
 ```
 
