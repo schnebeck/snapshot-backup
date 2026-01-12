@@ -94,7 +94,7 @@ This tool is designed for simplicity and robustness in trusted environments.
 
 - **Zero-Trust Environments:** Backing up untrusted third-party clients.
 
-- **Public Internet:** Exposing the SSH backup port directly to the internet (please use a VPN like oPenVPN or WireGuard).
+- **Public Internet:** Exposing the SSH backup port directly to the internet (please use a VPN like OpenVPN or WireGuard).
 
 - **Multi-Tenant Hosting:** Where "Client A" must be mathematically prevented from accessing "Client B" even if they gain root access to the backup server.
 
@@ -201,6 +201,7 @@ if [ "$ACTION" = "up" ]; then
     fi
 fi
 ```
+There is a much more sophisticated Network-Manager dispacher script in the repository.
 
 ## 📂 Restore
 
