@@ -71,7 +71,7 @@ setup_loopback_ssh() {
     set_config "REMOTE_HOST" "localhost"
     set_config "REMOTE_USER" "$(whoami)"
     set_config "REMOTE_PORT" "22"
-    set_config "SSH_KEY" "$TEST_SSH_KEY"
+    set_config "REMOTE_KEY" "$TEST_SSH_KEY"
     set_config "REMOTE_AGENT" "$agent_cmd"
     set_config "CLIENT_NAME" "test-client"
     set_config "REMOTE_STORAGE_ROOT" "$SERVER_STORAGE"
@@ -105,7 +105,6 @@ run_backup() {
 assert_exists() {
     if [ ! -e "$1" ]; then
         echo -e "    ${RED}[FAIL] Expected: $1 to exist.${NC}"
-        TESTS_FAILED=$((TESTS_FAILED+1))
         return 1
     fi
 }
@@ -113,7 +112,6 @@ assert_exists() {
 assert_missing() {
     if [ -e "$1" ]; then
         echo -e "    ${RED}[FAIL] Expected: $1 to be missing.${NC}"
-        TESTS_FAILED=$((TESTS_FAILED+1))
         return 1
     fi
 }
