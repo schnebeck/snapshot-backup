@@ -344,35 +344,76 @@ iterate_list() {
     done
 }
 
+## @brief Returns 0 if the given UID has an active graphical (X11/Wayland) session.
+_has_graphical_session() {
+    local uid="$1"
+    local session_id stype
+    for session_id in $(loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$uid" '$2 == u {print $1}'); do
+        stype=$(loginctl show-session "$session_id" -p Type --value 2>/dev/null)
+        case "$stype" in
+            x11|wayland|mir) return 0 ;;
+        esac
+    done
+    return 1
+}
+
 ## @brief Sends a system notification if enabled.
 notify() {
     local title="$1"
     local msg="$2"
     local urgency="${3:-normal}"
-    
+
     if [ "$ENABLE_NOTIFICATIONS" != true ]; then return 0; fi
-    
+
     (
         set +e
         if ! command -v notify-send >/dev/null 2>&1; then exit 0; fi
-        
-        local user_id
-        user_id=$(id -u)
-        
-        if [ "$user_id" -eq 0 ]; then
-             local target_user="${SUDO_USER:-}"
-             if [ -z "$target_user" ]; then
-                 target_user=$(loginctl list-users --no-legend 2>/dev/null | awk '{print $2}' | head -n1)
-             fi
-             
-             if [ -n "$target_user" ] && id "$target_user" >/dev/null 2>&1; then
-                 local target_uid
-                 target_uid=$(id -u "$target_user")
-                 export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$target_uid/bus"
-                 compat_run_with_timeout 5 sudo -E -u "$target_user" notify-send -u "$urgency" -a "Snapshot Backup" "$title" "$msg" 2>/dev/null
-             fi
+
+        if [ "$(id -u)" -ne 0 ]; then
+            compat_run_with_timeout 5 notify-send -u "$urgency" -a "Snapshot Backup" "$title" "$msg" 2>/dev/null
+            exit $?
+        fi
+
+        local target_user=""
+        local target_uid=""
+        local cand_uid=""
+
+        # Prefer SUDO_USER if it's a real (non-root) user with an active graphical session
+        if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+            cand_uid=$(id -u "$SUDO_USER" 2>/dev/null)
+            if [ -n "$cand_uid" ] && [ "$cand_uid" -ge 1000 ] 2>/dev/null \
+               && [ -S "/run/user/$cand_uid/bus" ] \
+               && _has_graphical_session "$cand_uid"; then
+                target_user="$SUDO_USER"
+                target_uid="$cand_uid"
+            fi
+        fi
+
+        # Fallback: scan for any human user with an active graphical D-Bus session
+        # (skips SSH-only sessions on servers where /run/user/*/bus may still exist)
+        if [ -z "$target_user" ]; then
+            for bus_socket in /run/user/*/bus; do
+                [ -S "$bus_socket" ] || continue
+                cand_uid=$(echo "$bus_socket" | sed 's|/run/user/\([0-9]*\)/bus|\1|')
+                [ "$cand_uid" -ge 1000 ] 2>/dev/null || continue
+                _has_graphical_session "$cand_uid" || continue
+                target_user=$(id -nu "$cand_uid" 2>/dev/null) || continue
+                target_uid="$cand_uid"
+                break
+            done
+        fi
+
+        [ -n "$target_user" ] || exit 0
+
+        local dbus_addr="unix:path=/run/user/$target_uid/bus"
+        # runuser switches user without sudo/PAM overhead; env passes DBUS address explicitly
+        if command -v runuser >/dev/null 2>&1; then
+            compat_run_with_timeout 5 runuser -u "$target_user" -- \
+                env "DBUS_SESSION_BUS_ADDRESS=$dbus_addr" \
+                notify-send -u "$urgency" -a "Snapshot Backup" "$title" "$msg" 2>/dev/null
         else
-             compat_run_with_timeout 5 notify-send -u "$urgency" -a "Snapshot Backup" "$title" "$msg" 2>/dev/null
+            compat_run_with_timeout 5 su "$target_user" -c \
+                "DBUS_SESSION_BUS_ADDRESS='$dbus_addr' notify-send -u '$urgency' -a 'Snapshot Backup' '$title' '$msg'" 2>/dev/null
         fi
     ) || true
 }
