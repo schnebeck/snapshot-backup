@@ -344,17 +344,24 @@ iterate_list() {
     done
 }
 
-## @brief Returns 0 if the given UID has an active graphical (X11/Wayland) session.
+## @brief Returns 0 if the given UID should receive desktop notifications.
+## Allows: graphical sessions (x11/wayland/mir) and lingering users with no
+## active session (daemon may still be running). Blocks: SSH/tty-only sessions.
 _has_graphical_session() {
     local uid="$1"
-    local session_id stype
-    for session_id in $(loginctl list-sessions --no-legend 2>/dev/null | awk -v u="$uid" '$2 == u {print $1}'); do
+    local session_id stype has_sessions=false
+    local sessions
+    sessions=$(loginctl show-user "$uid" --property=Sessions --value 2>/dev/null)
+    for session_id in $sessions; do
+        has_sessions=true
         stype=$(loginctl show-session "$session_id" -p Type --value 2>/dev/null)
         case "$stype" in
             x11|wayland|mir) return 0 ;;
         esac
     done
-    return 1
+    # No graphical session found: allow if lingering (no sessions at all),
+    # block if only SSH/tty sessions are active (server context).
+    [ "$has_sessions" = false ]
 }
 
 ## @brief Sends a system notification if enabled.
@@ -412,8 +419,9 @@ notify() {
                 env "DBUS_SESSION_BUS_ADDRESS=$dbus_addr" \
                 notify-send -u "$urgency" -a "Snapshot Backup" "$title" "$msg" 2>/dev/null
         else
-            compat_run_with_timeout 5 su "$target_user" -c \
-                "DBUS_SESSION_BUS_ADDRESS='$dbus_addr' notify-send -u '$urgency' -a 'Snapshot Backup' '$title' '$msg'" 2>/dev/null
+            compat_run_with_timeout 5 su -c \
+                "DBUS_SESSION_BUS_ADDRESS='$dbus_addr' notify-send -u '$urgency' -a 'Snapshot Backup' '$title' '$msg'" \
+                "$target_user" 2>/dev/null
         fi
     ) || true
 }
