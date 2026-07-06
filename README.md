@@ -1,6 +1,6 @@
 # snapshot-backup.sh - Intelligent Incremental Backup
 
-⚠️ **STATUS: STABLE / PRODUCTION READY (v18.2)**
+⚠️ **STATUS: STABLE / PRODUCTION READY (v18.3)**
 
 ### ⚖️ DISCLAIMER / LIMITATION OF LIABILITY
 
@@ -422,7 +422,14 @@ This ensures that even if the SSH key is leaked, an attacker cannot easily get a
 
 ## 📆 Version History
 
-- **v18.2:** * Fix: Strict Side-Effect Isolation (prevents folder creation on non-write actions).
+- **v18.3:** Fix: Desktop notifications now work correctly when backup runs as root.
+  - `runuser` (with `env DBUS_SESSION_BUS_ADDRESS=...`) replaces broken `sudo -E` approach.
+  - `loginctl show-session -p Type` filters graphical sessions (x11/wayland) from SSH/tty-only sessions — notifications are silently skipped on pure server backups.
+  - Lingering D-Bus sessions (systemd `linger` enabled) are handled correctly.
+  - Fix: `su` fallback argument order corrected for busybox/Alpine compatibility.
+  - Fix: Two bugs in test-framework.sh (wrong SSH key variable name, double failure counter).
+
+- **v18.2:** Fix: Strict Side-Effect Isolation (prevents folder creation on non-write actions).
   
   - Fix: Wrapper logic alignment.
   
