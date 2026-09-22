@@ -29,7 +29,7 @@ umask 0077
 # 1. CONSTANTS & CONFIGURATION DEFAULTS
 # ==============================================================================
 
-SCRIPT_VERSION="18.3"
+SCRIPT_VERSION="18.4"
 EXPECTED_CONFIG_VERSION="2.0"
 
 # --- System Paths ---
@@ -1317,7 +1317,16 @@ load_config() {
         if [ -z "$file_ver" ] || [ "$file_ver" != "$EXPECTED_CONFIG_VERSION" ]; then
             die "Config Version Mismatch in $config_file."
         fi
+        # LOCK_DIR is derived from PIDFILE when the script loads, which happens
+        # before this file is read. A config that sets only PIDFILE would
+        # therefore keep the default lock: two instances on one host would
+        # report separate PIDs while sharing one lock, and the second would
+        # refuse to start for no visible reason. Clearing it first lets a
+        # config set it explicitly and otherwise re-derives it from the
+        # PIDFILE the config actually chose.
+        LOCK_DIR=""
         . "$config_file"
+        [ -z "${LOCK_DIR:-}" ] && LOCK_DIR="${PIDFILE%.pid}.lock"
     fi
     
     if [ -n "${LOCK_DIR:-}" ]; then AGENT_LOCK_DIR="$LOCK_DIR"; fi

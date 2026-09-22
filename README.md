@@ -421,6 +421,8 @@ This ensures that even if the SSH key is leaked, an attacker cannot easily get a
 ---
 
 ## 📆 Version History
+- **v18.4:** `LOCK_DIR` now follows a `PIDFILE` set in the config. It is derived when the script loads, before any config is read, so a host running two instances with separate PIDFILEs used to share the default lock — the second instance refusing to start for a reason its PID file did not explain. A config may still set `LOCK_DIR` explicitly; it is only re-derived when it does not.
+
 
 - **v18.3:** Fix: Desktop notifications now work correctly when backup runs as root.
   - `runuser` (with `env DBUS_SESSION_BUS_ADDRESS=...`) replaces broken `sudo -E` approach.

@@ -430,6 +430,36 @@ test_17_crash_recovery() {
     assert_exists "$MNT_DEST/daily.0" || return 1
 }
 
+test_19_lock_dir_follows_pidfile() {
+    # Goal: A config that sets PIDFILE must get the matching lock directory.
+    #
+    # LOCK_DIR is derived from PIDFILE when the script loads, before any config
+    # is read. Without re-deriving it afterwards, a host running two instances
+    # with separate PIDFILEs would still share the default lock - the second
+    # instance refusing to start for no reason its PID file explains.
+    #
+    # The check is indirect but exact: place a held lock at the path the config
+    # implies and require the run to refuse it. Before the fix the script looks
+    # at the default path instead, finds nothing, and backs up happily.
+    local custom_pid="$TEST_ROOT/custom-instance.pid"
+    local custom_lock="$TEST_ROOT/custom-instance.lock"
+
+    set_config "PIDFILE" "$custom_pid"
+
+    mkdir -p "$custom_lock"
+    echo $$ > "$custom_pid"   # this shell is alive, so the lock is held
+
+    "$SCRIPT_BIN" --config "$CONF_FILE" --debug >> "$LOG_FILE" 2>&1
+    local rc=$?
+
+    rm -rf "$custom_lock" "$custom_pid"
+
+    if [ "$rc" -ne 2 ]; then
+        echo -e "    ${RED}[FAIL] Ran despite a held lock at $custom_lock (exit $rc).${NC}"
+        return 1
+    fi
+}
+
 test_18_conditional_storage_creation() {
     # Goal: Verify that storage creation is strictly conditional.
     # Case A: --action version (Read-Only) -> MUST NOT create directory
@@ -510,5 +540,6 @@ run_test_case "15 Network Retry (3 Attempts)" test_15_network_retry_logic
 run_test_case "16 Smart Purge (Disk Full)" test_16_smart_purge_logic
 run_test_case "17 Crash Recovery (Stale .tmp)" test_17_crash_recovery
 run_test_case "18 Storage Folder Creation" test_18_conditional_storage_creation
+run_test_case "19 Lock Dir Follows PIDFILE" test_19_lock_dir_follows_pidfile
 
 print_summary
