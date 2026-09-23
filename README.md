@@ -421,6 +421,8 @@ This ensures that even if the SSH key is leaked, an attacker cannot easily get a
 ---
 
 ## 📆 Version History
+- **v18.5:** Rsync log classification no longer reports file names as errors. The patterns were unanchored, so any listed path containing `denied`, `failed:` or `fatal:` was logged as an error — a successful backup of a source holding `AccessDeniedException.php` produced hundreds of them, which is how people learn to stop reading the log. Anchored now, with `IO error` added because rsync writes that one unprefixed. `rsync warning: … vanished` stays unflagged: files disappearing while a live filesystem is copied is normal.
+
 - **v18.4:** `LOCK_DIR` now follows a `PIDFILE` set in the config. It is derived when the script loads, before any config is read, so a host running two instances with separate PIDFILEs used to share the default lock — the second instance refusing to start for a reason its PID file did not explain. A config may still set `LOCK_DIR` explicitly; it is only re-derived when it does not.
 
 

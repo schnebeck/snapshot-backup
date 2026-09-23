@@ -460,6 +460,41 @@ test_19_lock_dir_follows_pidfile() {
     fi
 }
 
+test_20_rsync_log_classification() {
+    # Goal: file names must not be reported as rsync errors.
+    #
+    # The classifier greps each rsync output line. Unanchored patterns matched
+    # the listing itself: a source containing AccessDeniedException.php made a
+    # successful run log hundreds of errors, which is how people learn to stop
+    # reading logs.
+    local pattern='^rsync(:| error)|^IO error|^ERROR:|^fatal:|: Permission denied|: No space left'
+
+    # These are file names, not diagnostics.
+    for benign in \
+        "/opt/app/models/access_denied_traffic_node.py" \
+        "deleting var/app/Exception/AccessDeniedException.php" \
+        "/var/log/failed-login-attempts.log" \
+        "usr/share/doc/fatal-error-handler/README"
+    do
+        if echo "$benign" | grep -qiE "$pattern"; then
+            echo -e "    ${RED}[FAIL] File name reported as an error: $benign${NC}"
+            return 1
+        fi
+    done
+
+    # These are diagnostics and must still be caught.
+    for real in \
+        "rsync: [sender] send_files failed to open \"/x\": Permission denied (13)" \
+        "rsync error: some files/attrs were not transferred (code 23)" \
+        "IO error encountered -- skipping file deletion"
+    do
+        if ! echo "$real" | grep -qiE "$pattern"; then
+            echo -e "    ${RED}[FAIL] Real error not detected: $real${NC}"
+            return 1
+        fi
+    done
+}
+
 test_18_conditional_storage_creation() {
     # Goal: Verify that storage creation is strictly conditional.
     # Case A: --action version (Read-Only) -> MUST NOT create directory
@@ -541,5 +576,6 @@ run_test_case "16 Smart Purge (Disk Full)" test_16_smart_purge_logic
 run_test_case "17 Crash Recovery (Stale .tmp)" test_17_crash_recovery
 run_test_case "18 Storage Folder Creation" test_18_conditional_storage_creation
 run_test_case "19 Lock Dir Follows PIDFILE" test_19_lock_dir_follows_pidfile
+run_test_case "20 Rsync Log Classification" test_20_rsync_log_classification
 
 print_summary

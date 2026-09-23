@@ -29,7 +29,7 @@ umask 0077
 # 1. CONSTANTS & CONFIGURATION DEFAULTS
 # ==============================================================================
 
-SCRIPT_VERSION="18.4"
+SCRIPT_VERSION="18.5"
 EXPECTED_CONFIG_VERSION="2.0"
 
 # --- System Paths ---
@@ -952,7 +952,19 @@ run_monitored_rsync() {
                      last_log_time=$now
                 fi
             else
-                if echo "$line" | grep -qiE "^rsync:|rsync error:|ERROR:|failed:|fatal:|denied"; then
+                # Anchored on purpose. Unanchored "denied", "failed:" and
+                # "fatal:" also match rsync's ordinary file listing: a backup
+                # containing AccessDeniedException.php or
+                # access_denied_traffic_node.py logged hundreds of errors for a
+                # run that succeeded, which teaches people to ignore the log.
+                # rsync prefixes its own diagnostics, so anchoring loses
+                # nothing; "IO error" is added because rsync writes that one
+                # without a prefix and it is real.
+                #
+                # "rsync warning: ... vanished" is deliberately absent: files
+                # disappearing while a live filesystem is copied is normal, and
+                # reporting it would produce noise every night.
+                if echo "$line" | grep -qiE "^rsync(:| error)|^IO error|^ERROR:|^fatal:|: Permission denied|: No space left"; then
                     log "ERROR" "$line"
                 else
                     log "DEBUG" "$line"
