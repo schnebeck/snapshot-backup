@@ -29,7 +29,7 @@ umask 0077
 # 1. CONSTANTS & CONFIGURATION DEFAULTS
 # ==============================================================================
 
-SCRIPT_VERSION="18.5"
+SCRIPT_VERSION="18.6"
 EXPECTED_CONFIG_VERSION="2.0"
 
 # --- System Paths ---
@@ -98,6 +98,16 @@ DEEP_VERIFY_INTERVAL_DAYS="35"
 ENABLE_NOTIFICATIONS=true
 NETWORK_TIMEOUT=10
 FORCE_VERIFY=false
+
+# Hook state. _HOOKS_ARMED says a PRE hook may have set something up, so the
+# POST hook is owed; _RUN_EXIT_CODE is what the POST hook is told.
+_HOOKS_ARMED=false
+_RUN_EXIT_CODE=1
+
+# Hook commands, normally set in the config file.
+PRE_RUN_CMD=""
+PRE_RSYNC_CMD=""
+POST_RUN_CMD=""
 
 RSYNC_PROGRESS_OPTS=""
 RSYNC_ACL_OPT=""
@@ -1031,7 +1041,15 @@ core_backup_execution() {
     local _CTX_RAW_REMOTE_BASE="$4"
     local _CTX_SSH_CMD_OPTS="${5:-}"
     local _CTX_VERIFY_STATUS=0
-    
+
+    # After the target is prepared and before a single file is read. This is
+    # the point an LVM snapshot or a filesystem freeze wants: the rotation that
+    # runs before it can take ten minutes on a large chain, and a snapshot held
+    # open that long collects changes in its copy-on-write area for nothing.
+    if ! run_hook "PRE_RSYNC_CMD" "${PRE_RSYNC_CMD:-}"; then
+        die "PRE_RSYNC_CMD failed - not backing up. A source that was meant to be frozen and is not would be copied as if it were."
+    fi
+
     create_exclude_list
     
     _exec_item() {
@@ -1385,6 +1403,34 @@ acquire_lock() {
 }
 
 ## @brief Generic cleanup on exit.
+## @brief Runs a configured hook command and reports whether it succeeded.
+##
+## Hooks are called, not listened to: the script waits and reads the exit code.
+## That is the point - a PRE hook that fails must be able to stop the backup,
+## because a snapshot that was not created is not a snapshot the backup may
+## quietly do without.
+##
+## $1 = name for the log, $2 = command line, $3.. = arguments passed to it.
+## Returns the command's exit code, or 0 when nothing is configured.
+##
+## A hook whose failure should not matter says so in ordinary shell:
+##   PRE_RUN_CMD="/usr/local/sbin/something || true"
+run_hook() {
+    local name="$1"
+    local cmd="$2"
+    shift 2
+
+    [ -z "$cmd" ] && return 0
+
+    log "INFO" "Hook $name: $cmd"
+    # The config carries a command line, not a path, so it goes through sh -c:
+    # arguments and shell constructs in it have to survive.
+    sh -c "$cmd" -- "$@"
+    local rc=$?
+    [ "$rc" -ne 0 ] && log "ERROR" "Hook $name failed with exit $rc"
+    return $rc
+}
+
 cleanup() {
     if [ "$AGENT_MODE" = true ]; then
         agent_cleanup
@@ -1409,6 +1455,19 @@ cleanup() {
     
     if [ -n "${TEMP_EXCLUDE_FILE:-}" ] && [ -f "$TEMP_EXCLUDE_FILE" ]; then
         rm -f "$TEMP_EXCLUDE_FILE"
+    fi
+
+    # POST_RUN_CMD belongs here rather than at the end of the happy path: this
+    # runs on success, on failure, on abort and on signal. Whatever a PRE hook
+    # set up - an LVM snapshot, a frozen guest filesystem - then has exactly
+    # one place that is guaranteed to tear it down, and a guest left frozen
+    # because a backup died at 04:00 stays frozen until somebody notices.
+    #
+    # Only when a hook was actually armed: cleanup also runs on paths that
+    # never started a backup, such as a refused lock.
+    if [ "${_HOOKS_ARMED:-false}" = true ]; then
+        _HOOKS_ARMED=false
+        run_hook "POST_RUN_CMD" "${POST_RUN_CMD:-}" "${_RUN_EXIT_CODE:-0}" || true
     fi
 }
 
@@ -1470,6 +1529,25 @@ SMART_PURGE_SLOTS=$SMART_PURGE_SLOTS
 $(print_config_list SOURCE_DIRS)
 $(print_config_list EXCLUDE_PATTERNS)
 $(print_config_list EXCLUDE_MOUNTPOINTS)
+
+# Hooks
+#
+# Commands the script calls at points only it knows. They are called, not
+# listened to: it waits and reads the exit code, so a PRE hook that fails stops
+# the run. A hook whose failure should not matter says so in ordinary shell:
+#   PRE_RUN_CMD="/usr/local/sbin/dump-databases.sh || true"
+#
+# PRE_RUN_CMD    after the lock is held, before anything else. For dumps.
+# PRE_RSYNC_CMD  after the target is prepared, before the first file is read.
+#                This is where an LVM snapshot or a filesystem freeze belongs:
+#                the rotation before it can take minutes, and a snapshot held
+#                open that long fills its copy-on-write area for nothing.
+# POST_RUN_CMD   always, including on failure, abort and signal. Receives the
+#                run's exit code as \$1. This is the only place guaranteed to
+#                tear down what a PRE hook set up.
+PRE_RUN_CMD="$PRE_RUN_CMD"
+PRE_RSYNC_CMD="$PRE_RSYNC_CMD"
+POST_RUN_CMD="$POST_RUN_CMD"
 
 # System
 LOGFILE="$LOGFILE"
@@ -1629,6 +1707,116 @@ do_setup_remote() {
     do_deploy_agent "$target"
 }
 
+## @brief True when $1 is a newer version than $2.
+##
+## Compares dotted version numbers field by field. Needed because an upgrade
+## that only checks for inequality will happily install an older file, and a
+## CDN serving a stale copy is enough to make that happen - it did, and three
+## machines were downgraded by one.
+version_gt() {
+    local a="$1" b="$2" i=1 fa fb
+    [ "$a" = "$b" ] && return 1
+    while [ "$i" -le 4 ]; do
+        fa=$(sanitize_int "$(echo "$a" | cut -d. -f$i)")
+        fb=$(sanitize_int "$(echo "$b" | cut -d. -f$i)")
+        [ "$fa" -gt "$fb" ] && return 0
+        [ "$fa" -lt "$fb" ] && return 1
+        i=$((i+1))
+    done
+    return 1
+}
+
+## @brief Fetches the published script and replaces this one with it.
+##
+## What this does NOT do is verify authorship. HTTPS establishes that the file
+## came from the host in the URL and was not altered on the way; it says
+## nothing about who put it there. There is no signature to check, so a
+## compromised repository would be installed like any other update. That is the
+## honest limit of a self-updater without signing, and the reason this never
+## runs on its own - it is a command somebody types.
+##
+## $1 = "check" to report only.
+do_upgrade() {
+    local mode="${1:-install}"
+    local url="${UPGRADE_URL:-https://raw.githubusercontent.com/schnebeck/snapshot-backup/main/snapshot-backup.sh}"
+    local target="$0"
+
+    [ "$(id -u)" -eq 0 ] || die "Upgrade requires root."
+
+    # Not while a backup is running: replacing the file underneath a running
+    # shell is how you get a script that reads half of one version and half of
+    # another.
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+        die "A backup is running (PID $(cat "$PIDFILE")). Not upgrading."
+    fi
+
+    command -v curl >/dev/null 2>&1 || die "curl is required for --upgrade."
+
+    local tmp
+    tmp=$(mktemp) || die "Could not create a temporary file."
+
+    log "INFO" "Fetching $url"
+    # The no-cache header asks intermediaries for the current file. It is not a
+    # guarantee - a CDN may serve a stale copy anyway, which is why the version
+    # check below is the actual protection rather than a formality.
+    if ! curl -fsSL --proto "=https" --tlsv1.2 --max-time 60 \
+              -H "Cache-Control: no-cache" -H "Pragma: no-cache" \
+              -o "$tmp" "$url"; then
+        rm -f "$tmp"
+        die "Download failed."
+    fi
+
+    # Three checks before anything is replaced. Each one has a failure mode it
+    # is there for: a captive portal returning HTML, a truncated transfer, a
+    # file that is not this program.
+    local new_ver
+    new_ver=$(grep -m1 '^SCRIPT_VERSION=' "$tmp" | cut -d'"' -f2)
+    if [ -z "$new_ver" ]; then
+        rm -f "$tmp"
+        die "Downloaded file carries no SCRIPT_VERSION - this is not the script."
+    fi
+    if ! sh -n "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        die "Downloaded file is not valid shell - refusing to install it."
+    fi
+    if ! grep -q "^core_backup_execution()" "$tmp"; then
+        rm -f "$tmp"
+        die "Downloaded file does not look like this program - refusing."
+    fi
+
+    printf 'Installed: %s\nAvailable: %s\n' "$SCRIPT_VERSION" "$new_ver"
+
+    if [ "$new_ver" = "$SCRIPT_VERSION" ]; then
+        log "INFO" "Already at $SCRIPT_VERSION."
+        rm -f "$tmp"
+        return 0
+    fi
+
+    # An upgrade does not go backwards. Without this, a stale copy from a cache
+    # is installed as eagerly as a new release.
+    if ! version_gt "$new_ver" "$SCRIPT_VERSION" && [ "$mode" != "force" ]; then
+        rm -f "$tmp"
+        log "WARN" "Published version $new_ver is older than the installed $SCRIPT_VERSION - not installing."
+        log "WARN" "A CDN may be serving a stale copy; try again later, or --upgrade --force to install it anyway."
+        return 0
+    fi
+
+    if [ "$mode" = "check" ]; then
+        rm -f "$tmp"
+        return 0
+    fi
+
+    local backup="${target}.${SCRIPT_VERSION}"
+    cp -p "$target" "$backup" || { rm -f "$tmp"; die "Could not back up $target."; }
+    cat "$tmp" > "$target" || { rm -f "$tmp"; die "Could not write $target."; }
+    chmod 700 "$target"
+    rm -f "$tmp"
+
+    log "SUCCESS" "Upgraded $SCRIPT_VERSION -> $new_ver (previous kept as $backup)"
+    printf 'The agent on the backup server is a copy of this file and is not\n'
+    printf 'updated by this: run --deploy-agent to bring it along.\n'
+}
+
 ## @brief Mounts the backup storage (Local bind or Remote SSHFS).
 do_mount() {
     local mountpoint="$1"
@@ -1739,6 +1927,9 @@ Options:
   --umount [PATH]        Unmount backup storage.
   --deploy-agent [TG]    Deploy agent to target (user@host).
   --setup-remote [TG]    Wizard: SSH Setup & Deployment.
+  --upgrade [--check|--force]
+                         Fetch the published version and install it. Never
+                         downgrades unless --force is given.
   --is-running           Check if backup is running (exit code 0/1).
   --is-job-done          Check if today's backup is done (exit code 0/1).
   --has-storage          Check if storage is writable (exit code 0/1).
@@ -1775,6 +1966,11 @@ client_main() {
             --kill|-k) action="KILL" ;;
             --deploy-agent) action="DEPLOY"; if [ -n "${2:-}" ]; then action_target="$2"; shift; fi ;;
             --setup-remote) action="SETUP_REMOTE"; if [ -n "${2:-}" ]; then action_target="$2"; shift; fi ;;
+            --upgrade) action="UPGRADE"
+                       case "${2:-}" in
+                           --check) action_target="check"; shift ;;
+                           --force) action_target="force"; shift ;;
+                       esac ;;
             --install) action="INSTALL"; if [ -n "${2:-}" ]; then action_target="$2"; shift; fi ;;
             --is-running) action="IS_RUNNING" ;;
             --is-job-done) action="IS_JOB_DONE" ;;
@@ -1807,6 +2003,7 @@ client_main() {
         KILL)        kill_active_backups ;;
         DEPLOY)      do_deploy_agent "$action_target"; exit 0 ;;
         SETUP_REMOTE) do_setup_remote "$action_target"; exit 0 ;;
+        UPGRADE)     do_upgrade "${action_target:-install}"; exit 0 ;;
         INSTALL)     do_install_agent "$action_target"; exit 0 ;;
         IS_RUNNING)  check_is_running_cli ;;
         IS_JOB_DONE) check_is_job_done_cli ;;
@@ -1816,6 +2013,13 @@ client_main() {
             check_rsync_capabilities
             acquire_lock
             log_startup_summary
+
+            # From here on a POST_RUN_CMD is owed, whatever happens.
+            _HOOKS_ARMED=true
+            _RUN_EXIT_CODE=1
+            if ! run_hook "PRE_RUN_CMD" "${PRE_RUN_CMD:-}"; then
+                die "PRE_RUN_CMD failed - not backing up."
+            fi
 
             for i in $INTERVALS; do
                 consolidate_directory_indices "$i"
@@ -1835,6 +2039,7 @@ client_main() {
                 _perform_local_backup_logic "$BASE_INTERVAL"
             fi
             
+            _RUN_EXIT_CODE=0
             rmdir "$LOCK_DIR" 2>/dev/null
             rm -f "$PIDFILE"
             collect_stats "$LOGFILE"

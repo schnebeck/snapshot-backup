@@ -495,6 +495,127 @@ test_20_rsync_log_classification() {
     done
 }
 
+test_21_hooks_order_and_result() {
+    # Goal: the three hooks run, in order, and POST_RUN_CMD is told how it went.
+    #
+    # Hooks are called rather than listened to, so order is part of the
+    # contract: PRE_RUN before anything, PRE_RSYNC after the target is prepared
+    # and before a file is read, POST_RUN at the end with the exit code in $1.
+    local trace="$TEST_ROOT/hook-trace.txt"
+    rm -f "$trace"
+
+    set_config "PRE_RUN_CMD"   "echo pre-run >> $trace"
+    set_config "PRE_RSYNC_CMD" "echo pre-rsync >> $trace"
+    set_config "POST_RUN_CMD"  "echo post-run:\$1 >> $trace"
+
+    echo "data" > "$MNT_SRC/hooked.txt"
+    run_backup
+
+    local got
+    got=$(tr '\n' ' ' < "$trace" 2>/dev/null)
+    if [ "$got" != "pre-run pre-rsync post-run:0 " ]; then
+        echo -e "    ${RED}[FAIL] Hook order/result was: '$got'${NC}"
+        return 1
+    fi
+}
+
+test_22_failing_pre_hook_stops_the_run() {
+    # Goal: a PRE hook that fails stops the backup, and POST_RUN still runs.
+    #
+    # This is the whole reason hooks return a value. A snapshot that was not
+    # created must not be backed up as though it had been - the copy would look
+    # like a consistent one and would not be. The teardown still has to happen,
+    # or whatever the hook set up stays set up.
+    local trace="$TEST_ROOT/hook-fail-trace.txt"
+    rm -f "$trace"
+
+    set_config "PRE_RUN_CMD"   ""
+    set_config "PRE_RSYNC_CMD" "exit 7"
+    set_config "POST_RUN_CMD"  "echo post-run:\$1 >> $trace"
+
+    echo "must-not-arrive" > "$MNT_SRC/unwanted.txt"
+    "$SCRIPT_BIN" --config "$CONF_FILE" --debug >> "$LOG_FILE" 2>&1
+    local rc=$?
+
+    if [ "$rc" -eq 0 ]; then
+        echo -e "    ${RED}[FAIL] Run reported success although PRE_RSYNC_CMD failed.${NC}"
+        return 1
+    fi
+
+    if ! grep -q "post-run:" "$trace" 2>/dev/null; then
+        echo -e "    ${RED}[FAIL] POST_RUN_CMD did not run after the failure.${NC}"
+        return 1
+    fi
+
+    # Clean up for whatever runs next.
+    set_config "PRE_RSYNC_CMD" ""
+    set_config "POST_RUN_CMD" ""
+    rm -f "$MNT_SRC/unwanted.txt"
+}
+
+test_23_show_config_is_valid_shell() {
+    # Goal: --show-config must produce a file the script can source.
+    #
+    # The template is a heredoc, so anything in it that looks like a variable
+    # is expanded when it is written. A comment mentioning $1 aborted the whole
+    # command under set -u, and nothing noticed because the output was never
+    # fed back in - which is exactly what a config template is for.
+    local generated="$TEST_ROOT/generated.conf"
+
+    if ! "$SCRIPT_BIN" --show-config > "$generated" 2>/dev/null; then
+        echo -e "    ${RED}[FAIL] --show-config exited non-zero.${NC}"
+        return 1
+    fi
+
+    if ! sh -n "$generated" 2>/dev/null; then
+        echo -e "    ${RED}[FAIL] Generated config is not valid shell.${NC}"
+        return 1
+    fi
+
+    # Every setting the script reads should appear, or a template is a trap.
+    local missing=""
+    for key in CONFIG_VERSION BACKUP_MODE CLIENT_NAME SOURCE_DIRS \
+               PRE_RUN_CMD PRE_RSYNC_CMD POST_RUN_CMD LOGFILE PIDFILE
+    do
+        grep -qE "^$key=" "$generated" || missing="$missing $key"
+    done
+    if [ -n "$missing" ]; then
+        echo -e "    ${RED}[FAIL] Template is missing:$missing${NC}"
+        return 1
+    fi
+}
+
+test_24_version_comparison() {
+    # Goal: version_gt must order versions numerically, not as strings.
+    #
+    # This is what keeps --upgrade from going backwards. Without it, a CDN
+    # serving a stale copy is installed as eagerly as a new release - which is
+    # how three machines were downgraded by one version. "18.10 vs 18.9" is the
+    # case a string comparison gets wrong.
+    . "$SCRIPT_BIN" --version >/dev/null 2>&1 || true
+
+    local failed=""
+    _expect_gt() {
+        version_gt "$1" "$2" || failed="$failed [$1>$2 expected]"
+    }
+    _expect_not_gt() {
+        version_gt "$1" "$2" && failed="$failed [$1>$2 unexpected]"
+        return 0
+    }
+
+    _expect_gt     "18.7"  "18.6"
+    _expect_gt     "18.10" "18.9"
+    _expect_gt     "19.0"  "18.99"
+    _expect_not_gt "18.6"  "18.7"
+    _expect_not_gt "18.9"  "18.10"
+    _expect_not_gt "18.6"  "18.6"
+
+    if [ -n "$failed" ]; then
+        echo -e "    ${RED}[FAIL] version_gt:$failed${NC}"
+        return 1
+    fi
+}
+
 test_18_conditional_storage_creation() {
     # Goal: Verify that storage creation is strictly conditional.
     # Case A: --action version (Read-Only) -> MUST NOT create directory
@@ -577,5 +698,9 @@ run_test_case "17 Crash Recovery (Stale .tmp)" test_17_crash_recovery
 run_test_case "18 Storage Folder Creation" test_18_conditional_storage_creation
 run_test_case "19 Lock Dir Follows PIDFILE" test_19_lock_dir_follows_pidfile
 run_test_case "20 Rsync Log Classification" test_20_rsync_log_classification
+run_test_case "21 Hook Order and Result" test_21_hooks_order_and_result
+run_test_case "22 Failing PRE Hook Stops Run" test_22_failing_pre_hook_stops_the_run
+run_test_case "23 Generated Config Is Valid" test_23_show_config_is_valid_shell
+run_test_case "24 Version Comparison" test_24_version_comparison
 
 print_summary

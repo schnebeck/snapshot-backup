@@ -1,6 +1,6 @@
 # snapshot-backup.sh - Intelligent Incremental Backup
 
-⚠️ **STATUS: STABLE / PRODUCTION READY (v18.5)**
+⚠️ **STATUS: STABLE / PRODUCTION READY (v18.6)**
 
 ### ⚖️ DISCLAIMER / LIMITATION OF LIABILITY
 
@@ -272,6 +272,10 @@ The script automatically detects the currently logged-in GUI user and sends stat
 
 **`--setup-remote [TARGET]`** Interactive wizard that handles SSH key generation, key exchange (`ssh-copy-id`), and agent deployment to the remote server.
 
+**`--upgrade [--check|--force]`** Fetches the published version over HTTPS and installs it, keeping the previous one as `snapshot-backup.sh.<old-version>`. With `--check` it only reports which version is available. It refuses while a backup is running, and refuses a download that carries no `SCRIPT_VERSION`, does not parse as shell, or does not contain this program — a captive portal or a truncated transfer must not end up in `/usr/local/sbin`. Set `UPGRADE_URL` to install from a fork.
+
+What it does *not* do is verify authorship: HTTPS establishes that the file came from the host in the URL, not who put it there. There is no signature to check, so a compromised repository would install like any other update. That is why this is a command somebody types and never something that runs on its own. The agent on the backup server is a copy of the same file and is not updated by it — run `--deploy-agent` to bring it along.
+
 **`--is-running`** Checks if a backup process is currently active. Returns exit code `0` if running, `1` if idle. Useful for monitoring scripts or status bars.
 
 **`--is-job-done`** Checks if a valid backup for the current Base Interval (e.g., today for `daily`) already exists. Returns exit code `0` (true) if done, `1` (false) if a backup is needed.
@@ -285,6 +289,37 @@ The script automatically detects the currently logged-in GUI user and sends stat
 **`--debug`** Enables verbose logging to stdout and the log file. Useful for troubleshooting connection or rsync issues.
 
 **`--timeout [SEC]`** Sets a custom timeout for network operations and checks. Overrides the default `NETWORK_TIMEOUT` (10s).
+
+### E2. Hooks
+
+Three commands the script calls at points only it knows. They are **called, not listened to**: the script waits for each and reads its exit code, so a `PRE` hook that fails stops the run.
+
+| Setting | When | On failure |
+|---|---|---|
+| `PRE_RUN_CMD` | after the lock is held, before anything else | run aborts |
+| `PRE_RSYNC_CMD` | after the target is prepared, before the first file is read | run aborts |
+| `POST_RUN_CMD` | always — success, failure, abort, signal | logged only |
+
+`POST_RUN_CMD` receives the run's exit code as `$1`. It lives in the cleanup path, which is the only place guaranteed to run on every exit — that matters when the `PRE` hook set something up that has to be taken down again.
+
+The case this exists for:
+
+```sh
+PRE_RSYNC_CMD="/usr/local/sbin/freeze-and-snapshot.sh create"
+POST_RUN_CMD="/usr/local/sbin/freeze-and-snapshot.sh remove"
+```
+
+A snapshot that was not created must not be backed up as though it had been; the copy would look consistent and would not be. And a guest left frozen because a backup died at 04:00 stays frozen until somebody notices — hence the teardown in cleanup rather than at the end of the happy path.
+
+`PRE_RSYNC_CMD` runs **after** the rotation rather than before it, because on a large chain the hardlink copy takes minutes and a snapshot held open that long fills its copy-on-write area for nothing.
+
+A hook whose failure should not matter says so in ordinary shell, which needs no special syntax:
+
+```sh
+PRE_RUN_CMD="/usr/local/sbin/dump-databases.sh || true"
+```
+
+One edge: if `PRE_RSYNC_CMD` fails during the **very first** run of a new client, the prepared — and empty — `daily.0` stays behind. It carries no timestamp, so the next run treats it as ancient and rotates it away. An existing chain is untouched, because that run updates in place and nothing was created.
 
 ### F. Configuration Reference
 
@@ -421,6 +456,10 @@ This ensures that even if the SSH key is leaked, an attacker cannot easily get a
 ---
 
 ## 📆 Version History
+- **v18.6:** Hooks (`PRE_RUN_CMD`, `PRE_RSYNC_CMD`, `POST_RUN_CMD`) and `--upgrade`. Section E2 covers what the hooks are for and why `POST_RUN_CMD` lives in the cleanup path.
+
+  Two details in here exist because the obvious version of them was wrong. `--upgrade` compares versions **numerically**, not for inequality: a check that only asks "is it different" installs an older file just as eagerly as a newer one, and `raw.githubusercontent.com` serves a cached copy for minutes after a push — enough to downgrade a machine by one version. `18.10` is newer than `18.9`, which a string comparison gets wrong as soon as the minor number passes nine. And the test suite now feeds the output of `--show-config` back through `sh -n`: the template is a heredoc, so a `$1` in a comment was expanded and aborted the whole command under `set -u`, unnoticed because a generated config had never been read back — which is the only thing it is for.
+
 - **v18.5:** Rsync log classification no longer reports file names as errors. The patterns were unanchored, so any listed path containing `denied`, `failed:` or `fatal:` was logged as an error — a successful backup of a source holding `AccessDeniedException.php` produced hundreds of them, which is how people learn to stop reading the log. Anchored now, with `IO error` added because rsync writes that one unprefixed. `rsync warning: … vanished` stays unflagged: files disappearing while a live filesystem is copied is normal.
 
 - **v18.4:** `LOCK_DIR` now follows a `PIDFILE` set in the config. It is derived when the script loads, before any config is read, so a host running two instances with separate PIDFILEs used to share the default lock — the second instance refusing to start for a reason its PID file did not explain. A config may still set `LOCK_DIR` explicitly; it is only re-derived when it does not.
