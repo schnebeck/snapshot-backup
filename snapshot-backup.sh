@@ -3,7 +3,7 @@
 # ==============================================================================
 ## @file    snapshot-backup.sh
 ## @brief   Unified Snapshot Backup Client & Agent (POSIX sh)
-## @version 18.3
+## @version 18.7
 ##
 ## @note    DEVIATION FROM STRICT POSIX:
 ##          This script utilizes the 'local' keyword for variable scoping.
@@ -29,7 +29,7 @@ umask 0077
 # 1. CONSTANTS & CONFIGURATION DEFAULTS
 # ==============================================================================
 
-SCRIPT_VERSION="18.6"
+SCRIPT_VERSION="18.7"
 EXPECTED_CONFIG_VERSION="2.0"
 
 # --- System Paths ---
@@ -532,13 +532,21 @@ get_sortable_date() {
     
     if [ "$ts" -eq 0 ]; then echo "0"; return; fi
 
-    local week_fmt="%V"
-    if ! date +%V >/dev/null 2>&1; then week_fmt="%W"; fi
+    # Promotion compares these numerically, so each one must grow with time and
+    # name exactly one period. Weekly is the ISO year plus ISO week. Before 18.7
+    # it was "%Y%m%V": a week across a month boundary had two signatures and got
+    # two weekly snapshots, and ISO week 53 in early January compared as newer
+    # than every January week, so nothing was promoted until February. Daily and
+    # hourly carried the week number in the middle and broke the same way.
+    # "%Y%W" is the fallback for a date without %G: also monotonic, its weeks
+    # only split at New Year.
+    local week_fmt="%G%V"
+    case "$(ts_to_date "$ts" "+%G%V")" in ''|*[!0-9]*) week_fmt="%Y%W" ;; esac
     
     case "$interval" in
-        hourly)  ts_to_date "$ts" "+%Y%m${week_fmt}%d%H" ;;
-        daily)   ts_to_date "$ts" "+%Y%m${week_fmt}%d" ;;
-        weekly)  ts_to_date "$ts" "+%Y%m${week_fmt}" ;;
+        hourly)  ts_to_date "$ts" "+%Y%m%d%H" ;;
+        daily)   ts_to_date "$ts" "+%Y%m%d" ;;
+        weekly)  ts_to_date "$ts" "+$week_fmt" ;;
         monthly) ts_to_date "$ts" "+%Y%m" ;;
         yearly)  ts_to_date "$ts" "+%Y" ;;
         *)       echo "0" ;;
@@ -814,6 +822,41 @@ apply_smart_retention_policy() {
     fi
 }
 
+## @brief Frees space before a transfer by removing the oldest base snapshots.
+## Runs before the target is prepared, in both modes. A full target makes the
+## transfer fail, and a purge that only runs after a successful transfer then
+## never runs at all: a relay sat at 610 MB free for eight months this way,
+## failing every night with "Broken pipe". Only the base interval is touched,
+## at most SMART_PURGE_SLOTS snapshots, and never $int.0 - weekly and monthly
+## history is not traded for space without someone deciding it.
+make_room_before_backup() {
+    local int="$1"
+    [ "${SPACE_LOW_LIMIT_GB:-0}" -gt 0 ] && [ -d "$BACKUP_ROOT" ] || return 0
+
+    local slots="${SMART_PURGE_SLOTS:-0}"
+    local need_kb=$((SPACE_LOW_LIMIT_GB * 1024 * 1024))
+    local avail_kb max_idx
+    while :; do
+        avail_kb=$(df -P "$BACKUP_ROOT" | awk 'NR==2 {print $4}')
+        avail_kb=$(sanitize_int "$avail_kb")
+        [ "$avail_kb" -ge "$need_kb" ] && return 0
+
+        if [ "$slots" -le 0 ]; then
+            log "WARN" "Low space: $((avail_kb / 1024)) MB free, limit ${SPACE_LOW_LIMIT_GB} GB. No purge slots left (SMART_PURGE_SLOTS=${SMART_PURGE_SLOTS:-0})."
+            return 0
+        fi
+        max_idx=$(get_max_index "$int")
+        if [ "$max_idx" = "-1" ] || [ "$(sanitize_int "$max_idx")" -lt 1 ]; then
+            log "WARN" "Low space: $((avail_kb / 1024)) MB free, limit ${SPACE_LOW_LIMIT_GB} GB. Only $int.0 is left, which is never purged."
+            return 0
+        fi
+        max_idx=$(sanitize_int "$max_idx")
+        log "WARN" "Smart purge: $((avail_kb / 1024)) MB free, limit ${SPACE_LOW_LIMIT_GB} GB. Removing $int.$max_idx before the transfer."
+        safe_rm "$BACKUP_ROOT/$int.$max_idx"
+        slots=$((slots - 1))
+    done
+}
+
 ## @brief Deletes backups that exceed the configured retention limit.
 enforce_retention_limit() {
     local int="$1"
@@ -951,7 +994,8 @@ run_with_retry() {
 run_monitored_rsync() {
     local last_log_time=0
     local log_interval=${LOG_PROGRESS_INTERVAL:-60}
-    local status_file="/tmp/snapshot_rsync_status.$$"
+    local status_file
+    status_file=$(mktemp 2>/dev/null) || { status_file="/tmp/snapshot_rsync_status.$$.$(date +%s)"; : > "$status_file"; }
     
     ("$@" --timeout=300 $RSYNC_PROGRESS_OPTS 2>&1; echo $? > "$status_file") | while IFS= read -r line; do
             if echo "$line" | grep -q "[0-9]%[ ]"; then
@@ -982,11 +1026,12 @@ run_monitored_rsync() {
             fi
     done
     
-    local rsync_exit=0
-    if [ -f "$status_file" ]; then
-        rsync_exit=$(cat "$status_file")
-        rm -f "$status_file"
-    fi
+    # No status means rsync's exit was never recorded - the subshell was killed.
+    # That is not a success; before 18.7 it counted as one.
+    local rsync_exit
+    rsync_exit=$(cat "$status_file" 2>/dev/null)
+    rm -f "$status_file"
+    case "$rsync_exit" in ''|*[!0-9]*) log "ERROR" "rsync ended without an exit status."; rsync_exit=255 ;; esac
     
     if [ "$rsync_exit" -ne 0 ] && [ "$rsync_exit" -ne 24 ]; then
         log "ERROR" "Rsync failed with code $rsync_exit"
@@ -1056,17 +1101,20 @@ core_backup_execution() {
         local src="$1"
         [ ! -e "$src" ] && return
         
+        # 0 and 24 (files vanished while being read) are both a complete
+        # copy of a live filesystem; anything else is not. A plain "if !"
+        # counted 24 as a failure, and the caller then ignored the result.
+        local rc=0
         if [ "$_CTX_MODE" = "REMOTE" ]; then
-             if ! run_with_retry rsync $_CTX_RSYNC_OPTS -e "$_CTX_SSH_CMD_OPTS" --exclude-from="$TEMP_EXCLUDE_FILE" -R "$src" "$_CTX_DEST_BASE/"; then
-                 _CTX_VERIFY_STATUS=1
-             fi
+             run_with_retry rsync $_CTX_RSYNC_OPTS -e "$_CTX_SSH_CMD_OPTS" --exclude-from="$TEMP_EXCLUDE_FILE" -R "$src" "$_CTX_DEST_BASE/" || rc=$?
         else
-             local rel_path="${src#/}"
-             mkdir -p "$_CTX_DEST_BASE/$rel_path"
-             if ! run_monitored_rsync rsync $_CTX_RSYNC_OPTS --exclude-from="$TEMP_EXCLUDE_FILE" "$src/" "$_CTX_DEST_BASE/$rel_path/"; then
-                 _CTX_VERIFY_STATUS=1
-             fi
+             # -R, as in REMOTE mode: the same tree comes out, and an absolute
+             # exclude like "/var/lib/x" means the real path. Without it the
+             # transfer root was the source directory, and for any source other
+             # than "/" such a pattern silently matched nothing.
+             run_monitored_rsync rsync $_CTX_RSYNC_OPTS --exclude-from="$TEMP_EXCLUDE_FILE" -R "$src" "$_CTX_DEST_BASE/" || rc=$?
         fi
+        case "$rc" in 0|24) ;; *) _CTX_VERIFY_STATUS=1 ;; esac
     }
     
     iterate_list "$SOURCE_DIRS" _exec_item
@@ -1088,6 +1136,7 @@ core_backup_execution() {
 _perform_local_backup_logic() {
     local int="$1"
     check_path_safety
+    make_room_before_backup "$int"
     
     local target_path
     target_path=$(core_prepare_backup_target "$int")
@@ -1101,13 +1150,16 @@ _perform_local_backup_logic() {
     fi
     
     if [ "$v_status" -eq 0 ]; then
-        [ "$FORCE_VERIFY" = true ] && { mkdir -p "$(dirname "$LAST_VERIFY_FILE")"; date +%s > "$LAST_VERIFY_FILE"; }
+        [ "$FORCE_VERIFY" = true ] && record_verify_done
         core_commit_backup "$int" "$target_path"
         core_perform_all_promotions
         log "INFO" "Backup Summary: Success."
     else
         log "ERROR" "Backup failed. Cleaning up temp files."
         [ "${target_path%.tmp}" != "$target_path" ] && safe_rm "$target_path"
+        # Exit non-zero: returning here reported success to cron, systemd
+        # and POST_RUN_CMD alike, and a failing backup went unnoticed.
+        exit 1
     fi
 }
 
@@ -1118,9 +1170,14 @@ _perform_remote_backup_logic() {
     
     local c_opts
     c_opts="$(get_retention_args)"
+
+    # The agent reads no config of its own, so it only knows what it is told.
+    # An agent older than 18.7 skips options it does not know.
+    local p_opts=""
+    [ "$SPACE_LOW_LIMIT_GB" -gt 0 ] && p_opts="--smart-purge-limit $SPACE_LOW_LIMIT_GB --smart-purge-slots $SMART_PURGE_SLOTS"
     
     local target_suffix
-    target_suffix=$(run_remote_cmd "$REMOTE_AGENT --action prepare --client $CLIENT_NAME $c_opts") || die "Remote preparation failed."
+    target_suffix=$(run_remote_cmd "$REMOTE_AGENT --action prepare --client $CLIENT_NAME $c_opts $p_opts") || die "Remote preparation failed."
     target_suffix=$(echo "$target_suffix" | grep -E "^${BASE_INTERVAL}\.0(\.tmp)?$")
     if [ -z "$target_suffix" ]; then die "Invalid remote target received."; fi
     
@@ -1135,14 +1192,28 @@ _perform_remote_backup_logic() {
     if ! core_backup_execution "REMOTE" "$t_ssh" "$r_opts" "$t_raw_unused" "$ssh_cmd"; then
         v_status=1
     fi
+
+    # A failed transfer must not be committed. The commit writes the
+    # timestamp, and a half-transferred tree with a timestamp is
+    # indistinguishable from a good snapshot - it would rotate on as one.
+    if [ "$v_status" -ne 0 ]; then
+        die "Transfer failed - not committing. The last complete snapshot stays as it is."
+    fi
     
     run_remote_cmd "$REMOTE_AGENT --action commit --client $CLIENT_NAME $c_opts" || exit 1
+    [ "$FORCE_VERIFY" = true ] && record_verify_done
     
-    local p_opts=""
-    [ "$SPACE_LOW_LIMIT_GB" -gt 0 ] && p_opts="--smart-purge-limit $SPACE_LOW_LIMIT_GB"
     run_remote_cmd "$REMOTE_AGENT --action purge --client $CLIENT_NAME $c_opts $p_opts" || exit 1
     
     log "INFO" "Backup Summary: Success."
+}
+
+## @brief Notes that a --checksum run completed, so the next is due in DEEP_VERIFY_INTERVAL_DAYS.
+## Before 18.7 only LOCAL mode wrote this. A REMOTE client never found the
+## stamp, counted from 1970 and verified every byte on both sides every night.
+record_verify_done() {
+    mkdir -p "$(dirname "$LAST_VERIFY_FILE")"
+    date +%s > "$LAST_VERIFY_FILE"
 }
 
 ## @brief Helper to generate retention arguments for agent calls.
@@ -1154,8 +1225,35 @@ get_retention_args() {
 # 5. AGENT INTERFACE
 # ==============================================================================
 
+## @brief Serialises the agent actions that rename a client's snapshots.
+## Before 18.7 prepare wrote a lock file and nothing ever read it. The lock is a
+## directory (mkdir is atomic) holding the PID; a holder that no longer runs is
+## stale and removed. AGENT_LOCK_WAIT seconds of waiting, then the action fails.
+agent_lock() {
+    local l="$AGENT_LOCK_DIR/$CLIENT_NAME.lockd" holder waited=0 wait_max
+    wait_max=$(sanitize_int "${AGENT_LOCK_WAIT:-120}")
+    mkdir -p "$AGENT_LOCK_DIR"
+    while ! mkdir "$l" 2>/dev/null; do
+        holder=$(cat "$l/pid" 2>/dev/null)
+        # no PID after a few seconds: the holder died between mkdir and writing it
+        if { [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; } || { [ -z "$holder" ] && [ "$waited" -ge 5 ]; }; then
+            log "WARN" "Removing stale agent lock of '$CLIENT_NAME' (PID ${holder:-none})."
+            rm -rf "$l"
+            continue
+        fi
+        [ "$waited" -ge "$wait_max" ] && die "Another action for '$CLIENT_NAME' is running (PID ${holder:-?}). Gave up after ${wait_max}s."
+        sleep 1
+        waited=$((waited + 1))
+    done
+    echo $$ > "$l/pid"
+    AGENT_HELD_LOCK="$l"
+}
+
 ## @brief Removes agent lock file on exit.
 agent_cleanup() {
+    if [ -n "${AGENT_HELD_LOCK:-}" ] && [ "$(cat "$AGENT_HELD_LOCK/pid" 2>/dev/null)" = "$$" ]; then
+        rm -rf "$AGENT_HELD_LOCK"
+    fi
     if [ -n "${CLIENT_NAME:-}" ] && [ -d "$AGENT_LOCK_DIR" ]; then
         local lf="$AGENT_LOCK_DIR/$CLIENT_NAME.lock"
         if [ -f "$lf" ]; then
@@ -1195,6 +1293,8 @@ agent_main() {
             --retain-monthly) RETAIN_MONTHLY=$(sanitize_int "$2"); shift 2 ;;
             --retain-yearly) RETAIN_YEARLY=$(sanitize_int "$2"); shift 2 ;;
             --smart-purge-limit) SPACE_LOW_LIMIT_GB=$(sanitize_int "$2"); shift 2 ;;
+            --smart-purge-slots) SMART_PURGE_SLOTS=$(sanitize_int "$2"); shift 2 ;;
+            --key-blob) KEY_BLOB="$2"; shift 2 ;;
             --config|-c) load_config "$2"; shift 2 ;;
             --agent-mode) shift ;;
             --version) echo "$SCRIPT_VERSION"; exit 0 ;;
@@ -1205,6 +1305,7 @@ agent_main() {
     case "$action" in
         version) echo "$SCRIPT_VERSION"; exit 0 ;;
         install) do_install_agent; exit 0 ;;
+        lock-key) do_lock_key "${CLIENT_NAME:-}" "${KEY_BLOB:-}"; exit 0 ;;
         "") die "Error: No action specified." ;;
     esac
 
@@ -1238,14 +1339,14 @@ agent_main() {
 
     case "$action" in
         prepare)
-            mkdir -p "$AGENT_LOCK_DIR"
-            echo $$ > "$AGENT_LOCK_DIR/$CLIENT_NAME.lock"
-            HAS_LOCK=true
+            agent_lock
+            make_room_before_backup "$BASE_INTERVAL" >&2
             local full_path
             full_path=$(core_prepare_backup_target "$BASE_INTERVAL")
             echo "${full_path#$BACKUP_ROOT/}"
             ;;
         commit)
+            agent_lock
             local t_0
             t_0=$(get_interval_path "$BASE_INTERVAL" 0)
             local t_used="$t_0"
@@ -1253,6 +1354,7 @@ agent_main() {
             core_commit_backup "$BASE_INTERVAL" "$t_used"
             ;;
         purge)
+            agent_lock
             core_perform_all_promotions
             ;;
         status)
@@ -1285,11 +1387,19 @@ agent_main() {
 do_install_agent() {
     local target_user="${1:-backup}"
     local wrapper_path="${WRAPPER_PATH:-/usr/local/bin/snapshot-wrapper.sh}"
-    local install_path="/usr/local/sbin/snapshot-agent.sh"
-    
+    local install_path="${AGENT_INSTALL_PATH:-/usr/local/sbin/snapshot-agent.sh}"
+
     if [ "$(id -u)" -ne 0 ]; then die "Installation requires root."; fi
     
-    if ! [ "$0" -ef "$install_path" ]; then cp -f "$0" "$install_path"; fi
+    # A new file moved into place, never written into the old one: a shell reads
+    # its script piece by piece, so an agent action still running - a purge for
+    # one of many clients - would otherwise go on in a mixture of two versions.
+    if ! [ "$0" -ef "$install_path" ]; then
+        cp -f "$0" "$install_path.new.$$" || die "Could not copy the agent."
+        chmod 700 "$install_path.new.$$"
+        chown 0:0 "$install_path.new.$$"
+        mv -f "$install_path.new.$$" "$install_path" || die "Could not install the agent."
+    fi
     chmod 700 "$install_path"
     chown 0:0 "$install_path"
     
@@ -1297,19 +1407,206 @@ do_install_agent() {
         useradd --system --home-dir /var/backups --no-create-home --shell /bin/false "$target_user"
     fi
     
-    cat > "$wrapper_path" <<EOF
-#!/bin/bash
+    local rsync_bin sftp_bin s
+    rsync_bin=$(command -v rsync 2>/dev/null || echo /usr/bin/rsync)
+    sftp_bin=""
+    for s in /usr/lib/openssh/sftp-server /usr/libexec/openssh/sftp-server /usr/libexec/sftp-server /usr/lib/ssh/sftp-server /usr/lib/sftp-server; do
+        [ -x "$s" ] && { sftp_bin="$s"; break; }
+    done
+
+    # The wrapper is the only thing between a client's key and root on this machine,
+    # so it is written in plain POSIX sh and needs nothing but a shell, logger (optional)
+    # and readlink -f - all present in coreutils and in busybox.
+    {
+        echo "#!/bin/sh"
+        echo "# snapshot-wrapper.sh - forced command for backup client keys."
+        echo "# Generated by snapshot-backup.sh $SCRIPT_VERSION (--install). Edit ENFORCE only."
+        echo "AGENT=\"$install_path\""
+        echo "STORAGE_ROOT=\"$BASE_STORAGE_PATH\""
+        echo "RSYNC=\"$rsync_bin\""
+        echo "SFTP_SERVER=\"$sftp_bin\""
+        echo "ENFORCE=\"${WRAPPER_ENFORCE:-1}\""
+        cat <<'WRAPPER'
+#
+# authorized_keys, one line per client (--setup-remote writes it):
+#   command="/usr/local/bin/snapshot-wrapper.sh CLIENT",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 AAAA...
+#
+# With CLIENT the key is confined to that client:
+#   - agent actions only with --client CLIENT; no install, no --config (the agent would
+#     source that file as shell code)
+#   - rsync only as a server, only below STORAGE_ROOT/CLIENT (checked after resolving
+#     symlinks), only with known options; no protect-args, which would hide the paths
+#   - no sftp. sftp-server cannot be confined: "-R -d" means read-only and a start
+#     directory, not a jail, so it reads the whole server as root - other clients'
+#     backups included. A key that needs --mount gets it explicitly and knowingly:
+#       command="/usr/local/bin/snapshot-wrapper.sh CLIENT --allow-mount",...
+# Without CLIENT (an old line) it behaves as before 18.7 and logs "unpinned".
+# ENFORCE=0 logs what it would refuse and lets it through - for moving existing clients over.
 export LC_ALL=C
-CMD="\${SSH_ORIGINAL_COMMAND:-\$*}"
-case "\$CMD" in
-    *snapshot-agent.sh*|*--action*) exec $install_path \$CMD ;;
-    *sftp-server*) exec /usr/lib/openssh/sftp-server ;;
-    rsync*) exec \$CMD ;;
-    *) echo "Access Denied."; exit 1 ;;
-esac
-EOF
-    chmod +x "$wrapper_path"
-    log "INFO" "Agent installed."
+CLIENT="${1:-}"
+MOUNT="${2:-}"
+CMD="${SSH_ORIGINAL_COMMAND:-}"
+REASON=""
+
+note() { command -v logger >/dev/null 2>&1 && logger -t snapshot-wrapper -- "$*"; return 0; }
+refuse() { REASON="$1"; return 1; }
+
+# a path may be used only inside this client's own tree - also after symlinks are resolved
+inside_own_tree() {
+    p="$1"; base="$STORAGE_ROOT/$CLIENT"
+    case "$p" in *..*) refuse "path with ..: $p"; return 1 ;; esac
+    case "$p" in "$base"|"$base"/*) ;; *) refuse "path outside $base: $p"; return 1 ;; esac
+    q="$p"
+    while [ ! -e "$q" ] && [ "$q" != "$base" ] && [ "$q" != "/" ]; do q=$(dirname "$q"); done
+    r=$(readlink -f "$q" 2>/dev/null) || { refuse "cannot resolve $q"; return 1; }
+    rb=$(readlink -f "$base" 2>/dev/null) || rb="$base"
+    case "$r" in "$rb"|"$rb"/*) return 0 ;; esac
+    refuse "path leaves $base through a link: $p -> $r"
+}
+
+check_agent() {
+    shift
+    action=""; client_ok=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --agent-mode) shift ;;
+            --action) [ $# -ge 2 ] || { refuse "--action without value"; return 1; }; action="$2"; shift 2 ;;
+            --client) { [ $# -ge 2 ] && [ "$2" = "$CLIENT" ]; } || { refuse "--client ${2:-} is not $CLIENT"; return 1; }; client_ok=1; shift 2 ;;
+            --retain-hourly|--retain-daily|--retain-weekly|--retain-monthly|--retain-yearly|--smart-purge-limit|--smart-purge-slots)
+                [ $# -ge 2 ] || { refuse "$1 without value"; return 1; }
+                case "$2" in ''|*[!0-9]*) refuse "$1 $2 is not a number"; return 1 ;; esac
+                shift 2 ;;
+            *) refuse "agent argument not allowed: $1"; return 1 ;;
+        esac
+    done
+    case "$action" in
+        version) return 0 ;;
+        prepare|commit|purge|status|check-storage|check-job-done) [ -n "$client_ok" ] || { refuse "$action without --client"; return 1; } ;;
+        *) refuse "agent action not allowed: $action"; return 1 ;;
+    esac
+}
+
+check_rsync() {
+    shift
+    [ "${1:-}" = "--server" ] || { refuse "rsync not in server mode"; return 1; }
+    shift
+    dot=0; paths=0
+    for a in "$@"; do
+        if [ "$dot" = 1 ]; then inside_own_tree "$a" || return 1; paths=$((paths + 1)); continue; fi
+        case "$a" in
+            .) dot=1 ;;
+            --sender) ;;
+            --*)
+                case "$a" in
+                    --delete|--delete-before|--delete-during|--delete-delay|--delete-after|--delete-excluded|\
+                    --numeric-ids|--inplace|--partial|--ignore-errors|--force|--safe-links|--munge-links|\
+                    --fake-super|--existing|--ignore-existing|--size-only|--no-*|--fsync|--stats) ;;
+                    --timeout=*|--contimeout=*|--bwlimit=*|--max-delete=*|--max-size=*|--min-size=*|\
+                    --modify-window=*|--compress-level=*|--compress-choice=*|--checksum-choice=*|\
+                    --info=*|--debug=*|--log-format=*|--out-format=*|--iconv=*) ;;
+                    --link-dest=*|--compare-dest=*|--copy-dest=*) inside_own_tree "${a#*=}" || return 1 ;;
+                    --partial-dir=*) case "${a#*=}" in /*|*..*) refuse "partial-dir must be relative: $a"; return 1 ;; esac ;;
+                    *) refuse "rsync option not allowed: $a"; return 1 ;;
+                esac ;;
+            -*)
+                # "-vlogDtprRze.iLsfxCIvu": the letters before "e." are options, after it the
+                # protocol's capability flags. Refused among the options: s (protect-args hides
+                # the paths from this check), K/L/k (follow symlinks out of the tree), b (backups
+                # elsewhere), and anything unknown.
+                opts="${a#-}"; opts="${opts%%e.*}"
+                case "$opts" in *[!vlogDtprRzxHAXcSWuniIOJUNdqPhECmyF]*) refuse "rsync short option not allowed in $a"; return 1 ;; esac ;;
+            *) refuse "unexpected rsync argument: $a"; return 1 ;;
+        esac
+    done
+    [ "$dot" = 1 ] && [ "$paths" -ge 1 ] || { refuse "rsync without a path"; return 1; }
+}
+
+decide() {
+    [ -n "$CMD" ] || { refuse "interactive login"; return 1; }
+    set -f
+    # shellcheck disable=SC2086
+    set -- $CMD
+    case "$1" in
+        snapshot-agent.sh|*/snapshot-agent.sh) check_agent "$@" ;;
+        rsync|*/rsync) check_rsync "$@" ;;
+        internal-sftp|sftp-server|*/sftp-server)
+            [ "$MOUNT" = "--allow-mount" ] || { refuse "sftp not enabled for this key (it cannot be confined; --allow-mount)"; return 1; }
+            [ -n "$SFTP_SERVER" ] || refuse "no sftp-server on this machine" ;;
+        *) refuse "command not allowed: $1" ;;
+    esac
+}
+
+# before 18.7, and still for authorized_keys lines without a client name
+legacy() {
+    set -f
+    # shellcheck disable=SC2086
+    case "$CMD" in
+        *snapshot-agent.sh*|*--action*) exec "$AGENT" $CMD ;;
+        *sftp-server*|internal-sftp) exec "${SFTP_SERVER:-/usr/lib/openssh/sftp-server}" ;;
+        rsync*) exec $CMD ;;
+        *) echo "Access Denied."; exit 1 ;;
+    esac
+}
+
+if [ -z "$CLIENT" ]; then
+    note "unpinned key (no client name in authorized_keys) - legacy mode: $CMD"
+    legacy
+fi
+case "$CLIENT" in *[!A-Za-z0-9._-]*|*..*|.*) note "DENY invalid client name '$CLIENT'"; echo "Access Denied."; exit 1 ;; esac
+case "$MOUNT" in ''|--allow-mount) ;; *) note "DENY client=$CLIENT unknown wrapper option '$MOUNT'"; echo "Access Denied."; exit 1 ;; esac
+
+if decide; then
+    set -f
+    # shellcheck disable=SC2086
+    set -- $CMD
+    case "$1" in
+        *snapshot-agent.sh) shift; exec "$AGENT" "$@" ;;
+        *rsync) shift; exec "$RSYNC" "$@" ;;
+        *) exec "$SFTP_SERVER" -R -d "$STORAGE_ROOT/$CLIENT" ;;
+    esac
+fi
+note "DENY client=$CLIENT reason=$REASON cmd=$CMD"
+if [ "$ENFORCE" = 0 ]; then
+    note "AUDIT client=$CLIENT: ENFORCE=0, letting it through the old way"
+    legacy
+fi
+echo "Access Denied: $REASON" >&2
+exit 1
+WRAPPER
+    } > "$wrapper_path.new"
+    chmod 755 "$wrapper_path.new"
+    mv -f "$wrapper_path.new" "$wrapper_path"
+    log "INFO" "Agent installed. Wrapper: $wrapper_path (ENFORCE=${WRAPPER_ENFORCE:-1})"
+}
+
+## @brief Confines one key in authorized_keys to the wrapper for one client.
+##
+## Runs on the backup server as the login user, over the key that is being locked -
+## so it works only while that key is still unrestricted, i.e. during --setup-remote.
+## $1 = client name, $2 = the key's base64 blob (second field of the .pub file).
+do_lock_key() {
+    local client="$1" blob="$2"
+    local f="${HOME:-/root}/.ssh/authorized_keys"
+    local wrapper="${WRAPPER_PATH:-/usr/local/bin/snapshot-wrapper.sh}"
+    local opts="command=\"$wrapper $client\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty"
+    validate_client_name "$client"
+    case "$blob" in ''|*[!A-Za-z0-9+/=]*) die "lock-key: invalid key blob." ;; esac
+    [ -f "$f" ] || die "lock-key: $f not found."
+    grep -q "$blob" "$f" || die "lock-key: key not found in $f."
+    cp -p "$f" "$f.before-lock-$(date +%s)"
+    # Whatever options the line had are replaced; key type, blob and comment stay.
+    awk -v b="$blob" -v o="$opts" '
+        {
+            n = split($0, w, " ")
+            for (i = 2; i <= n; i++) if (w[i] == b && w[i-1] ~ /^(ssh-|ecdsa-|sk-)/) {
+                line = w[i-1]; for (j = i; j <= n; j++) line = line " " w[j]
+                print o " " line; next
+            }
+            print
+        }' "$f" > "$f.tmp.$$" || die "lock-key: rewrite failed."
+    chmod 600 "$f.tmp.$$"
+    mv -f "$f.tmp.$$" "$f"
+    log "INFO" "Key locked to $wrapper $client."
 }
 
 # ==============================================================================
@@ -1471,20 +1768,56 @@ cleanup() {
     fi
 }
 
-trap cleanup EXIT INT TERM
+# A signal ends the run. A trap on INT/TERM that only cleaned up let the shell
+# carry on afterwards (dash, busybox and bash alike): the lock was gone and
+# POST_RUN_CMD had run mid-run, and the run went on to commit and exit 0.
+# exit hands over to the EXIT trap, which cleans up once.
+trap cleanup EXIT
+trap 'log "ERROR" "Stopped by SIGHUP."; exit 129' HUP
+trap 'log "ERROR" "Stopped by SIGINT."; exit 130' INT
+trap 'log "ERROR" "Stopped by SIGTERM."; exit 143' TERM
 
-## @brief Kills active backup processes if requested.
-kill_active_backups() {
-    if [ -f "$PIDFILE" ]; then
-        local pid
-        pid=$(cat "$PIDFILE")
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            log "WARN" "Killing process $pid..."
-            kill "$pid"
+## @brief Prints the PIDs of all processes below $1, deepest first (reads /proc).
+_descendants() {
+    local parent="$1" d p pp
+    for d in /proc/[0-9]*; do
+        p="${d#/proc/}"
+        pp=$(sed -n 's/.*) [A-Za-z] \([0-9]*\).*/\1/p' "$d/stat" 2>/dev/null)
+        if [ "$pp" = "$parent" ]; then
+            _descendants "$p"
+            echo "$p"
         fi
-        rm -f "$PIDFILE" "$LOCK_DIR"
+    done
+}
+
+## @brief Stops the run this config's PIDFILE names, and what it started.
+## Before 18.7 this ran "pkill -f snapshot-backup.sh", which hit every process
+## mentioning the script - runs of other configs, an editor, itself - while the
+## rsync of the run it was meant for went on, and the run then committed.
+kill_active_backups() {
+    local pid
+    pid=$(sanitize_int "$(cat "$PIDFILE" 2>/dev/null)")
+    if [ "$pid" -gt 0 ] && kill -0 "$pid" 2>/dev/null; then
+        log "WARN" "Stopping backup run $pid and the processes it started."
+        # The run first, so it starts nothing new; its trap fires once the
+        # command it waits for is gone, which is why rsync and ssh go as well.
+        local tree
+        tree=$(_descendants "$pid")
+        kill "$pid" 2>/dev/null
+        # shellcheck disable=SC2086
+        [ -n "$tree" ] && kill $tree 2>/dev/null
+        local i=0
+        while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 30 ]; do sleep 1; i=$((i + 1)); done
+        kill -0 "$pid" 2>/dev/null && die "Run $pid did not stop within 30 s."
+    else
+        log "INFO" "No backup running for this configuration."
     fi
-    pkill -f "$(basename "$0")" 2>/dev/null || true
+    # A run that died without its cleanup leaves the lock behind.
+    if [ -d "$LOCK_DIR" ] && ! kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+        rm -f "$PIDFILE"
+        rmdir "$LOCK_DIR" 2>/dev/null
+    fi
+    exit 0
 }
 
 # ==============================================================================
@@ -1545,6 +1878,10 @@ $(print_config_list EXCLUDE_MOUNTPOINTS)
 # POST_RUN_CMD   always, including on failure, abort and signal. Receives the
 #                run's exit code as \$1. This is the only place guaranteed to
 #                tear down what a PRE hook set up.
+#                Use SINGLE quotes when the command refers to \$1:
+#                  POST_RUN_CMD='/usr/local/sbin/thaw.sh \$1'
+#                In double quotes the \$1 is expanded while this file is loaded,
+#                and the hook receives the path of this file instead.
 PRE_RUN_CMD="$PRE_RUN_CMD"
 PRE_RSYNC_CMD="$PRE_RSYNC_CMD"
 POST_RUN_CMD="$POST_RUN_CMD"
@@ -1705,6 +2042,17 @@ do_setup_remote() {
     
     ssh-copy-id -i "$REMOTE_KEY.pub" "$target"
     do_deploy_agent "$target"
+
+    # ssh-copy-id leaves the key unrestricted: root on the server for anyone who holds it.
+    # Confine it to the wrapper for this client, over the same key, while it still works.
+    local blob
+    blob=$(awk '{print $2}' "$REMOTE_KEY.pub")
+    if run_remote_cmd "/usr/local/sbin/snapshot-agent.sh --agent-mode --action lock-key --client $CLIENT_NAME --key-blob $blob"; then
+        log "SUCCESS" "Key locked on the server: it can now only run backups for '$CLIENT_NAME'."
+    else
+        log "WARN" "Could not lock the key on the server. Add by hand, in front of the key in authorized_keys:"
+        log "WARN" "  command=\"/usr/local/bin/snapshot-wrapper.sh $CLIENT_NAME\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty"
+    fi
 }
 
 ## @brief True when $1 is a newer version than $2.

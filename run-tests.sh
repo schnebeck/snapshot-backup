@@ -1,6 +1,6 @@
 #!/bin/bash
 # file: run-tests.sh
-# Final Version for snapshot-backup.sh v18.3
+# Test suite for snapshot-backup.sh v18.7
 
 source ./test-framework.sh
 
@@ -506,7 +506,10 @@ test_21_hooks_order_and_result() {
 
     set_config "PRE_RUN_CMD"   "echo pre-run >> $trace"
     set_config "PRE_RSYNC_CMD" "echo pre-rsync >> $trace"
-    set_config "POST_RUN_CMD"  "echo post-run:\$1 >> $trace"
+    # Single quotes, as the config template says: set_config writes double quotes, and
+    # in those the config's own loading expands $1 - to the path of the config file.
+    sed -i '/^POST_RUN_CMD=/d' "$CONF_FILE"
+    printf "POST_RUN_CMD='echo post-run:\$1 >> %s'\n" "$trace" >> "$CONF_FILE"
 
     echo "data" > "$MNT_SRC/hooked.txt"
     run_backup
@@ -592,7 +595,10 @@ test_24_version_comparison() {
     # serving a stale copy is installed as eagerly as a new release - which is
     # how three machines were downgraded by one version. "18.10 vs 18.9" is the
     # case a string comparison gets wrong.
-    . "$SCRIPT_BIN" --version >/dev/null 2>&1 || true
+    # Only the two functions under test are loaded. Sourcing the whole script runs its
+    # main part, whose "exit" ends this runner: from 18.6 on every test after this one,
+    # and the summary, silently never ran.
+    eval "$(sed -n '/^sanitize_int()/,/^}/p; /^version_gt()/,/^}/p' "$SCRIPT_BIN")"
 
     local failed=""
     _expect_gt() {
@@ -614,6 +620,326 @@ test_24_version_comparison() {
         echo -e "    ${RED}[FAIL] version_gt:$failed${NC}"
         return 1
     fi
+}
+
+test_25_wrapper_confines_a_client() {
+    # Goal: a key pinned to one client must reach nothing but that client's backups.
+    #
+    # Before 18.7 the wrapper ignored the client name it was given and passed on any
+    # agent arguments, any command starting with "rsync" and a full sftp-server - all as
+    # root. One client's key could delete every other client's backups, or hand the agent
+    # "--config FILE" and have it source a file it had just uploaded. This runs the
+    # generated wrapper against stubs that only print how they were called, under every
+    # POSIX shell present, because the wrapper has to work on busybox machines too.
+    local w="$TEST_ROOT/wrapper.sh" store="$TEST_ROOT/wstore" stubs="$TEST_ROOT/stubs"
+    rm -rf "$store" "$stubs"; mkdir -p "$store/alice/daily.0" "$store/bob/daily.0" "$stubs"
+    ln -s "$store/bob" "$store/alice/escape"
+
+    AGENT_INSTALL_PATH="$TEST_ROOT/agent-installed.sh" WRAPPER_PATH="$w" WRAPPER_ENFORCE=1 \
+        BASE_STORAGE="$store" "$SCRIPT_BIN" --agent-mode --config "$CONF_FILE" --action install >> "$LOG_FILE" 2>&1
+    [ -f "$w" ] || { echo -e "    ${RED}[FAIL] no wrapper generated${NC}"; return 1; }
+    grep -q "^STORAGE_ROOT=\"$store\"" "$w" || { echo -e "    ${RED}[FAIL] wrapper does not use BASE_STORAGE${NC}"; return 1; }
+    local s
+    for s in AGENT RSYNC SFTP_SERVER; do
+        printf '#!/bin/sh\necho "%s $*"\n' "$s" > "$stubs/$s"; chmod +x "$stubs/$s"
+        sed -i "s|^$s=.*|$s=\"$stubs/$s\"|" "$w"
+    done
+    printf '#!/bin/sh\nexec busybox sh "$@"\n' > "$stubs/busybox_sh"; chmod +x "$stubs/busybox_sh"
+
+    local failed="" sh out
+    # $1 = the wrapper's arguments, $2 = the command. $1 unquoted on purpose:
+    # "alice --allow-mount" is two words in authorized_keys too.
+    # (Until 18.7 _deny passed its arguments one position off, so every denial
+    # below tested an empty command - which is refused anyway - and proved nothing.)
+    # shellcheck disable=SC2086
+    _run() { SSH_ORIGINAL_COMMAND="$2" "$sh" "$w" $1 2>/dev/null; }
+    _allow() {  # $1 expected stub, $2 client, $3 command
+        out=$(_run "$2" "$3"); case "$out" in "$1 "*) ;; *) failed="$failed [$sh: refused '$3' for '$2']" ;; esac
+    }
+    _deny() {   # $1 client, $2 command
+        out=$(_run "$1" "$2"); case "$out" in AGENT*|RSYNC*|SFTP_SERVER*) failed="$failed [$sh: allowed '$2' for '$1']" ;; esac
+    }
+    for sh in sh dash bash busybox; do
+        command -v "$sh" >/dev/null || continue
+        [ "$sh" = busybox ] && sh="$stubs/busybox_sh"
+        _allow AGENT alice "/usr/local/sbin/snapshot-agent.sh --action prepare --client alice --retain-hourly 0 --retain-daily 7 --retain-weekly 4 --retain-monthly 12 --retain-yearly 0"
+        _allow AGENT alice "/usr/local/sbin/snapshot-agent.sh --action purge --client alice --retain-daily 7 --smart-purge-limit 20"
+        _allow AGENT alice "/usr/local/sbin/snapshot-agent.sh --agent-mode --action version"
+        _allow RSYNC alice "rsync --server -vlogDtprRze.iLsfxCIvu --numeric-ids --delete . $store/alice/daily.0.tmp/"
+        _allow RSYNC alice "rsync --server --sender -vlogDtprRe.iLsfxCIvu . $store/alice/daily.0/etc"
+        _allow RSYNC alice "rsync --server -vlogDtprRze.iLsfxCIvu --numeric-ids --delete --stats . $store/alice/daily.0.tmp/"
+        # sftp-server has no chroot: "-R -d" is read-only and a start directory, nothing
+        # more, so it reads the whole server. Only a key that is given it explicitly.
+        _allow SFTP_SERVER "alice --allow-mount" "/usr/lib/openssh/sftp-server"
+        _deny alice "/usr/lib/openssh/sftp-server"
+        _deny alice "internal-sftp"
+        _deny alice "/usr/local/sbin/snapshot-agent.sh --action purge --client bob --retain-daily 0"
+        _deny alice "/usr/local/sbin/snapshot-agent.sh --agent-mode --action install"
+        _deny alice "/usr/local/sbin/snapshot-agent.sh --action status --client alice --config $store/alice/daily.0/x.conf"
+        _deny alice "/usr/local/sbin/snapshot-agent.sh --action prepare"
+        _deny alice "rsync --server -vlogDtprRze.iLsfxCIvu --delete . $store/bob/daily.0/"
+        _deny alice "rsync --server -vlogDtprRze.iLsfxCIvu --delete . $store/alice/../bob/daily.0/"
+        _deny alice "rsync --server -vlogDtprRze.iLsfxCIvu --delete . $store/alice/escape/daily.0/"
+        _deny alice "rsync --server -vlogDtpsrRze.iLsfxCIvu . $store/alice/daily.0/"
+        _deny alice "rsync --server -vlogDtprRze.iLsfxCIvu --log-file=/etc/cron.d/x . $store/alice/daily.0/"
+        _deny alice "rsync --server -vlogDtprRze.iLsfxCIvu --link-dest=$store/bob/daily.0 . $store/alice/daily.0/"
+        _deny alice "rsync -av /etc/shadow $store/alice/"
+        _deny alice "sh -c id"
+        _deny alice ""
+        _deny "../x" "/usr/local/sbin/snapshot-agent.sh --agent-mode --action version"
+    done
+
+    # ENFORCE=0 lets a refused command through the old way (and logs it)
+    sed -i 's/^ENFORCE=.*/ENFORCE="0"/' "$w"; sh=sh
+    _allow AGENT alice "/usr/local/sbin/snapshot-agent.sh --action status --client bob"
+    # an authorized_keys line without a client name keeps the old behaviour
+    sed -i 's/^ENFORCE=.*/ENFORCE="1"/' "$w"
+    _allow AGENT "" "/usr/local/sbin/snapshot-agent.sh --action status --client bob"
+
+    if [ -n "$failed" ]; then echo -e "    ${RED}[FAIL]$failed${NC}"; return 1; fi
+}
+
+test_26_lock_key() {
+    # Goal: --setup-remote must leave the new key confined to the wrapper, not as root.
+    #
+    # ssh-copy-id installs a key without any restriction. The README promised an
+    # authorized_keys lock since 15.1, but nothing wrote it; every confinement on a real
+    # server had been added by hand. lock-key rewrites exactly the line holding the key.
+    local home="$TEST_ROOT/lockhome" f
+    rm -rf "$home"; mkdir -p "$home/.ssh"; f="$home/.ssh/authorized_keys"
+    printf '%s\n' \
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOTHERKEYother0000000000000000000000000000 admin@desk" \
+        "no-pty ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITARGETKEYtarget00000000000000000000000000 root@alice" > "$f"
+    HOME="$home" "$SCRIPT_BIN" --agent-mode --config "$CONF_FILE" --action lock-key --client alice \
+        --key-blob AAAAC3NzaC1lZDI1NTE5AAAAITARGETKEYtarget00000000000000000000000000 >> "$LOG_FILE" 2>&1 \
+        || { echo -e "    ${RED}[FAIL] lock-key failed${NC}"; return 1; }
+    grep -q '^command="/usr/local/bin/snapshot-wrapper.sh alice",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITARGETKEYtarget00000000000000000000000000 root@alice$' "$f" \
+        || { echo -e "    ${RED}[FAIL] target key not locked: $(grep TARGET "$f")${NC}"; return 1; }
+    grep -q '^ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOTHERKEYother0000000000000000000000000000 admin@desk$' "$f" \
+        || { echo -e "    ${RED}[FAIL] the other key was changed${NC}"; return 1; }
+    HOME="$home" "$SCRIPT_BIN" --agent-mode --config "$CONF_FILE" --action lock-key --client alice --key-blob 'x;rm' >> "$LOG_FILE" 2>&1 \
+        && { echo -e "    ${RED}[FAIL] invalid blob accepted${NC}"; return 1; }
+    return 0
+}
+
+# A mock bin directory: rsync exits with the given code, sleep does nothing
+# (run_with_retry waits 30 s between attempts), ssh runs the command locally.
+_mock_failing_transfer() {
+    local dir="$1" code="$2"
+    mkdir -p "$dir"
+    printf '#!/bin/sh\necho "mock rsync, exit %s" >&2\nexit %s\n' "$code" "$code" > "$dir/rsync"
+    printf '#!/bin/sh\nexit 0\n' > "$dir/sleep"
+    cat > "$dir/ssh" <<'EOF'
+#!/bin/bash
+eval "${@: -1}"
+EOF
+    printf '#!/bin/sh\necho "Filesystem 1024-blocks Used Available Capacity Mounted on"\necho "/dev/mock 999999999 999 100 99%% /"\n' > "$dir/df_full"
+    chmod +x "$dir/rsync" "$dir/sleep" "$dir/ssh" "$dir/df_full"
+}
+
+_mock_remote_config() {
+    set_config "BACKUP_MODE" "REMOTE"
+    set_config "REMOTE_HOST" "mock_host"
+    set_config "CLIENT_NAME" "test-client"
+    set_config "REMOTE_STORAGE_ROOT" "$SERVER_STORAGE"
+    set_config "BASE_STORAGE" "$SERVER_STORAGE"
+    set_config "REMOTE_AGENT" "$SCRIPT_BIN --agent-mode --config $CONF_FILE"
+}
+
+test_27_local_exit_24_commits() {
+    # Exit 24 means files vanished while a live filesystem was read. The copy
+    # is complete; "if ! rsync" counted it as a failure and never committed.
+    local mb="$TEST_ROOT/mock27"; _mock_failing_transfer "$mb" 24
+    local old_path="$PATH"; export PATH="$mb:$PATH"
+    run_backup; local ret=$?
+    export PATH="$old_path"
+    [ "$ret" -eq 0 ] || { echo -e "    ${RED}[FAIL] exit $ret after rsync 24${NC}"; return 1; }
+    assert_exists "$MNT_DEST/daily.0/.backup_timestamp" || { echo -e "    ${RED}[FAIL] rsync 24 was not committed${NC}"; return 1; }
+}
+
+test_28_local_failure_is_reported() {
+    # A failed local run returned normally, so cron, systemd and POST_RUN_CMD
+    # all saw success - a relay failed every night for eight months unseen.
+    local mb="$TEST_ROOT/mock28"; _mock_failing_transfer "$mb" 11
+    local old_path="$PATH"; export PATH="$mb:$PATH"
+    run_backup; local ret=$?
+    export PATH="$old_path"
+    [ "$ret" -ne 0 ] || { echo -e "    ${RED}[FAIL] rsync 11 ended with exit 0${NC}"; return 1; }
+    assert_missing "$MNT_DEST/daily.0/.backup_timestamp" || return 1
+}
+
+test_29_remote_failure_does_not_commit() {
+    # The commit writes the timestamp. After a failed transfer it turned a
+    # half-copied tree into something indistinguishable from a good snapshot.
+    local mb="$TEST_ROOT/mock29"; _mock_failing_transfer "$mb" 11
+    _mock_remote_config
+    local c="$SERVER_STORAGE/test-client"
+    mock_timestamp "$c/daily.0" "2 days ago"
+    local before; before=$(cat "$c/daily.0/.backup_timestamp")
+    local old_path="$PATH"; export PATH="$mb:$PATH"
+    run_backup; local ret=$?
+    export PATH="$old_path"
+    [ "$ret" -ne 0 ] || { echo -e "    ${RED}[FAIL] remote rsync 11 ended with exit 0${NC}"; return 1; }
+    [ "$(cat "$c/daily.0/.backup_timestamp")" = "$before" ] || { echo -e "    ${RED}[FAIL] daily.0 was committed after a failed transfer${NC}"; return 1; }
+    assert_missing "$c/daily.1" || { echo -e "    ${RED}[FAIL] a failed transfer was rotated in${NC}"; return 1; }
+}
+
+test_30_purge_runs_before_the_transfer() {
+    # A full target makes the transfer fail. A purge that only runs after a
+    # successful transfer then never runs: the store stays full for good.
+    local mb="$TEST_ROOT/mock30"; _mock_failing_transfer "$mb" 11
+    mv "$mb/df_full" "$mb/df"
+    set_config "SPACE_LOW_LIMIT_GB" 3
+    set_config "SMART_PURGE_SLOTS" 2
+    local i
+    for i in 0 1 2 3; do mock_timestamp "$MNT_DEST/daily.$i" "$((i+1)) days ago"; done
+    local old_path="$PATH"; export PATH="$mb:$PATH"
+    run_backup
+    export PATH="$old_path"
+    assert_missing "$MNT_DEST/daily.3" || { echo -e "    ${RED}[FAIL] LOCAL: no purge before the transfer${NC}"; return 1; }
+    assert_missing "$MNT_DEST/daily.2" || return 1
+    assert_exists "$MNT_DEST/daily.1" || { echo -e "    ${RED}[FAIL] LOCAL: purged more than SMART_PURGE_SLOTS${NC}"; return 1; }
+    assert_exists "$MNT_DEST/daily.0" || return 1
+
+    # REMOTE: the agent reads no config, so the slots have to travel with the
+    # call - and daily.0 survives even when more slots are allowed than exist.
+    _mock_remote_config
+    set_config "SMART_PURGE_SLOTS" 5
+    local c="$SERVER_STORAGE/test-client"
+    for i in 0 1 2; do mock_timestamp "$c/daily.$i" "$((i+1)) days ago"; done
+    export PATH="$mb:$PATH"
+    run_backup
+    export PATH="$old_path"
+    assert_missing "$c/daily.2" || { echo -e "    ${RED}[FAIL] REMOTE: no purge before the transfer${NC}"; return 1; }
+    assert_missing "$c/daily.1" || return 1
+    assert_exists "$c/daily.0/.backup_timestamp" || { echo -e "    ${RED}[FAIL] REMOTE: daily.0 was purged${NC}"; return 1; }
+}
+
+test_31_term_stops_the_run() {
+    # A trap on INT/TERM that only cleans up lets the shell carry on afterwards:
+    # the lock was released and POST_RUN_CMD ran in the middle of the run, which
+    # then went on to commit and exit 0. A stopped backup must stay stopped.
+    local mb="$TEST_ROOT/mock31"; mkdir -p "$mb"
+    printf '#!/bin/sh\ncase "$*" in *--version*) exit 0 ;; esac\nsleep 3\nexit 0\n' > "$mb/rsync"; chmod +x "$mb/rsync"
+    local old_path="$PATH"; export PATH="$mb:$PATH"
+    "$SCRIPT_BIN" --config "$CONF_FILE" >> "$LOG_FILE" 2>&1 &
+    local pid=$!
+    sleep 1; kill -TERM "$pid"; wait "$pid"; local ret=$?
+    export PATH="$old_path"
+    [ "$ret" -ne 0 ] || { echo -e "    ${RED}[FAIL] exit 0 after SIGTERM${NC}"; return 1; }
+    assert_missing "$MNT_DEST/daily.0/.backup_timestamp" || { echo -e "    ${RED}[FAIL] committed after SIGTERM${NC}"; return 1; }
+}
+
+test_32_remote_verify_is_recorded() {
+    # The deep-verify stamp was written in LOCAL mode only. A REMOTE client
+    # therefore found no stamp every night and ran --checksum every night.
+    local mb="$TEST_ROOT/mock32"; mkdir -p "$mb"
+    printf '#!/bin/sh\necho "$*" >> "%s/rsync.calls"\nexit 0\n' "$TEST_ROOT" > "$mb/rsync"
+    cat > "$mb/ssh" <<'EOF'
+#!/bin/bash
+eval "${@: -1}"
+EOF
+    chmod +x "$mb/rsync" "$mb/ssh"
+    _mock_remote_config
+    set_config "LAST_VERIFY_FILE" "$TEST_ROOT/lastverify/stamp"
+    local old_path="$PATH"; export PATH="$mb:$PATH"
+    run_backup
+    local first; first=$(grep -c -- "--exclude-from.*--checksum\|--checksum.*--exclude-from" "$TEST_ROOT/rsync.calls")
+    : > "$TEST_ROOT/rsync.calls"
+    run_backup
+    local second; second=$(grep -c -- "--checksum" "$TEST_ROOT/rsync.calls")
+    export PATH="$old_path"
+    [ "$first" -ge 1 ] || { echo -e "    ${RED}[FAIL] first run did not verify${NC}"; return 1; }
+    assert_exists "$TEST_ROOT/lastverify/stamp" || { echo -e "    ${RED}[FAIL] REMOTE run left no verify stamp${NC}"; return 1; }
+    [ "$second" -eq 0 ] || { echo -e "    ${RED}[FAIL] second run verified again${NC}"; return 1; }
+}
+
+test_33_local_absolute_exclude() {
+    # REMOTE copies with -R, so "/a/b/c" matches the real path. LOCAL copied
+    # "src/" into "dest/src/" without it, which anchors patterns at the source
+    # directory: for any source but "/" an absolute pattern matched nothing.
+    mkdir -p "$MNT_SRC/sub"
+    echo keep > "$MNT_SRC/sub/keep.me"; echo skip > "$MNT_SRC/sub/skip.me"
+    set_config "EXCLUDE_PATTERNS" "$MNT_SRC/sub/skip.me"
+    run_backup || { echo -e "    ${RED}[FAIL] backup failed${NC}"; return 1; }
+    local d="$MNT_DEST/daily.0${MNT_SRC}/sub"
+    assert_exists "$d/keep.me" || { echo -e "    ${RED}[FAIL] layout changed${NC}"; return 1; }
+    assert_missing "$d/skip.me" || { echo -e "    ${RED}[FAIL] LOCAL ignored an absolute exclude${NC}"; return 1; }
+}
+
+test_34_period_signatures() {
+    # Weekly was "%Y%m%V": a week across a month boundary had two signatures and
+    # got two weekly snapshots, and ISO week 53 in early January compared as
+    # newer than every January week, so nothing was promoted until February.
+    eval "$(sed -n '/^sanitize_int()/,/^}/p; /^get_sortable_date()/,/^}/p' "$SCRIPT_BIN")"
+    ts_to_date() { date -d "@$1" "$2"; }
+    local f=""
+    _s() { get_sortable_date "$1" "$(date -d "$2 12:00" +%s)"; }
+    [ "$(_s weekly 2026-09-28)" = "$(_s weekly 2026-10-04)" ] || f="$f [week 40 split by the month]"
+    [ "$(_s weekly 2027-01-11)" -gt "$(_s weekly 2027-01-02)" ] || f="$f [Jan 11 not after ISO week 53]"
+    [ "$(_s weekly 2027-01-04)" -gt "$(_s weekly 2026-12-27)" ] || f="$f [week 1 not after week 52]"
+    [ "$(_s daily 2027-01-04)" -gt "$(_s daily 2027-01-02)" ] || f="$f [daily Jan 4 not after Jan 2]"
+    [ "$(_s hourly 2027-01-04)" -gt "$(_s hourly 2027-01-02)" ] || f="$f [hourly Jan 4 not after Jan 2]"
+    [ "$(_s monthly 2027-01-02)" -gt "$(_s monthly 2026-12-31)" ] || f="$f [monthly]"
+    [ -z "$f" ] || { echo -e "    ${RED}[FAIL]$f${NC}"; return 1; }
+}
+
+test_35_agent_serialises_actions() {
+    # The agent wrote a lock file and never looked at it. Two actions for the
+    # same client could rename the same directories at the same time.
+    set_config "BASE_STORAGE" "$SERVER_STORAGE"
+    set_config "LOCK_DIR" "$TEST_ROOT/agentlock"
+    local l="$TEST_ROOT/agentlock/t35.lockd"
+    mkdir -p "$l"; sleep 30 & local holder=$!; echo "$holder" > "$l/pid"
+    local a="$SCRIPT_BIN --agent-mode --config $CONF_FILE --action prepare --client t35 --retain-daily 7"
+    AGENT_LOCK_WAIT=2 $a >> "$LOG_FILE" 2>&1; local busy=$?
+    kill "$holder" 2>/dev/null; wait "$holder" 2>/dev/null
+    AGENT_LOCK_WAIT=2 $a >> "$LOG_FILE" 2>&1; local stale=$?
+    [ "$busy" -ne 0 ] || { echo -e "    ${RED}[FAIL] prepare ran while another action held the lock${NC}"; return 1; }
+    [ "$stale" -eq 0 ] || { echo -e "    ${RED}[FAIL] a dead holder's lock blocked prepare${NC}"; return 1; }
+    assert_missing "$l" || { echo -e "    ${RED}[FAIL] lock left behind${NC}"; return 1; }
+}
+
+test_36_kill_stops_only_this_run() {
+    # --kill ran "pkill -f snapshot-backup.sh": every process whose command line
+    # mentions the script - other configs' runs, an editor, itself - while the
+    # rsync of the run it was meant for kept going.
+    local mb="$TEST_ROOT/mock36"; mkdir -p "$mb"
+    printf '#!/bin/sh\ncase "$*" in *--version*) exit 0 ;; esac\nexec sleep 30\n' > "$mb/rsync"; chmod +x "$mb/rsync"
+    set_config "PIDFILE" "$TEST_ROOT/run36.pid"
+    sh -c 'sleep 30; : snapshot-backup.sh' & local bystander=$!
+    local old_path="$PATH"; export PATH="$mb:$PATH"
+    "$SCRIPT_BIN" --config "$CONF_FILE" >> "$LOG_FILE" 2>&1 &
+    local pid=$!
+    sleep 1
+    "$SCRIPT_BIN" --config "$CONF_FILE" --kill >> "$LOG_FILE" 2>&1
+    local i=0; while kill -0 "$pid" 2>/dev/null && [ $i -lt 10 ]; do sleep 1; i=$((i+1)); done
+    export PATH="$old_path"
+    local f=""
+    kill -0 "$pid" 2>/dev/null && { f="$f [run still alive after 10 s]"; kill -9 "$pid"; }
+    kill -0 "$bystander" 2>/dev/null || f="$f [killed an unrelated process]"
+    kill "$bystander" 2>/dev/null; pkill -f "$mb/rsync" 2>/dev/null; pkill -x -f "sleep 30" 2>/dev/null
+    [ -e "$MNT_DEST/daily.0/.backup_timestamp" ] && f="$f [committed after --kill]"
+    [ -d "$TEST_ROOT/run36.lock" ] && f="$f [lock left behind]"
+    [ -z "$f" ] || { echo -e "    ${RED}[FAIL]$f${NC}"; return 1; }
+}
+
+test_37_install_replaces_atomically() {
+    # --install wrote the new agent into the existing file. An agent action
+    # still running reads its script piece by piece and would continue in a
+    # mixture of two versions. The installed file must be a new inode.
+    local a="$TEST_ROOT/agent-37.sh"
+    printf '#!/bin/sh\n# old agent\n' > "$a"
+    exec 7< "$a"
+    local before; before=$(ls -i "$a" | awk '{print $1}')
+    AGENT_INSTALL_PATH="$a" WRAPPER_PATH="$TEST_ROOT/wrapper-37.sh" \
+        "$SCRIPT_BIN" --agent-mode --config "$CONF_FILE" --action install >> "$LOG_FILE" 2>&1
+    local after; after=$(ls -i "$a" | awk '{print $1}')
+    local held; held=$(cat <&7); exec 7<&-
+    [ "$before" != "$after" ] || { echo -e "    ${RED}[FAIL] agent rewritten in place (inode $before)${NC}"; return 1; }
+    [ "$held" = "$(printf '#!/bin/sh\n# old agent')" ] || { echo -e "    ${RED}[FAIL] an open reader saw the new content${NC}"; return 1; }
+    cmp -s "$a" "$SCRIPT_BIN" || { echo -e "    ${RED}[FAIL] installed agent differs from the script${NC}"; return 1; }
+    [ -z "$(ls "$TEST_ROOT"/agent-37.sh.new.* 2>/dev/null)" ] || { echo -e "    ${RED}[FAIL] temporary file left behind${NC}"; return 1; }
 }
 
 test_18_conditional_storage_creation() {
@@ -702,5 +1028,18 @@ run_test_case "21 Hook Order and Result" test_21_hooks_order_and_result
 run_test_case "22 Failing PRE Hook Stops Run" test_22_failing_pre_hook_stops_the_run
 run_test_case "23 Generated Config Is Valid" test_23_show_config_is_valid_shell
 run_test_case "24 Version Comparison" test_24_version_comparison
+run_test_case "25 Wrapper Confines a Client" test_25_wrapper_confines_a_client
+run_test_case "26 Lock Key in authorized_keys" test_26_lock_key
+run_test_case "27 Local Exit 24 Commits" test_27_local_exit_24_commits
+run_test_case "28 Local Failure Is Reported" test_28_local_failure_is_reported
+run_test_case "29 Remote Failure Not Committed" test_29_remote_failure_does_not_commit
+run_test_case "30 Purge Before Transfer" test_30_purge_runs_before_the_transfer
+run_test_case "31 SIGTERM Stops the Run" test_31_term_stops_the_run
+run_test_case "32 Remote Verify Is Recorded" test_32_remote_verify_is_recorded
+run_test_case "33 Local Absolute Exclude" test_33_local_absolute_exclude
+run_test_case "34 Period Signatures" test_34_period_signatures
+run_test_case "35 Agent Serialises Actions" test_35_agent_serialises_actions
+run_test_case "36 Kill Stops Only This Run" test_36_kill_stops_only_this_run
+run_test_case "37 Install Replaces Atomically" test_37_install_replaces_atomically
 
 print_summary
