@@ -6,7 +6,8 @@
 # @details   Triggers snapshot-backup.sh based on network events, power state,
 #            trusted networks, and specific safety pre-checks.
 #
-# @version   5.0 (Added: Extended Safety Checks & Systemd Optimization)
+# @version   5.1 (Added: timer trigger, trust over all active connections,
+#                  RUN_ONCE_PER_PERIOD)
 # @license   GPLv3
 # ==============================================================================
 
@@ -14,26 +15,46 @@
 # 1. CONFIGURATION & CONSTANTS
 # ==============================================================================
 
-# NetworkManager arguments
+# NetworkManager arguments: interface and event ("up", "vpn-up", ...).
+# The systemd timer calls this script as "<script> - timer"; see section 3.
 INTERFACE="$1"
 ACTION="$2"
 
-# Configuration Files
-DISPATCHER_CONF="/etc/snapshot-backup-dispatcher.conf"
-BACKUP_CONF="/etc/snapshot-backup.conf"
+# Paths. Overridable from the environment only so that test-dispatcher.sh can
+# run the script without root; NetworkManager and systemd pass none of these.
+DISPATCHER_CONF="${DISPATCHER_CONF:-/etc/snapshot-backup-dispatcher.conf}"
+BACKUP_CONF="${BACKUP_CONF:-/etc/snapshot-backup.conf}"
+POWER_SUPPLY_DIR="${POWER_SUPPLY_DIR:-/sys/class/power_supply}"
 
 # Binaries
 BACKUP_SCRIPT="/usr/local/sbin/snapshot-backup.sh"
-LOGGER_BIN="/usr/bin/logger"
-SYSTEMD_RUN="/usr/bin/systemd-run"
+LOGGER_BIN="${LOGGER_BIN:-/usr/bin/logger}"
+SYSTEMD_RUN="${SYSTEMD_RUN:-/usr/bin/systemd-run}"
 SYSTEMD_INHIBIT="/usr/bin/systemd-inhibit"
-NOTIFY_SEND="/usr/bin/notify-send"
+NOTIFY_SEND="${NOTIFY_SEND:-/usr/bin/notify-send}"
+NMCLI="${NMCLI:-nmcli}"
+ON_AC_POWER_BIN="${ON_AC_POWER_BIN:-on_ac_power}"
 
 # Logging Tag
 LOG_TAG="nm-backup-dispatcher"
 
-# Defaults
+# Seconds to wait after a network event before checking anything (DHCP lease,
+# routing table). The timer skips the wait: its network has long settled.
+NM_SETTLE_SECONDS="${NM_SETTLE_SECONDS:-10}"
+
+# Timeout for the checks that ask the backup server (--has-storage,
+# --is-job-done). One second was enough at home; over the VPN from a hotel an
+# SSH handshake takes longer, and an --is-job-done that times out reads as
+# "not done" - which, from an hourly timer, would mean a backup every hour.
+CHECK_TIMEOUT="${CHECK_TIMEOUT:-10}"
+
+# Defaults, overridable in DISPATCHER_CONF
 declare -a HOME_NETWORKS=()
+# false: every trusted network event backs up, into the current period's
+#        snapshot if one exists (in-place update) - the behaviour before 5.1.
+# true:  a network event backs up only if this period has no backup yet.
+# The timer always behaves as "true".
+RUN_ONCE_PER_PERIOD=false
 
 # ==============================================================================
 # 2. HELPER FUNCTIONS
@@ -50,17 +71,17 @@ log() {
 # @return 0 if on AC power, 1 if on Battery.
 check_power() {
     # Method A: sysfs check
-    for ps in /sys/class/power_supply/*; do
+    for ps in "$POWER_SUPPLY_DIR"/*; do
         if [ -r "$ps/type" ] && grep -q "Mains" "$ps/type"; then
             if [ -r "$ps/online" ] && grep -q "1" "$ps/online"; then return 0; fi
         fi
     done
     # Method B: on_ac_power utility
-    if command -v on_ac_power >/dev/null; then
-        if on_ac_power; then return 0; fi
+    if command -v "$ON_AC_POWER_BIN" >/dev/null; then
+        if "$ON_AC_POWER_BIN"; then return 0; fi
     fi
     # Fallback: Assume AC if no battery detected
-    if [ ! -d "/sys/class/power_supply" ]; then return 0; fi
+    if [ ! -d "$POWER_SUPPLY_DIR" ]; then return 0; fi
     
     return 1
 }
@@ -96,10 +117,36 @@ notify_user() {
 }
 
 ##
-# @brief Main logic wrapper to be detached.
+# @brief True if a trusted network is in use; sets TRUSTED_NET to its name.
+#
+# A network event names the connection that came up (CONNECTION_ID), and only
+# that one is judged. Without one - the timer - every active connection counts.
+# Before 5.1 the first line of "nmcli connection show --active" stood in for
+# all of them, and with the VPN up that line is the VPN: at home, on the trusted
+# Wi-Fi, the check then judged the tunnel and skipped.
+is_trusted_network() {
+    local -a candidates=()
+    if [ -n "${CONNECTION_ID:-}" ]; then
+        candidates=("$CONNECTION_ID")
+    else
+        mapfile -t candidates < <("$NMCLI" -t -f NAME connection show --active 2>/dev/null)
+    fi
+    local c net
+    for c in "${candidates[@]}"; do
+        for net in "${HOME_NETWORKS[@]}"; do
+            if [[ "$c" == "$net" ]]; then TRUSTED_NET="$c"; return 0; fi
+        done
+    done
+    TRUSTED_NET="${candidates[*]}"
+    return 1
+}
+
+##
+# @brief Main logic: runs detached after a network event, in the foreground
+#        from the timer.
 run_logic() {
     # Delay for network stabilization (DHCP lease, routing table update)
-    sleep 10
+    [ "$MODE" = event ] && sleep "$NM_SETTLE_SECONDS"
 
     # 1. Power State Check
     if ! check_power; then
@@ -117,22 +164,11 @@ run_logic() {
 
     # 3. Network Trust Validation
     if [ ${#HOME_NETWORKS[@]} -gt 0 ]; then
-        local current_con="${CONNECTION_ID:-}"
-        if [ -z "$current_con" ]; then
-            current_con=$(nmcli -t -f NAME connection show --active | head -n 1)
-        fi
-
-        local match=false
-        for net in "${HOME_NETWORKS[@]}"; do
-            if [[ "$current_con" == "$net" ]]; then match=true; break; fi
-        done
-
-        if [ "$match" = false ]; then
-            log "SKIP: Network '$current_con' is not trusted."
+        if ! is_trusted_network; then
+            log "SKIP: Network '$TRUSTED_NET' is not trusted."
             exit 0
-        else
-            log "TRUST: Network '$current_con' is trusted."
         fi
+        log "TRUST: Network '$TRUSTED_NET' is trusted."
     fi
 
     # 4. Load Core Backup Configuration
@@ -168,25 +204,29 @@ run_logic() {
     # 6. Advanced Safety Invariants (Script-based checks)
     
     # Check A: Verify storage availability and writability
-    if ! "$BACKUP_SCRIPT" --has-storage --timeout 1 >/dev/null 2>&1; then
+    if ! "$BACKUP_SCRIPT" --has-storage --timeout "$CHECK_TIMEOUT" >/dev/null 2>&1; then
         log "SKIP: Safety Check 'has-storage' failed (Target unreachable/unwritable)."
         exit 0
     fi
     log "TEST: Storage is verified and available."
 
     # Check B: Prevent concurrent backup executions
-    if "$BACKUP_SCRIPT" --is-running --timeout 1 >/dev/null 2>&1; then
+    if "$BACKUP_SCRIPT" --is-running --timeout "$CHECK_TIMEOUT" >/dev/null 2>&1; then
         log "SKIP: Safety Check 'is-running' failed (Instance already active)."
         exit 0
     fi
     log "TEST: No existing backup process detected."
 
-    # Check C: Verify if the job is already completed for the current interval
-    #if "$BACKUP_SCRIPT" --is-job-done --timeout 1 >/dev/null 2>&1; then
-    #    log "SKIP: Safety Check 'is-job-done' failed (Interval already covered)."
-    #    exit 0
-    #fi
-    #log "TEST: Backup interval is open; job is required."
+    # Check C: Verify if the job is already completed for the current interval.
+    # Always for the timer, which would otherwise back up every hour; for network
+    # events only with RUN_ONCE_PER_PERIOD=true (see section 1).
+    if [ "$MODE" = timer ] || [ "$RUN_ONCE_PER_PERIOD" = true ]; then
+        if "$BACKUP_SCRIPT" --is-job-done --timeout "$CHECK_TIMEOUT" >/dev/null 2>&1; then
+            log "SKIP: Safety Check 'is-job-done' failed (Interval already covered)."
+            exit 0
+        fi
+        log "TEST: Backup interval is open; job is required."
+    fi
 
     # 7. Final Execution via Systemd
     if [ -x "$BACKUP_SCRIPT" ]; then
@@ -209,6 +249,18 @@ run_logic() {
 # ==============================================================================
 # 3. MAIN ENTRY POINT
 # ==============================================================================
+
+# "timer": called by snapshot-backup-check.timer (see README). A network event
+# fires once per connection, so on its own it misses a laptop that is plugged
+# in after arriving on battery, and one that stays on the same network for days.
+# The timer runs the same checks in the foreground; Check C keeps it to one
+# backup per period.
+if [ "$ACTION" = "timer" ]; then
+    MODE=timer
+    run_logic
+    exit 0
+fi
+MODE=event
 
 # Only trigger on 'up' or 'vpn-up' events
 if [[ "$ACTION" != "up" && "$ACTION" != "vpn-up" ]]; then exit 0; fi

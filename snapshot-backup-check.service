@@ -1,0 +1,10 @@
+# Runs the NetworkManager dispatcher's checks on a schedule (see the .timer).
+# Install the dispatcher as /etc/NetworkManager/dispatcher.d/30-backup-control.sh
+# and this file as /etc/systemd/system/snapshot-backup-check.service.
+[Unit]
+Description=Start a snapshot backup if one is due (laptop check)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/etc/NetworkManager/dispatcher.d/30-backup-control.sh - timer

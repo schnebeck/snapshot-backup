@@ -1,0 +1,15 @@
+# A network event fires once per connection. On its own it misses a laptop that
+# is plugged in after arriving on battery, and one that stays on the same network
+# for days. This timer asks every hour; the dispatcher backs up at most once per
+# period and only on AC power and a trusted network.
+#   systemctl enable --now snapshot-backup-check.timer
+[Unit]
+Description=Hourly check whether a snapshot backup is due
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=1h
+RandomizedDelaySec=5min
+
+[Install]
+WantedBy=timers.target

@@ -186,23 +186,47 @@ A single line handles all retention levels (Daily, Weekly, Monthly...):
 
 ### Automation (NetworkManager / Laptop)
 
-Ideal for laptops: Starts backup automatically when home and on AC power.
-Create `/etc/NetworkManager/dispatcher.d/99-backup`:
+Ideal for laptops: backs up automatically when on a trusted network and on AC power.
+The repository's `Network-Manager-Dispatcher-Start-Backup.sh` does that, with checks before
+every run: AC power, a trusted network, the backup server reachable and writable, no backup
+running already — and, where wanted, none done yet this period.
 
 ```
-#!/bin/bash
-INTERFACE="$1"
-ACTION="$2"
-MY_SSID="Home-WiFi"
-
-if [ "$ACTION" = "up" ]; then
-    CURRENT=$(nmcli -t -f GENERAL.CONNECTION dev show "$INTERFACE" | cut -d: -f2)
-    if [ "$CURRENT" = "$MY_SSID" ] && on_ac_power; then
-         /usr/local/sbin/snapshot-backup.sh &
-    fi
-fi
+sudo install -m 755 Network-Manager-Dispatcher-Start-Backup.sh /etc/NetworkManager/dispatcher.d/30-backup-control.sh
+sudo install -m 644 snapshot-backup-check.service snapshot-backup-check.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now snapshot-backup-check.timer
 ```
-There is a much more sophisticated Network-Manager dispacher script in the repository.
+
+`/etc/snapshot-backup-dispatcher.conf`:
+
+```
+# Connection names as NetworkManager shows them (nmcli connection show).
+# A VPN may be listed too: then the laptop backs up from anywhere over the tunnel.
+HOME_NETWORKS=(
+    "Home-WiFi"
+    "Home-WiFi_5GHz"
+    "My VPN"
+)
+# false (default): every trusted network event backs up, into this period's snapshot
+#                  if one exists. true: only if this period has no backup yet.
+RUN_ONCE_PER_PERIOD=true
+# Seconds for the checks that ask the backup server; raise it for slow VPN links.
+CHECK_TIMEOUT=10
+```
+
+**Two triggers.** NetworkManager calls the script when a connection comes up; the timer calls it
+every hour. A network event alone misses a laptop that is plugged in after arriving on battery,
+and one that stays on the same network for days — both wait for the next reconnect. The timer
+always backs up at most once per period, whatever `RUN_ONCE_PER_PERIOD` says.
+
+Decisions are logged to the journal: `journalctl -t nm-backup-dispatcher`. Every `SKIP` names its
+reason (battery, untrusted network, target unreachable, already done). `bash test-dispatcher.sh`
+runs the script against stubs, without root and without NetworkManager.
+
+Dispatcher 5.1 (2026-10-13): the timer, and the trust check looks at every active connection
+when no event names one — before, it took the first line of `nmcli connection show --active`,
+which with a VPN up is the tunnel, not the home Wi-Fi.
 
 ## 📂 Restore
 
