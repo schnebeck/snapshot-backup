@@ -3,7 +3,7 @@
 # ==============================================================================
 ## @file    snapshot-backup.sh
 ## @brief   Unified Snapshot Backup Client & Agent (POSIX sh)
-## @version 18.7
+## @version 18.8
 ##
 ## @note    DEVIATION FROM STRICT POSIX:
 ##          This script utilizes the 'local' keyword for variable scoping.
@@ -29,7 +29,7 @@ umask 0077
 # 1. CONSTANTS & CONFIGURATION DEFAULTS
 # ==============================================================================
 
-SCRIPT_VERSION="18.7"
+SCRIPT_VERSION="18.8"
 EXPECTED_CONFIG_VERSION="2.0"
 
 # --- System Paths ---
@@ -108,6 +108,18 @@ _RUN_EXIT_CODE=1
 PRE_RUN_CMD=""
 PRE_RSYNC_CMD=""
 POST_RUN_CMD=""
+
+# Wakeserver (optional): a machine that sleeps when idle is kept awake for the
+# length of a run through a lease, and/or a local sleep inhibitor.
+POWER_API_URL=""
+POWER_API_TOKEN=""
+POWER_LEASE_HOSTS=""
+POWER_LEASE_MINUTES=240
+POWER_WAIT_SECONDS=0
+POWER_HTTP_CLIENT="auto"
+INHIBIT_SLEEP=false
+_POWER_LEASED=""
+_INHIBIT_PID=""
 
 RSYNC_PROGRESS_OPTS=""
 RSYNC_ACL_OPT=""
@@ -575,17 +587,32 @@ is_backup_older_than_current_period() {
     fi
 }
 
+## @brief Renames a snapshot directory; refuses when the target already exists.
+##
+## mv onto an existing directory moves the source *into* it: after one failed
+## rename in a rotation, the next one would have nested a whole snapshot inside
+## another, which every later rotation then carries along. Before 18.8 none of
+## these renames was checked, and a commit that never happened reported success.
+move_snapshot() {
+    if [ -e "$2" ]; then
+        log "ERROR" "Not moving $1: $2 already exists."
+        return 1
+    fi
+    mv "$1" "$2" || { log "ERROR" "Could not move $1 to $2."; return 1; }
+}
+
 ## @brief Renumbers backup directories to remove gaps.
 consolidate_directory_indices() {
     local int="$1"
-    [ ! -d "$BACKUP_ROOT" ] && return
-    
+    [ ! -d "$BACKUP_ROOT" ] && return 0
+
     local target_index=0
+    # The loop runs in a subshell; its exit status is the pipeline's.
     find "$BACKUP_ROOT" -maxdepth 1 -name "${int}.*" -type d ! -name "*.tmp" 2>/dev/null | sed "s/^.*${int}\.//" | grep -E "^[0-9]+$" | sort -n | while read current_index; do
         if [ -n "$current_index" ]; then
             if [ "$current_index" -ne "$target_index" ]; then
                 log "DEBUG" "Consolidating $int: $current_index -> $target_index"
-                mv "$BACKUP_ROOT/$int.$current_index" "$BACKUP_ROOT/$int.$target_index"
+                move_snapshot "$BACKUP_ROOT/$int.$current_index" "$BACKUP_ROOT/$int.$target_index" || exit 1
             fi
             target_index=$((target_index+1))
         fi
@@ -597,35 +624,37 @@ rotate_period_up() {
     local raw_max
     raw_max=$(get_max_index "$int")
     
-    if [ "$raw_max" = "-1" ]; then return; fi
-    
+    if [ "$raw_max" = "-1" ]; then return 0; fi
+
     local max_idx
     max_idx=$(sanitize_int "$raw_max")
-    
+
     # NEU: Info, dass wir rotieren
     log "INFO" "Rotating interval '$int': Shifting $max_idx existing snapshots up..."
 
     local i=$max_idx
     while [ "$i" -ge 0 ]; do
         if [ -d "$BACKUP_ROOT/$int.$i" ]; then
-            # Optional: Jede einzelne Verschiebung loggen? 
+            # Optional: Jede einzelne Verschiebung loggen?
             # Das wären bei 30 Dailies 30 Zeilen. Vielleicht zu viel.
-            # log "DEBUG" "mv $int.$i -> $int.$((i+1))" 
-            mv "$BACKUP_ROOT/$int.$i" "$BACKUP_ROOT/$int.$((i+1))"
+            # log "DEBUG" "mv $int.$i -> $int.$((i+1))"
+            move_snapshot "$BACKUP_ROOT/$int.$i" "$BACKUP_ROOT/$int.$((i+1))" || return 1
         fi
         i=$((i-1))
     done
 }
 
 ## @brief Prepares the target directory for a new backup logic.
+## Prints the target path; returns non-zero, printing nothing, when the target
+## cannot be prepared.
 core_prepare_backup_target() {
     local int="$1"
-    mkdir -p "$BACKUP_ROOT"
+    mkdir -p "$BACKUP_ROOT" || { log "ERROR" "Could not create $BACKUP_ROOT."; return 1; }
     chmod 700 "$BACKUP_ROOT"
-    
+
     # 1. Clean indices
     for i in $INTERVALS; do
-        consolidate_directory_indices "$i"
+        consolidate_directory_indices "$i" || return 1
     done
     
     local target_0
@@ -662,7 +691,7 @@ core_prepare_backup_target() {
     # Decide: Initial or Update
     if [ ! -d "$target_0" ]; then
         log "INFO" "No valid backup found in ($int). Preparing INITIAL backup at .0"
-        mkdir -p "$target_0"
+        mkdir -p "$target_0" || { log "ERROR" "Could not create $target_0."; return 1; }
         chmod 700 "$target_0"
         echo "$target_0"
         return
@@ -683,31 +712,52 @@ core_prepare_backup_target() {
         if [ -d "$target_tmp" ]; then
             safe_rm "$target_tmp"
         fi
-        cp -al "$target_0" "$target_tmp"
+        # A partial link copy is not a base for rsync to finish: the files it
+        # missed would be copied in full, on a target that is usually short of
+        # space or inodes when cp fails.
+        if ! cp -al "$target_0" "$target_tmp"; then
+            log "ERROR" "Could not link $target_0 to $target_tmp."
+            safe_rm "$target_tmp"
+            return 1
+        fi
         chmod 700 "$target_tmp"
         echo "$target_tmp"
     fi
 }
 
 ## @brief Finalizes the backup by writing timestamps and populating other intervals.
+## Returns non-zero when the snapshot could not be committed or an interval not seeded.
 core_commit_backup() {
     local int="$1"
     local target_used="$2"
     local target_0
     target_0=$(get_interval_path "$int" 0)
-    
+    local status=0
+
     # 1. Commit/Rotate logic
     if [ "${target_used%.tmp}" != "$target_used" ]; then
         log "INFO" "Commit: Rotating and moving .tmp to .0"
-        rotate_period_up "$int"
-        mv "$target_used" "$target_0"
+        rotate_period_up "$int" || { log "ERROR" "Commit failed: could not rotate '$int'."; return 1; }
+        move_snapshot "$target_used" "$target_0" || { log "ERROR" "Commit failed: $target_used is not $int.0."; return 1; }
     else
         log "INFO" "Commit: In-Place update completed."
     fi
-    
+
     # 2. Timestamp & Permissions for the primary target
     if [ -d "$target_0" ]; then
-        date +%s > "$target_0/$TIMESTAMP_FILE"
+        # Without its timestamp the snapshot reads as being from 1970: rotated
+        # away on the next run as if it were old.
+        #
+        # A new file, never written into the old one: the rotation's "cp -al"
+        # links the timestamp too, and rsync -R deletes only below the source
+        # paths, so it survives in the snapshot root as the same inode as
+        # $int.1's - and the seeded weekly.0's, and so on along the chain.
+        # Before 18.8, writing into it gave every snapshot sharing it today's
+        # date: no period ever looked new, nothing was promoted, and retention
+        # deleted the history. (A source of "/" was spared: there --delete
+        # reaches the root and removed the link before the commit.)
+        rm -f "$target_0/$TIMESTAMP_FILE"
+        date +%s > "$target_0/$TIMESTAMP_FILE" || { log "ERROR" "Commit failed: could not write the timestamp of $int.0."; return 1; }
         chmod 700 "$target_0"
     fi
 
@@ -725,13 +775,20 @@ core_commit_backup() {
                 log "INFO" ">>> Action: Creating $check_int.0 as a hardlink copy of $int.0"                
                 # Create Hardlink Copy from the just-finished backup
                 # This recursively links EVERYTHING, including the timestamp file.
-                cp -al "$target_0" "$check_path"
-                
+                # A partial copy would count as this interval's snapshot from now on.
+                if ! cp -al "$target_0" "$check_path"; then
+                    log "ERROR" "Could not seed $check_int.0 from $int.0."
+                    safe_rm "$check_path"
+                    status=1
+                    continue
+                fi
+
                 # Ensure permissions (timestamp file is already there via hardlink)
                 chmod 700 "$check_path"
             fi
         fi
     done
+    return "$status"
 }
 
 ## @brief Evaluates promotion for a single backup slot.
@@ -791,11 +848,11 @@ check_and_promote_single_item() {
             return 0
         fi
 
-        rotate_period_up "$tgt_int"
-        
+        rotate_period_up "$tgt_int" || return 2
+
         log "INFO" "Promoting via MOVE (Cleaning up $src_path)."
-        mv "$src_path" "$tgt_path_0"
-        
+        move_snapshot "$src_path" "$tgt_path_0" || return 2
+
         if [ ! -f "$tgt_path_0/$TIMESTAMP_FILE" ] && [ -n "$src_ts" ]; then
             echo "$src_ts" > "$tgt_path_0/$TIMESTAMP_FILE"
         fi
@@ -804,7 +861,7 @@ check_and_promote_single_item() {
         return 1 # Status: Promoted
     fi
 
-    return 0 # Status: Kept
+    return 0 # Status: Kept (2: Failed)
 }
 
 ## @brief Deletes oldest daily backups if disk space is low.
@@ -813,6 +870,7 @@ apply_smart_retention_policy() {
     
     local avail_gb
     avail_gb=$(df -P "$BACKUP_ROOT" | awk 'NR==2 {print $4}')
+    avail_gb=$(sanitize_int "$avail_gb")
     avail_gb=$((avail_gb / 1024 / 1024))
     
     if [ "$avail_gb" -lt "$SPACE_LOW_LIMIT_GB" ]; then
@@ -887,6 +945,7 @@ enforce_retention_limit() {
 }
 
 ## @brief Executes strict chain promotion (recursive propagation from bottom to top).
+## Stops at the first rename that fails and returns non-zero.
 core_perform_all_promotions() {
     log "DEBUG" "Starting Strict-Chain Promotion..."
     
@@ -915,11 +974,15 @@ core_perform_all_promotions() {
             while [ "$i" -ge 0 ]; do
                 # HIER: Übergebe BASE_INTERVAL als 4. Parameter
                 check_and_promote_single_item "$current_int" "$i" "$next_int" "$BASE_INTERVAL"
+                if [ $? -eq 2 ]; then
+                    log "ERROR" "Promotion of $current_int.$i failed - stopping promotions."
+                    return 1
+                fi
                 i=$((i-1))
             done
-            
+
             # 2. CONSOLIDATION PHASE
-            consolidate_directory_indices "$current_int"
+            consolidate_directory_indices "$current_int" || return 1
             
             # 3. RETENTION PHASE
             enforce_retention_limit "$current_int"
@@ -1099,8 +1162,15 @@ core_backup_execution() {
     
     _exec_item() {
         local src="$1"
-        [ ! -e "$src" ] && return
-        
+        # Before 18.8 a missing source was skipped without a word: with every
+        # source missing - a typo, a disk not attached - the run ended in
+        # "Success" and a fresh timestamp on a snapshot that had not changed.
+        if [ ! -e "$src" ]; then
+            log "ERROR" "Source '$src' does not exist - not backed up."
+            _CTX_VERIFY_STATUS=1
+            return
+        fi
+
         # 0 and 24 (files vanished while being read) are both a complete
         # copy of a live filesystem; anything else is not. A plain "if !"
         # counted 24 as a failure, and the caller then ignored the result.
@@ -1139,8 +1209,8 @@ _perform_local_backup_logic() {
     make_room_before_backup "$int"
     
     local target_path
-    target_path=$(core_prepare_backup_target "$int")
-    
+    target_path=$(core_prepare_backup_target "$int") || die "Could not prepare the backup target in $BACKUP_ROOT."
+
     local r_opts="-aH $RSYNC_ACL_OPT $RSYNC_XATTR_OPT --delete --numeric-ids -x --stats"
     [ -n "${RSYNC_EXTRA_OPTS:-}" ] && r_opts="$r_opts $RSYNC_EXTRA_OPTS"
     
@@ -1150,9 +1220,9 @@ _perform_local_backup_logic() {
     fi
     
     if [ "$v_status" -eq 0 ]; then
+        core_commit_backup "$int" "$target_path" || die "Backup transferred, but not committed."
         [ "$FORCE_VERIFY" = true ] && record_verify_done
-        core_commit_backup "$int" "$target_path"
-        core_perform_all_promotions
+        core_perform_all_promotions || die "Backup committed, but the promotions failed."
         log "INFO" "Backup Summary: Success."
     else
         log "ERROR" "Backup failed. Cleaning up temp files."
@@ -1232,20 +1302,21 @@ get_retention_args() {
 agent_lock() {
     local l="$AGENT_LOCK_DIR/$CLIENT_NAME.lockd" holder waited=0 wait_max
     wait_max=$(sanitize_int "${AGENT_LOCK_WAIT:-120}")
-    mkdir -p "$AGENT_LOCK_DIR"
+    mkdir -p "$AGENT_LOCK_DIR" || die "Could not create $AGENT_LOCK_DIR."
     while ! mkdir "$l" 2>/dev/null; do
         holder=$(cat "$l/pid" 2>/dev/null)
         # no PID after a few seconds: the holder died between mkdir and writing it
         if { [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; } || { [ -z "$holder" ] && [ "$waited" -ge 5 ]; }; then
             log "WARN" "Removing stale agent lock of '$CLIENT_NAME' (PID ${holder:-none})."
             rm -rf "$l"
-            continue
         fi
-        [ "$waited" -ge "$wait_max" ] && die "Another action for '$CLIENT_NAME' is running (PID ${holder:-?}). Gave up after ${wait_max}s."
+        # Also after removing a stale lock: a lock that cannot be taken at all
+        # made this loop spin without a pause, for ever, before 18.8.
+        [ "$waited" -ge "$wait_max" ] && die "Could not take the agent lock of '$CLIENT_NAME' (held by PID ${holder:-?}). Gave up after ${wait_max}s."
         sleep 1
         waited=$((waited + 1))
     done
-    echo $$ > "$l/pid"
+    echo $$ > "$l/pid" || { rmdir "$l" 2>/dev/null; die "Could not write $l/pid."; }
     AGENT_HELD_LOCK="$l"
 }
 
@@ -1295,7 +1366,7 @@ agent_main() {
             --smart-purge-limit) SPACE_LOW_LIMIT_GB=$(sanitize_int "$2"); shift 2 ;;
             --smart-purge-slots) SMART_PURGE_SLOTS=$(sanitize_int "$2"); shift 2 ;;
             --key-blob) KEY_BLOB="$2"; shift 2 ;;
-            --config|-c) load_config "$2"; shift 2 ;;
+            --config|-c) [ -f "${2:-}" ] || die "Config file not found: ${2:-}"; load_config "$2"; shift 2 ;;
             --agent-mode) shift ;;
             --version) echo "$SCRIPT_VERSION"; exit 0 ;;
             *) shift ;;
@@ -1342,7 +1413,7 @@ agent_main() {
             agent_lock
             make_room_before_backup "$BASE_INTERVAL" >&2
             local full_path
-            full_path=$(core_prepare_backup_target "$BASE_INTERVAL")
+            full_path=$(core_prepare_backup_target "$BASE_INTERVAL") || die "prepare failed for '$CLIENT_NAME'."
             echo "${full_path#$BACKUP_ROOT/}"
             ;;
         commit)
@@ -1351,11 +1422,12 @@ agent_main() {
             t_0=$(get_interval_path "$BASE_INTERVAL" 0)
             local t_used="$t_0"
             if [ -d "$t_0.tmp" ]; then t_used="$t_0.tmp"; fi
-            core_commit_backup "$BASE_INTERVAL" "$t_used"
+            # The client's "|| exit 1" after commit and purge only works if these fail.
+            core_commit_backup "$BASE_INTERVAL" "$t_used" || die "commit failed for '$CLIENT_NAME'."
             ;;
         purge)
             agent_lock
-            core_perform_all_promotions
+            core_perform_all_promotions || die "purge failed for '$CLIENT_NAME'."
             ;;
         status)
             print_snapshot_table "$BACKUP_ROOT"
@@ -1370,15 +1442,15 @@ agent_main() {
             fi 
             exit 0
             ;; 
-        check-storage) 
+        check-storage)
             if touch "$BACKUP_ROOT/.w_test" 2>/dev/null; then
                 rm "$BACKUP_ROOT/.w_test"
                 echo "true"
             else
                 echo "false"
-                exit 0
+                exit 1
             fi
-            exit 0 
+            exit 0
             ;;
     esac
 }
@@ -1404,7 +1476,8 @@ do_install_agent() {
     chown 0:0 "$install_path"
     
     if ! id "$target_user" >/dev/null 2>&1; then
-        useradd --system --home-dir /var/backups --no-create-home --shell /bin/false "$target_user"
+        useradd --system --home-dir /var/backups --no-create-home --shell /bin/false "$target_user" \
+            || log "WARN" "Could not create the user '$target_user'."
     fi
     
     local rsync_bin sftp_bin s
@@ -1573,9 +1646,11 @@ fi
 echo "Access Denied: $REASON" >&2
 exit 1
 WRAPPER
-    } > "$wrapper_path.new"
+    } > "$wrapper_path.new" || { rm -f "$wrapper_path.new"; die "Could not write $wrapper_path.new."; }
+    # --setup-remote locks the key to this wrapper next: reporting it installed
+    # when it is not leaves the client with a key that runs nothing.
     chmod 755 "$wrapper_path.new"
-    mv -f "$wrapper_path.new" "$wrapper_path"
+    mv -f "$wrapper_path.new" "$wrapper_path" || die "Could not install the wrapper at $wrapper_path."
     log "INFO" "Agent installed. Wrapper: $wrapper_path (ENFORCE=${WRAPPER_ENFORCE:-1})"
 }
 
@@ -1593,7 +1668,7 @@ do_lock_key() {
     case "$blob" in ''|*[!A-Za-z0-9+/=]*) die "lock-key: invalid key blob." ;; esac
     [ -f "$f" ] || die "lock-key: $f not found."
     grep -q "$blob" "$f" || die "lock-key: key not found in $f."
-    cp -p "$f" "$f.before-lock-$(date +%s)"
+    cp -p "$f" "$f.before-lock-$(date +%s)" || die "lock-key: could not back up $f - nothing changed."
     # Whatever options the line had are replaced; key type, blob and comment stay.
     awk -v b="$blob" -v o="$opts" '
         {
@@ -1603,9 +1678,18 @@ do_lock_key() {
                 print o " " line; next
             }
             print
-        }' "$f" > "$f.tmp.$$" || die "lock-key: rewrite failed."
+        }' "$f" > "$f.tmp.$$" || { rm -f "$f.tmp.$$"; die "lock-key: rewrite failed."; }
+    # This file is root's way in. Before it is replaced, the new one must hold
+    # every line of the old one and the key with its new options: a full disk
+    # truncates the copy without awk noticing, and a line awk does not
+    # recognise as a key stays as it was - "locked" either way, before 18.8.
+    if [ "$(sanitize_int "$(wc -l < "$f.tmp.$$")")" -lt "$(sanitize_int "$(wc -l < "$f")")" ] \
+       || ! grep -F -- "$opts " "$f.tmp.$$" | grep -qF -- " $blob"; then
+        rm -f "$f.tmp.$$"
+        die "lock-key: the rewritten file is not what it should be - $f left unchanged."
+    fi
     chmod 600 "$f.tmp.$$"
-    mv -f "$f.tmp.$$" "$f"
+    mv -f "$f.tmp.$$" "$f" || { rm -f "$f.tmp.$$"; die "lock-key: could not replace $f."; }
     log "INFO" "Key locked to $wrapper $client."
 }
 
@@ -1654,6 +1738,18 @@ load_config() {
         LOCK_DIR=""
         . "$config_file"
         [ -z "${LOCK_DIR:-}" ] && LOCK_DIR="${PIDFILE%.pid}.lock"
+
+        # A number the shell cannot read makes every test on it false: before
+        # 18.8, RETAIN_DAILY="7d" switched daily off without a word.
+        local var val
+        for var in RETAIN_HOURLY RETAIN_DAILY RETAIN_WEEKLY RETAIN_MONTHLY RETAIN_YEARLY \
+                   SPACE_LOW_LIMIT_GB SMART_PURGE_SLOTS DEEP_VERIFY_INTERVAL_DAYS \
+                   NETWORK_TIMEOUT LOG_PROGRESS_INTERVAL POWER_LEASE_MINUTES POWER_WAIT_SECONDS; do
+            eval "val=\"\${$var:-}\""
+            case "$val" in
+                ''|*[!0-9]*) die "Config $config_file: $var must be a whole number, not '$val'." ;;
+            esac
+        done
     fi
     
     if [ -n "${LOCK_DIR:-}" ]; then AGENT_LOCK_DIR="$LOCK_DIR"; fi
@@ -1728,6 +1824,117 @@ run_hook() {
     return $rc
 }
 
+## @brief One request to the wakeserver API; prints the response body.
+##
+## $1 = path below /api/v1, $2 = form-encoded body (empty: GET). curl gets the
+## token from a header file, so it never shows in the process list; busybox
+## wget has no such option and takes it as an argument - visible to local
+## users for the duration of the call.
+power_api() {
+    local url="${POWER_API_URL%/}/api/v1/$1" client="${POWER_HTTP_CLIENT:-auto}" rc hfile
+    if [ "$client" = auto ]; then
+        if command -v curl >/dev/null 2>&1; then client=curl
+        elif command -v wget >/dev/null 2>&1; then client=wget
+        else return 127
+        fi
+    fi
+    case "$client" in
+        curl)
+            hfile=$(mktemp) || return 1
+            chmod 600 "$hfile"
+            printf 'Authorization: Bearer %s\n' "$POWER_API_TOKEN" > "$hfile"
+            if [ -n "$2" ]; then
+                curl -fsS --max-time 20 -H "@$hfile" --data "$2" "$url"
+            else
+                curl -fsS --max-time 20 -H "@$hfile" "$url"
+            fi
+            rc=$?
+            rm -f "$hfile"
+            return $rc
+            ;;
+        wget)
+            if [ -n "$2" ]; then
+                wget -q -O - -T 20 --header "Authorization: Bearer $POWER_API_TOKEN" --post-data "$2" "$url"
+            else
+                wget -q -O - -T 20 --header "Authorization: Bearer $POWER_API_TOKEN" "$url"
+            fi
+            ;;
+        *) return 127 ;;
+    esac
+}
+
+## @brief Waits up to POWER_WAIT_SECONDS for the wakeserver to report $1 awake.
+power_wait_awake() {
+    local wait end state
+    wait=$(sanitize_int "${POWER_WAIT_SECONDS:-0}")
+    [ "$wait" -gt 0 ] || return 0
+    end=$(( $(date +%s) + wait ))
+    while :; do
+        state=$(power_api "hosts/$1/state" "" 2>/dev/null)
+        if [ "$state" = awake ]; then
+            log "INFO" "Wakeserver: $1 is awake."
+            return 0
+        fi
+        if [ "$(date +%s)" -ge "$end" ]; then
+            log "WARN" "Wakeserver: $1 not awake after ${wait}s (state: ${state:-unknown})."
+            return 0
+        fi
+        sleep 5
+    done
+}
+
+## @brief Takes a lease on every POWER_LEASE_HOSTS host for this run.
+##
+## A lease keeps the wakeserver from putting the host to sleep, and wakes it if
+## it is asleep - the backup client itself, or a sleeping target. The backup
+## never depends on it: a wakeserver that does not answer costs a warning.
+power_lease_acquire() {
+    [ -n "${POWER_API_URL:-}" ] && [ -n "${POWER_LEASE_HOSTS:-}" ] || return 0
+    local holder="snapshot-backup:${CLIENT_NAME}" host minutes
+    minutes=$(sanitize_int "${POWER_LEASE_MINUTES:-240}")
+    for host in $POWER_LEASE_HOSTS; do
+        if power_api "hosts/$host/lease" "holder=$holder&minutes=$minutes" >/dev/null 2>&1; then
+            _POWER_LEASED="$_POWER_LEASED $host"
+            log "INFO" "Wakeserver: lease on $host for $minutes min."
+            power_wait_awake "$host"
+        else
+            log "WARN" "Wakeserver: no lease on $host ($POWER_API_URL did not accept it) - backing up without."
+        fi
+    done
+}
+
+## @brief Gives back every lease this run took; a lease not given back expires.
+power_lease_release() {
+    [ -n "${_POWER_LEASED:-}" ] || return 0
+    local holder="snapshot-backup:${CLIENT_NAME}" host
+    for host in $_POWER_LEASED; do
+        power_api "hosts/$host/release" "holder=$holder" >/dev/null 2>&1 \
+            || log "WARN" "Wakeserver: could not release the lease on $host; it expires by itself."
+    done
+    _POWER_LEASED=""
+}
+
+## @brief Holds a blocking sleep inhibitor for as long as this run lives.
+##
+## The holder watches this process and ends with it, so even a run killed with
+## SIGKILL does not leave the machine unable to sleep.
+inhibit_sleep_start() {
+    [ "${INHIBIT_SLEEP:-false}" = true ] || return 0
+    if ! command -v systemd-inhibit >/dev/null 2>&1; then
+        log "WARN" "INHIBIT_SLEEP=true, but systemd-inhibit is not available."
+        return 0
+    fi
+    systemd-inhibit --what=sleep --who=snapshot-backup --why="Backup running (PID $$)" --mode=block \
+        sh -c "while kill -0 $$ 2>/dev/null; do sleep 5; done" >/dev/null 2>&1 &
+    _INHIBIT_PID=$!
+}
+
+inhibit_sleep_stop() {
+    [ -n "${_INHIBIT_PID:-}" ] || return 0
+    kill "$_INHIBIT_PID" 2>/dev/null
+    _INHIBIT_PID=""
+}
+
 cleanup() {
     if [ "$AGENT_MODE" = true ]; then
         agent_cleanup
@@ -1766,6 +1973,10 @@ cleanup() {
         _HOOKS_ARMED=false
         run_hook "POST_RUN_CMD" "${POST_RUN_CMD:-}" "${_RUN_EXIT_CODE:-0}" || true
     fi
+
+    # After the POST hook, which may still need the machine awake.
+    power_lease_release
+    inhibit_sleep_stop
 }
 
 # A signal ends the run. A trap on INT/TERM that only cleaned up let the shell
@@ -1885,6 +2096,22 @@ $(print_config_list EXCLUDE_MOUNTPOINTS)
 PRE_RUN_CMD="$PRE_RUN_CMD"
 PRE_RSYNC_CMD="$PRE_RSYNC_CMD"
 POST_RUN_CMD="$POST_RUN_CMD"
+
+# Wakeserver (optional)
+#
+# For a machine that sleeps when idle. POWER_LEASE_HOSTS names the hosts the
+# wakeserver keeps awake (and wakes) while a run lasts - usually this machine
+# itself, or a sleeping backup server. The token comes from
+# "python3 -m wakeserver new-token NAME" on the wakeserver. Empty URL: off.
+# INHIBIT_SLEEP=true also holds a local blocking sleep inhibitor during a run;
+# leave it off on laptops, where closing the lid must still suspend.
+POWER_API_URL="$POWER_API_URL"
+POWER_API_TOKEN="$POWER_API_TOKEN"
+POWER_LEASE_HOSTS="$POWER_LEASE_HOSTS"
+POWER_LEASE_MINUTES=$POWER_LEASE_MINUTES
+POWER_WAIT_SECONDS=$POWER_WAIT_SECONDS
+POWER_HTTP_CLIENT="$POWER_HTTP_CLIENT"
+INHIBIT_SLEEP=$INHIBIT_SLEEP
 
 # System
 LOGFILE="$LOGFILE"
@@ -2020,13 +2247,40 @@ test_remote_connection() {
     run_remote_cmd_with_timeout "$NETWORK_TIMEOUT" "$REMOTE_AGENT --agent-mode --action version" >/dev/null 2>&1
 }
 
+## @brief Runs a command on an explicit target (user@host), with the configured port and key.
+##
+## The setup commands take a target on the command line; run_remote_cmd always
+## goes to REMOTE_USER@REMOTE_HOST from the config. Copying to one host and
+## installing or locking on another must not happen.
+run_on_target() {
+    local target="$1"
+    shift
+    ssh -p "$REMOTE_PORT" $REMOTE_SSH_OPTS -i "$REMOTE_KEY" "$target" "$@"
+}
+
 ## @brief Deploys the script as an agent to a remote host.
+##
+## Returns non-zero when the copy or the install fails: "Agent deployed." after
+## "Host key verification failed." sent people looking on the server for an
+## agent that was never there.
+##
+## The copy goes next to the agent, not onto it, and its install moves it into
+## place. Before 18.8 scp wrote straight into the running agent, which is what
+## --install avoids: an action still running for another client would go on in
+## a mixture of two versions.
 do_deploy_agent() {
     local target="$1"
+    local up="/usr/local/sbin/snapshot-agent.sh.upload"
     [ -z "$target" ] && target="$REMOTE_USER@$REMOTE_HOST"
     log "INFO" "Deploying Agent to $target..."
-    scp -P $REMOTE_PORT -i "$REMOTE_KEY" "$0" "$target:/usr/local/sbin/snapshot-agent.sh"
-    run_remote_cmd "/usr/local/sbin/snapshot-agent.sh --agent-mode --action install"
+    if ! scp -P "$REMOTE_PORT" -i "$REMOTE_KEY" "$0" "$target:$up"; then
+        log "ERROR" "Agent not deployed: copying the script to $target failed (see the scp message above)."
+        return 1
+    fi
+    if ! run_on_target "$target" "sh $up --agent-mode --action install; rc=\$?; rm -f $up; exit \$rc"; then
+        log "ERROR" "Agent not deployed: the install on $target failed."
+        return 1
+    fi
     log "SUCCESS" "Agent deployed."
 }
 
@@ -2037,21 +2291,31 @@ do_setup_remote() {
     
     if [ ! -f "$REMOTE_KEY" ]; then
         mkdir -p "$(dirname "$REMOTE_KEY")"
-        ssh-keygen -t ed25519 -f "$REMOTE_KEY" -N ""
+        if ! ssh-keygen -t ed25519 -f "$REMOTE_KEY" -N ""; then
+            log "ERROR" "Could not create the key $REMOTE_KEY. Nothing else was done."
+            return 1
+        fi
     fi
     
-    ssh-copy-id -i "$REMOTE_KEY.pub" "$target"
-    do_deploy_agent "$target"
+    # Each step needs the one before it: no agent without the key, no lock without the agent.
+    if ! ssh-copy-id -p "$REMOTE_PORT" -i "$REMOTE_KEY.pub" "$target"; then
+        log "ERROR" "The key was not installed on $target (see the ssh-copy-id message above). Nothing else was done."
+        log "ERROR" "Run this in a terminal: ssh needs one to ask about the host key and the password."
+        return 1
+    fi
+    do_deploy_agent "$target" || return 1
 
     # ssh-copy-id leaves the key unrestricted: root on the server for anyone who holds it.
     # Confine it to the wrapper for this client, over the same key, while it still works.
     local blob
     blob=$(awk '{print $2}' "$REMOTE_KEY.pub")
-    if run_remote_cmd "/usr/local/sbin/snapshot-agent.sh --agent-mode --action lock-key --client $CLIENT_NAME --key-blob $blob"; then
+    if run_on_target "$target" "/usr/local/sbin/snapshot-agent.sh --agent-mode --action lock-key --client $CLIENT_NAME --key-blob $blob"; then
         log "SUCCESS" "Key locked on the server: it can now only run backups for '$CLIENT_NAME'."
     else
         log "WARN" "Could not lock the key on the server. Add by hand, in front of the key in authorized_keys:"
         log "WARN" "  command=\"/usr/local/bin/snapshot-wrapper.sh $CLIENT_NAME\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty"
+        # The key works but is still root on the server: not a finished setup.
+        return 1
     fi
 }
 
@@ -2154,11 +2418,16 @@ do_upgrade() {
         return 0
     fi
 
+    # Written next to the script and moved over it, as --install does. Before
+    # 18.8 it was written into the script itself: a write that broke off - a
+    # full disk - left a truncated script, and no backup ran until somebody
+    # restored the copy.
     local backup="${target}.${SCRIPT_VERSION}"
     cp -p "$target" "$backup" || { rm -f "$tmp"; die "Could not back up $target."; }
-    cat "$tmp" > "$target" || { rm -f "$tmp"; die "Could not write $target."; }
-    chmod 700 "$target"
+    cat "$tmp" > "$target.new.$$" || { rm -f "$tmp" "$target.new.$$"; die "Could not write $target.new.$$ - $target is unchanged."; }
     rm -f "$tmp"
+    chmod 700 "$target.new.$$"
+    mv -f "$target.new.$$" "$target" || { rm -f "$target.new.$$"; die "Could not replace $target - it is unchanged."; }
 
     log "SUCCESS" "Upgraded $SCRIPT_VERSION -> $new_ver (previous kept as $backup)"
     printf 'The agent on the backup server is a copy of this file and is not\n'
@@ -2166,23 +2435,32 @@ do_upgrade() {
 }
 
 ## @brief Mounts the backup storage (Local bind or Remote SSHFS).
+## Returns non-zero when nothing was mounted; before 18.8 it said "Mounted" regardless.
 do_mount() {
     local mountpoint="$1"
     local client="${2:-$CLIENT_NAME}"
-    
+
     [ -z "$mountpoint" ] && mountpoint="$BACKUP_ROOT"
-    [ ! -d "$mountpoint" ] && mkdir -p "$mountpoint"
-    
+    if [ ! -d "$mountpoint" ]; then
+        mkdir -p "$mountpoint" || { log "ERROR" "Could not create $mountpoint."; return 1; }
+    fi
+
     if mountpoint -q "$mountpoint"; then
         log "WARN" "Already mounted."
-        return
+        return 0
     fi
-    
+
     if [ "$BACKUP_MODE" = "REMOTE" ]; then
         command -v sshfs >/dev/null || die "sshfs required."
-        sshfs -p "$REMOTE_PORT" -o "IdentityFile=$REMOTE_KEY" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_STORAGE_ROOT/$client" "$mountpoint"
+        if ! sshfs -p "$REMOTE_PORT" -o "IdentityFile=$REMOTE_KEY" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_STORAGE_ROOT/$client" "$mountpoint"; then
+            log "ERROR" "Mounting $REMOTE_HOST:$REMOTE_STORAGE_ROOT/$client on $mountpoint failed."
+            return 1
+        fi
     else
-        mount --bind "$BACKUP_ROOT" "$mountpoint"
+        if ! mount --bind "$BACKUP_ROOT" "$mountpoint"; then
+            log "ERROR" "Mounting $BACKUP_ROOT on $mountpoint failed."
+            return 1
+        fi
     fi
     log "SUCCESS" "Mounted to $mountpoint"
 }
@@ -2191,7 +2469,11 @@ do_mount() {
 do_umount() {
     local mp="$1"
     [ -z "$mp" ] && mp="$BACKUP_ROOT"
-    umount "$mp" && log "SUCCESS" "Unmounted $mp"
+    if ! umount "$mp"; then
+        log "ERROR" "Unmounting $mp failed."
+        return 1
+    fi
+    log "SUCCESS" "Unmounted $mp"
 }
 
 ## @brief CLI Check: Is a backup currently running?
@@ -2232,12 +2514,15 @@ check_is_job_done_cli() {
     # Verify if the existing snapshot covers the current period (In-Place Logic)
     local ts
     ts=$(read_timestamp "$BACKUP_ROOT/$BASE_INTERVAL.0/$TIMESTAMP_FILE")
+    # exit 1 with "false", as in REMOTE mode and as --help says. Before 18.8
+    # this exited 0, and a caller that reads the exit code took every LOCAL
+    # backup for done.
     if [ "$(is_backup_older_than_current_period "$BASE_INTERVAL" "$ts" "$START_TIME")" = "false" ]; then
         echo "true"
-    else
-        echo "false"
+        exit 0
     fi
-    exit 0
+    echo "false"
+    exit 1
 }
 
 ## @brief CLI Check: Is the storage writable?
@@ -2250,13 +2535,17 @@ check_has_storage_cli() {
             echo "false"
             exit 1
         fi
-    else 
-        if run_remote_cmd "$REMOTE_AGENT --action check-storage --client $CLIENT_NAME" 2>/dev/null; then
-            :
-        else
+    else
+        # The answer, not the exit code: an agent before 18.8 says "false" and
+        # exits 0, so --has-storage reported unwritable storage as writable.
+        # With the check timeout, like --is-job-done.
+        local res
+        res=$(run_remote_cmd_with_timeout "$NETWORK_TIMEOUT" "$REMOTE_AGENT --action check-storage --client $CLIENT_NAME" 2>/dev/null | tail -n 1 | tr -d '[:space:]')
+        if [ "$res" != "true" ]; then
             echo "false"
             exit 1
         fi
+        echo "true"
     fi
     exit 0
 }
@@ -2328,8 +2617,9 @@ client_main() {
             # Configuration Overrides
             --verify) cli_force_verify="true" ;; 
             --timeout) cli_timeout=$(sanitize_int "$2"); shift ;;
-            --config|-c) load_config "$2"; shift ;;
-            --debug) DEBUG_MODE="true" ;;            
+            # A config given by name must exist: before 18.8 a typo ran on the defaults.
+            --config|-c) [ -f "${2:-}" ] || die "Config file not found: ${2:-}"; load_config "$2"; shift ;;
+            --debug) DEBUG_MODE="true" ;;
             *) 
                 echo "Error: Unknown option '$1'" >&2
                 show_help
@@ -2346,11 +2636,11 @@ client_main() {
     case "$action" in
         SHOW_CONFIG) show_config ;;
         STATUS)      show_status ;;
-        MOUNT)       do_mount "$action_target"; exit 0 ;;
-        UMOUNT)      do_umount "$action_target"; exit 0 ;;
+        MOUNT)       do_mount "$action_target"; exit $? ;;
+        UMOUNT)      do_umount "$action_target"; exit $? ;;
         KILL)        kill_active_backups ;;
-        DEPLOY)      do_deploy_agent "$action_target"; exit 0 ;;
-        SETUP_REMOTE) do_setup_remote "$action_target"; exit 0 ;;
+        DEPLOY)      do_deploy_agent "$action_target"; exit $? ;;
+        SETUP_REMOTE) do_setup_remote "$action_target"; exit $? ;;
         UPGRADE)     do_upgrade "${action_target:-install}"; exit 0 ;;
         INSTALL)     do_install_agent "$action_target"; exit 0 ;;
         IS_RUNNING)  check_is_running_cli ;;
@@ -2365,6 +2655,8 @@ client_main() {
             # From here on a POST_RUN_CMD is owed, whatever happens.
             _HOOKS_ARMED=true
             _RUN_EXIT_CODE=1
+            inhibit_sleep_start
+            power_lease_acquire
             if ! run_hook "PRE_RUN_CMD" "${PRE_RUN_CMD:-}"; then
                 die "PRE_RUN_CMD failed - not backing up."
             fi

@@ -1,6 +1,6 @@
 #!/bin/bash
 # file: run-tests.sh
-# Test suite for snapshot-backup.sh v18.7
+# Test suite for snapshot-backup.sh v18.8
 
 source ./test-framework.sh
 
@@ -190,15 +190,22 @@ test_10_remote_backup_exec() {
 
 test_11_remote_agent_deploy() {
     setup_loopback_ssh
-    local target_agent="/usr/local/sbin/snapshot-agent.sh"
-    rm -f "$target_agent"
-    
-    "$SCRIPT_BIN" --config "$CONF_FILE" --deploy-agent "root@localhost" >/dev/null 2>&1
-    
+    local target_agent="/usr/local/sbin/snapshot-agent.sh" inode_before
+    # An agent already in place must be replaced, not written into: scp used
+    # to write straight into the running agent's file.
+    echo "#!/bin/sh" > "$target_agent"
+    inode_before=$(ls -i "$target_agent" | awk '{print $1}')
+
+    "$SCRIPT_BIN" --config "$CONF_FILE" --deploy-agent "root@localhost" >/dev/null 2>&1 \
+        || { echo -e "    ${RED}[FAIL] --deploy-agent failed.${NC}"; return 1; }
+
     if [ ! -x "$target_agent" ]; then
         echo -e "    ${RED}[FAIL] Agent not deployed/executable.${NC}"
         return 1
     fi
+    [ "$(ls -i "$target_agent" | awk '{print $1}')" != "$inode_before" ] \
+        || { echo -e "    ${RED}[FAIL] the agent was written in place, not replaced.${NC}"; return 1; }
+    [ ! -e "$target_agent.upload" ] || { echo -e "    ${RED}[FAIL] upload left behind.${NC}"; return 1; }
 }
 
 # ==============================================================================
@@ -942,6 +949,278 @@ test_37_install_replaces_atomically() {
     [ -z "$(ls "$TEST_ROOT"/agent-37.sh.new.* 2>/dev/null)" ] || { echo -e "    ${RED}[FAIL] temporary file left behind${NC}"; return 1; }
 }
 
+# A stand-in wakeserver: logs every request as "METHOD PATH AUTH BODY" to
+# $TEST_ROOT/api.log; /state answers with the next line of $TEST_ROOT/api.states
+# (the last one repeats), everything else with {"ok": true}.
+_start_mock_wakeserver() {
+    cat > "$TEST_ROOT/mock_api.py" <<'EOF'
+import http.server, os, sys
+root = sys.argv[1]
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def answer(self, body, ctype):
+        with open(os.path.join(root, "api.log"), "a") as f:
+            f.write(f"{self.command} {self.path} {self.headers.get('Authorization')} {body}\n")
+        self.send_response(200); self.send_header("Content-Type", ctype); self.end_headers()
+    def do_GET(self):
+        states = os.path.join(root, "api.states")
+        lines = open(states).read().split() if os.path.exists(states) else ["awake"]
+        self.answer("", "text/plain"); self.wfile.write((lines[0] + "\n").encode())
+        if len(lines) > 1: open(states, "w").write("\n".join(lines[1:]))
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()
+        self.answer(body, "application/json"); self.wfile.write(b'{"ok": true}')
+s = http.server.HTTPServer(("127.0.0.1", 0), H)
+open(os.path.join(root, "api.port"), "w").write(str(s.server_address[1]))
+s.serve_forever()
+EOF
+    rm -f "$TEST_ROOT/api.port" "$TEST_ROOT/api.log"
+    python3 "$TEST_ROOT/mock_api.py" "$TEST_ROOT" &
+    MOCK_API_PID=$!
+    local i=0; while [ ! -s "$TEST_ROOT/api.port" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done
+    set_config "POWER_API_URL" "http://127.0.0.1:$(cat "$TEST_ROOT/api.port")"
+    set_config "POWER_API_TOKEN" "invented-test-token"
+    set_config "POWER_LEASE_HOSTS" "alpha"
+    set_config "CLIENT_NAME" "test-client"
+}
+
+# rsync that notes in the API log that the transfer happened, then exits with $1
+_mock_rsync_logging() {
+    local mb="$TEST_ROOT/mock_power"; mkdir -p "$mb"
+    printf '#!/bin/sh\ncase "$*" in *--version*) exit 0 ;; esac\necho "RSYNC" >> "%s/api.log"\nexit %s\n' \
+        "$TEST_ROOT" "$1" > "$mb/rsync"
+    chmod +x "$mb/rsync"
+    echo "$mb"
+}
+
+test_38_power_lease_around_the_run() {
+    # A machine that sleeps when idle must not be put to sleep by the wakeserver
+    # in the middle of its own backup: the run holds a lease from start to end.
+    _start_mock_wakeserver
+    local mb; mb=$(_mock_rsync_logging 0)
+    local old_path="$PATH"; export PATH="$mb:$PATH"
+    run_backup; local ret=$?
+    export PATH="$old_path"; kill "$MOCK_API_PID" 2>/dev/null
+    [ "$ret" -eq 0 ] || { echo -e "    ${RED}[FAIL] backup failed${NC}"; return 1; }
+    local seq; seq=$(awk '{print $1, $2}' "$TEST_ROOT/api.log" | tr '\n' '|')
+    case "$seq" in
+        "POST /api/v1/hosts/alpha/lease|RSYNC "*"|POST /api/v1/hosts/alpha/release|") ;;
+        *) echo -e "    ${RED}[FAIL] order: $seq${NC}"; return 1 ;;
+    esac
+    grep -q "^POST /api/v1/hosts/alpha/lease Bearer invented-test-token holder=snapshot-backup:test-client&minutes=240$" \
+        "$TEST_ROOT/api.log" || { echo -e "    ${RED}[FAIL] lease request: $(head -1 "$TEST_ROOT/api.log")${NC}"; return 1; }
+}
+
+test_39_power_unreachable_still_backs_up() {
+    # The wakeserver is a convenience: when it does not answer, the backup runs anyway.
+    set_config "POWER_API_URL" "http://127.0.0.1:9"
+    set_config "POWER_LEASE_HOSTS" "alpha"
+    echo data > "$MNT_SRC/file"
+    run_backup; local ret=$?
+    [ "$ret" -eq 0 ] || { echo -e "    ${RED}[FAIL] exit $ret${NC}"; return 1; }
+    assert_exists "$MNT_DEST/daily.0/.backup_timestamp" || return 1
+    grep -q "Wakeserver: no lease on alpha" "$LOG_FILE" || { echo -e "    ${RED}[FAIL] no warning${NC}"; return 1; }
+}
+
+test_40_power_released_after_a_failure() {
+    _start_mock_wakeserver
+    local mb; mb=$(_mock_rsync_logging 11)
+    local old_path="$PATH"; export PATH="$mb:$PATH"
+    run_backup; local ret=$?
+    export PATH="$old_path"; kill "$MOCK_API_PID" 2>/dev/null
+    [ "$ret" -ne 0 ] || { echo -e "    ${RED}[FAIL] failure not reported${NC}"; return 1; }
+    grep -q "^POST /api/v1/hosts/alpha/release" "$TEST_ROOT/api.log" \
+        || { echo -e "    ${RED}[FAIL] lease not released after a failed run${NC}"; return 1; }
+}
+
+test_41_power_with_wget() {
+    # busybox clients have wget, not curl: form-encoded POSTs with the bearer header.
+    command -v wget >/dev/null 2>&1 || { echo -n "(no wget, skipped) "; return 0; }
+    _start_mock_wakeserver
+    set_config "POWER_HTTP_CLIENT" "wget"
+    local mb; mb=$(_mock_rsync_logging 0)
+    local old_path="$PATH"; export PATH="$mb:$PATH"
+    run_backup
+    export PATH="$old_path"; kill "$MOCK_API_PID" 2>/dev/null
+    grep -q "^POST /api/v1/hosts/alpha/lease Bearer invented-test-token holder=" "$TEST_ROOT/api.log" \
+        && grep -q "^POST /api/v1/hosts/alpha/release" "$TEST_ROOT/api.log" \
+        || { echo -e "    ${RED}[FAIL] $(cat "$TEST_ROOT/api.log")${NC}"; return 1; }
+}
+
+test_42_wait_until_awake() {
+    _start_mock_wakeserver
+    printf 'waking\nwaking\nawake\n' > "$TEST_ROOT/api.states"
+    set_config "POWER_WAIT_SECONDS" "60"
+    local mb; mb=$(_mock_rsync_logging 0)
+    local old_path="$PATH"; export PATH="$mb:$PATH"
+    run_backup
+    export PATH="$old_path"; kill "$MOCK_API_PID" 2>/dev/null
+    [ "$(grep -c "^GET /api/v1/hosts/alpha/state" "$TEST_ROOT/api.log")" -eq 3 ] \
+        || { echo -e "    ${RED}[FAIL] polls: $(grep -c GET "$TEST_ROOT/api.log")${NC}"; return 1; }
+    grep -q "Wakeserver: alpha is awake" "$LOG_FILE" || { echo -e "    ${RED}[FAIL] no awake log${NC}"; return 1; }
+}
+
+test_43_inhibit_sleep_during_the_run() {
+    # The host's own guard: a blocking inhibitor while rsync runs, gone afterwards.
+    local mb="$TEST_ROOT/mock_inhibit"; mkdir -p "$mb"
+    printf '#!/bin/sh\necho $$ > "%s/inhibitor.pid"\nwhile [ "${1#--}" != "$1" ]; do shift; done\nexec "$@"\n' \
+        "$TEST_ROOT" > "$mb/systemd-inhibit"
+    printf '#!/bin/sh\ncase "$*" in *--version*) exit 0 ;; esac\nkill -0 "$(cat "%s/inhibitor.pid")" && touch "%s/held"\nexit 0\n' \
+        "$TEST_ROOT" "$TEST_ROOT" > "$mb/rsync"
+    chmod +x "$mb/systemd-inhibit" "$mb/rsync"
+    set_config "INHIBIT_SLEEP" "true"
+    local old_path="$PATH"; export PATH="$mb:$PATH"
+    run_backup
+    export PATH="$old_path"
+    assert_exists "$TEST_ROOT/held" || { echo -e "    ${RED}[FAIL] no inhibitor while rsync ran${NC}"; return 1; }
+    sleep 1
+    if kill -0 "$(cat "$TEST_ROOT/inhibitor.pid")" 2>/dev/null; then
+        echo -e "    ${RED}[FAIL] inhibitor outlived the run${NC}"; return 1
+    fi
+}
+
+test_44_setup_failures_are_reported() {
+    # Goal: --deploy-agent and --setup-remote must fail loudly when the server cannot be reached.
+    #
+    # Run through a pipe (no terminal), ssh cannot ask about the host key and every call
+    # ends in "Host key verification failed". Both commands still logged "Agent deployed."
+    # and exited 0, and --setup-remote went on to deploy and lock after ssh-copy-id had
+    # failed. The mock tools fail the way ssh does and record that they were called.
+    local bin="$TEST_ROOT/mockbin" out c
+    mkdir -p "$bin"
+    for c in ssh scp ssh-copy-id; do
+        printf '#!/bin/sh\necho "%s: Host key verification failed." >&2\necho %s >> "%s/calls"\nexit 255\n' \
+            "$c" "$c" "$bin" > "$bin/$c"
+        chmod +x "$bin/$c"
+    done
+    : > "$TEST_ROOT/id_mock"; : > "$TEST_ROOT/id_mock.pub"
+    set_config "REMOTE_KEY" "$TEST_ROOT/id_mock"
+
+    out=$(PATH="$bin:$PATH" "$SCRIPT_BIN" --config "$CONF_FILE" --deploy-agent root@mock_host 2>&1) \
+        && { echo -e "    ${RED}[FAIL] --deploy-agent exited 0 after scp failed${NC}"; return 1; }
+    echo "$out" | grep -q "Agent deployed" \
+        && { echo -e "    ${RED}[FAIL] --deploy-agent reported success after scp failed${NC}"; return 1; }
+
+    rm -f "$bin/calls"
+    out=$(PATH="$bin:$PATH" "$SCRIPT_BIN" --config "$CONF_FILE" --setup-remote root@mock_host 2>&1) \
+        && { echo -e "    ${RED}[FAIL] --setup-remote exited 0 after ssh-copy-id failed${NC}"; return 1; }
+    [ "$(cat "$bin/calls" 2>/dev/null)" = "ssh-copy-id" ] \
+        || { echo -e "    ${RED}[FAIL] went on after ssh-copy-id failed: $(tr '\n' ' ' < "$bin/calls")${NC}"; return 1; }
+    return 0
+}
+
+test_45_checks_answer_by_exit_code() {
+    # The dispatcher reads the exit code of --is-job-done and --has-storage.
+    # LOCAL --is-job-done said "false" with exit 0; a REMOTE agent said "false"
+    # about unwritable storage with exit 0, and --has-storage passed that on as 0.
+    run_backup || { echo -e "    ${RED}[FAIL] first run failed${NC}"; return 1; }
+    echo $(( $(date +%s) - 3 * 86400 )) > "$MNT_DEST/daily.0/.backup_timestamp"
+    "$SCRIPT_BIN" --config "$CONF_FILE" --is-job-done >/dev/null 2>&1 \
+        && { echo -e "    ${RED}[FAIL] --is-job-done exited 0 for a backup from three days ago${NC}"; return 1; }
+    local bin="$TEST_ROOT/mock45"; mkdir -p "$bin"
+    printf '#!/bin/sh\necho false\nexit 0\n' > "$bin/ssh"; chmod +x "$bin/ssh"
+    set_config "BACKUP_MODE" "REMOTE"
+    PATH="$bin:$PATH" "$SCRIPT_BIN" --config "$CONF_FILE" --has-storage >/dev/null 2>&1 \
+        && { echo -e "    ${RED}[FAIL] --has-storage exited 0 when the agent said false${NC}"; return 1; }
+    return 0
+}
+
+test_46_mount_failure_is_reported() {
+    # --mount said "Mounted" and exited 0 whether or not mount had worked.
+    local bin="$TEST_ROOT/mock46" out; mkdir -p "$bin"
+    for c in mount umount; do printf '#!/bin/sh\necho "%s: failed" >&2\nexit 32\n' "$c" > "$bin/$c"; done
+    printf '#!/bin/sh\nexit 1\n' > "$bin/mountpoint"
+    chmod +x "$bin"/*
+    out=$(PATH="$bin:$PATH" "$SCRIPT_BIN" --config "$CONF_FILE" --mount "$TEST_ROOT/mp46" 2>&1) \
+        && { echo -e "    ${RED}[FAIL] --mount exited 0 after mount failed${NC}"; return 1; }
+    echo "$out" | grep -q "Mounted to" \
+        && { echo -e "    ${RED}[FAIL] --mount reported success${NC}"; return 1; }
+    PATH="$bin:$PATH" "$SCRIPT_BIN" --config "$CONF_FILE" --umount "$TEST_ROOT/mp46" >/dev/null 2>&1 \
+        && { echo -e "    ${RED}[FAIL] --umount exited 0 after umount failed${NC}"; return 1; }
+    return 0
+}
+
+test_47_missing_source_fails_the_run() {
+    # A source that does not exist was skipped without a word, and the run
+    # ended in "Success" with a fresh timestamp.
+    echo "data" > "$MNT_SRC/file47"
+    set_config "SOURCE_DIRS" "$MNT_SRC $TEST_ROOT/no-such-source"
+    run_backup && { echo -e "    ${RED}[FAIL] run with a missing source exited 0${NC}"; return 1; }
+    grep -q "no-such-source' does not exist" "$LOG_FILE" \
+        || { echo -e "    ${RED}[FAIL] missing source not named in the log${NC}"; return 1; }
+    assert_missing "$MNT_DEST/daily.0/.backup_timestamp" || return 1
+}
+
+test_48_failed_rotation_is_not_committed() {
+    # The commit's renames were not checked. When daily.0 could not become
+    # daily.1, "mv daily.0.tmp daily.0" moved the new snapshot INTO the old one,
+    # and the run reported success.
+    run_backup || { echo -e "    ${RED}[FAIL] first run failed${NC}"; return 1; }
+    echo $(( $(date +%s) - 3 * 86400 )) > "$MNT_DEST/daily.0/.backup_timestamp"
+    : > "$MNT_DEST/daily.1"    # a file, not a snapshot: the rotation cannot use the name
+    run_backup && { echo -e "    ${RED}[FAIL] run exited 0 although the rotation failed${NC}"; return 1; }
+    [ -e "$MNT_DEST/daily.0/daily.0.tmp" ] \
+        && { echo -e "    ${RED}[FAIL] new snapshot nested inside daily.0${NC}"; return 1; }
+    return 0
+}
+
+test_49_bad_numbers_in_config() {
+    # RETAIN_DAILY="7d" failed every test on it and switched daily off without
+    # a word; a --config naming a file that is not there ran on the defaults.
+    set_config "RETAIN_DAILY" "7d"
+    "$SCRIPT_BIN" --config "$CONF_FILE" --status >/dev/null 2>&1 \
+        && { echo -e "    ${RED}[FAIL] RETAIN_DAILY=7d accepted${NC}"; return 1; }
+    set_config "RETAIN_DAILY" "7"
+    "$SCRIPT_BIN" --config "$TEST_ROOT/no-such.conf" --status >/dev/null 2>&1 \
+        && { echo -e "    ${RED}[FAIL] missing --config file accepted${NC}"; return 1; }
+    return 0
+}
+
+test_50_lock_key_verifies_the_result() {
+    # lock-key found the blob, rewrote nothing it recognised, and said "locked".
+    local home="$TEST_ROOT/lockhome50" f before
+    rm -rf "$home"; mkdir -p "$home/.ssh"; f="$home/.ssh/authorized_keys"
+    echo "unknown-type AAAAC3NzaC1lZDI1NTE5AAAAITARGETKEYtarget00000000000000000000000000 root@alice" > "$f"
+    before=$(cat "$f")
+    HOME="$home" "$SCRIPT_BIN" --agent-mode --config "$CONF_FILE" --action lock-key --client alice \
+        --key-blob AAAAC3NzaC1lZDI1NTE5AAAAITARGETKEYtarget00000000000000000000000000 >> "$LOG_FILE" 2>&1 \
+        && { echo -e "    ${RED}[FAIL] lock-key exited 0 without locking the key${NC}"; return 1; }
+    [ "$(cat "$f")" = "$before" ] || { echo -e "    ${RED}[FAIL] authorized_keys was changed${NC}"; return 1; }
+    return 0
+}
+
+test_52_rotation_keeps_the_old_timestamp() {
+    # "cp -al" links .backup_timestamp into the new snapshot, and rsync -R
+    # deletes only below the source paths, so the link survived. The commit
+    # wrote into it: daily.1 got today's date as well, and over weeks every
+    # snapshot shared one timestamp - nothing was ever promoted.
+    local old
+    run_backup || { echo -e "    ${RED}[FAIL] first run failed${NC}"; return 1; }
+    old=$(( $(date +%s) - 3 * 86400 ))
+    rm -f "$MNT_DEST/daily.0/.backup_timestamp"; echo "$old" > "$MNT_DEST/daily.0/.backup_timestamp"
+    run_backup || { echo -e "    ${RED}[FAIL] second run failed${NC}"; return 1; }
+    [ "$(cat "$MNT_DEST/daily.1/.backup_timestamp")" = "$old" ] \
+        || { echo -e "    ${RED}[FAIL] daily.1 lost its timestamp: $(cat "$MNT_DEST/daily.1/.backup_timestamp"), expected $old${NC}"; return 1; }
+    return 0
+}
+
+test_51_agent_lock_gives_up() {
+    # With a lock directory that cannot be created, agent_lock removed a
+    # "stale" lock after 5 s and looped back without sleeping: 100 % CPU, for ever.
+    local conf="$TEST_ROOT/agent51.conf" rc
+    : > "$TEST_ROOT/afile51"
+    cat > "$conf" <<EOF
+CONFIG_VERSION='2.0'
+BASE_STORAGE="$TEST_ROOT/storage51"
+LOCK_DIR="$TEST_ROOT/afile51/lock"
+EOF
+    timeout 30 "$SCRIPT_BIN" --agent-mode --config "$conf" --action prepare --client c51 >> "$LOG_FILE" 2>&1
+    rc=$?
+    [ "$rc" -eq 124 ] && { echo -e "    ${RED}[FAIL] agent lock still waiting after 30 s${NC}"; return 1; }
+    [ "$rc" -ne 0 ] || { echo -e "    ${RED}[FAIL] prepare exited 0 without a lock${NC}"; return 1; }
+    return 0
+}
+
 test_18_conditional_storage_creation() {
     # Goal: Verify that storage creation is strictly conditional.
     # Case A: --action version (Read-Only) -> MUST NOT create directory
@@ -1041,5 +1320,20 @@ run_test_case "34 Period Signatures" test_34_period_signatures
 run_test_case "35 Agent Serialises Actions" test_35_agent_serialises_actions
 run_test_case "36 Kill Stops Only This Run" test_36_kill_stops_only_this_run
 run_test_case "37 Install Replaces Atomically" test_37_install_replaces_atomically
+run_test_case "38 Wakeserver Lease Around the Run" test_38_power_lease_around_the_run
+run_test_case "39 Wakeserver Down, Backup Runs" test_39_power_unreachable_still_backs_up
+run_test_case "40 Wakeserver Lease Released on Failure" test_40_power_released_after_a_failure
+run_test_case "41 Wakeserver via busybox-style wget" test_41_power_with_wget
+run_test_case "42 Wakeserver Wait Until Awake" test_42_wait_until_awake
+run_test_case "43 Sleep Inhibitor During the Run" test_43_inhibit_sleep_during_the_run
+run_test_case "44 Setup Failures Are Reported" test_44_setup_failures_are_reported
+run_test_case "45 Checks Answer by Exit Code" test_45_checks_answer_by_exit_code
+run_test_case "46 Mount Failure Is Reported" test_46_mount_failure_is_reported
+run_test_case "47 Missing Source Fails the Run" test_47_missing_source_fails_the_run
+run_test_case "48 Failed Rotation Not Committed" test_48_failed_rotation_is_not_committed
+run_test_case "49 Bad Numbers in Config" test_49_bad_numbers_in_config
+run_test_case "50 Lock Key Verifies the Result" test_50_lock_key_verifies_the_result
+run_test_case "51 Agent Lock Gives Up" test_51_agent_lock_gives_up
+run_test_case "52 Rotation Keeps the Old Timestamp" test_52_rotation_keeps_the_old_timestamp
 
 print_summary

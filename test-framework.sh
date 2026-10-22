@@ -49,6 +49,9 @@ RETAIN_WEEKLY=4
 RETAIN_MONTHLY=12
 RETAIN_YEARLY=2
 LOGFILE="$LOG_FILE"
+# Its own lock: without it the suite shared /var/run/snapshot-backup.pid with
+# the host's real backup, and a nightly run in progress failed 29 tests.
+PIDFILE="$TEST_ROOT/snapshot-backup.pid"
 ENABLE_NOTIFICATIONS=false
 SPACE_LOW_LIMIT_GB=0
 SMART_PURGE_SLOTS=0

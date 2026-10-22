@@ -1,6 +1,6 @@
 # snapshot-backup.sh - Intelligent Incremental Backup
 
-⚠️ **STATUS: STABLE / PRODUCTION READY (v18.7)**
+⚠️ **STATUS: STABLE / PRODUCTION READY (v18.8)**
 
 ### ⚖️ DISCLAIMER / LIMITATION OF LIABILITY
 
@@ -391,7 +391,7 @@ Number of monthly snapshots (promoted from weekly).
 Number of yearly snapshots (promoted from monthly).
 
 **`SOURCE_DIRS`** (Default: `/`)
-Space-separated list of local directories to back up. Example: `"/etc" "/home"`.
+Space-separated list of local directories to back up. Example: `"/etc" "/home"`. A source that does not exist fails the run (since 18.8; before, it was skipped without a word).
 
 **`EXCLUDE_PATTERNS`** (Default: `.cache *.tmp ...`)
 Space-separated list of file/folder patterns to exclude from rsync.
@@ -404,6 +404,27 @@ Minimum free space (in GB) required on the target. If free space is below this l
 
 **`SMART_PURGE_SLOTS`** (Default: `0`)
 How many of the oldest base snapshots may be deleted before a transfer when `SPACE_LOW_LIMIT_GB` is reached. Only the base interval is touched, and never its `.0` — weekly and monthly history is not traded for space automatically. If space is still short afterwards, the run proceeds and fails loudly rather than purging further.
+
+**`POWER_API_URL`** (Default: empty = off)
+Base URL of a wakeserver (a separate project), e.g. `http://10.1.1.8:8080`, for machines that sleep when idle. While a run lasts, it holds a lease on each host in `POWER_LEASE_HOSTS`: the wakeserver neither puts that host to sleep nor leaves it asleep. The backup never depends on it — a wakeserver that does not answer costs a warning in the log, nothing more. The lease is released in the cleanup path, so also after a failure or a signal; one that is not released expires by itself.
+
+**`POWER_API_TOKEN`** (Default: empty)
+The bearer token from `python3 -m wakeserver new-token NAME` on the wakeserver. With curl it is passed through a mode-600 header file and never appears in the process list; busybox `wget` only takes it as an argument, visible to local users for the length of the call.
+
+**`POWER_LEASE_HOSTS`** (Default: empty)
+Space-separated wakeserver host names to keep awake: usually this machine itself, or a backup server that sleeps.
+
+**`POWER_LEASE_MINUTES`** (Default: `240`)
+Length of the lease. A run that outlasts it is not interrupted; the host's own agent refuses to sleep while `INHIBIT_SLEEP` holds its inhibitor.
+
+**`POWER_WAIT_SECONDS`** (Default: `0`)
+After taking a lease, wait up to this long for the wakeserver to report the host `awake` — for a target that had to be woken. `0` does not wait.
+
+**`POWER_HTTP_CLIENT`** (Default: `auto`)
+`curl`, `wget` (also busybox), or `auto`: curl if installed, otherwise wget.
+
+**`INHIBIT_SLEEP`** (Default: `false`)
+Hold a blocking `systemd-inhibit` sleep lock while a run lasts. The lock watches the backup process and ends with it, even after `kill -9`. Leave it off on laptops, where closing the lid must still suspend.
 
 **`DEEP_VERIFY_INTERVAL_DAYS`** (Default: `35`)
 Automatically force a `--verify` run every N days to detect bit-rot.
@@ -482,6 +503,16 @@ Consequently a client key can no longer **deploy** the agent (`--deploy-agent`, 
 ---
 
 ## 📆 Version History
+- **v18.8:** Machines that sleep when idle, and no more success that was not one.
+  - A run can hold a lease on a wakeserver (a separate project) (`POWER_*`) and a local blocking sleep inhibitor (`INHIBIT_SLEEP`), both released in the cleanup path. The wakeserver is optional for the run: unreachable, it costs a warning. curl or busybox wget; the token stays out of the process list with curl. Tests 38–43.
+  - **Every snapshot shared one timestamp.** The rotation's `cp -al` links `.backup_timestamp` into the new snapshot, and `rsync -R` deletes only below the source paths, so the link survived — and the commit wrote into it. Each rotation gave the previous snapshot today's date as well; over the weeks the whole chain, weekly and monthly included, came to share one file. No period ever looked new, nothing was promoted, and retention deleted the history: after 60 days a chain held seven dailies and the very first snapshot, all dated today. Affected: every source other than `/`, in REMOTE mode and, since 18.7, in LOCAL mode (with `/` the `--delete` reaches the snapshot root and removed the link in time). The commit now writes a new file. Existing chains recover from the next run on; the dates shown for older snapshots stay wrong. Test 52.
+  - `--setup-remote` and `--deploy-agent` reported `Agent deployed.` and exit 0 when nothing reached the server (issue #1). Each step is checked now, setup stops at the first one that fails, and the exit code says so; copy, install and lock all go to the host on the command line (the install and the lock used to go to the configured one); `ssh-copy-id` is given `REMOTE_PORT`. Test 44.
+  - The commit's and the promotion's renames were not checked: a rotation that failed reported success, and the next `mv` put the new snapshot *inside* the old `.0`. They now stop at the first failure and the run fails — locally, and through the agent's `commit` and `purge`, which never failed before. Test 48.
+  - `--is-job-done` (LOCAL) answered `false` with exit 0; `--has-storage` (REMOTE) passed on an agent's `false` as exit 0 and now also takes `--timeout`; `--mount` and `--umount` reported success whatever `mount` did. Tests 45, 46.
+  - A source in `SOURCE_DIRS` that does not exist fails the run (test 47). A number in the config the shell cannot read — `RETAIN_DAILY="7d"` used to switch daily off silently — and a `--config` file that is not there are errors (test 49).
+  - `lock-key` replaces `authorized_keys` only after checking that the new file holds every line and the locked key (test 50); `--install` fails when the wrapper cannot be written. The agent lock gives up after `AGENT_LOCK_WAIT` instead of spinning for ever on a lock it cannot take (test 51).
+  - `--deploy-agent` and `--upgrade` replace the script instead of writing into it, as `--install` does: an agent action still running no longer reads a mixture of two versions, and an upgrade that breaks off leaves the old script intact (test 11).
+
 - **v18.7:** A failed backup is a failed backup, in both modes. Three faults together let a LOCAL target sit full for eight months with every nightly run failing and nobody told:
   - The smart purge ran only after a *successful* backup. A full target makes the transfer fail, so the purge that would have made room never ran. It now runs before the transfer, as this README always said — in REMOTE mode inside the agent's `prepare`, which is now told `--smart-purge-slots` (the agent reads no config, so remote smart purge had been a no-op).
   - A failed LOCAL run logged `Backup failed` and returned normally: exit 0 for cron and systemd, `0` for `POST_RUN_CMD`. It now exits 1.
