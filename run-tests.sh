@@ -1,6 +1,6 @@
 #!/bin/bash
 # file: run-tests.sh
-# Test suite for snapshot-backup.sh v18.8
+# Test suite for snapshot-backup.sh v18.9
 
 source ./test-framework.sh
 
@@ -1221,6 +1221,42 @@ EOF
     return 0
 }
 
+test_53_comments_in_list_values() {
+    # A "#" line between the quotes is not a shell comment: every word of it
+    # became a list item - fatal missing sources in SOURCE_DIRS since 18.8,
+    # silent excludes in EXCLUDE_PATTERNS (issue #2). A quoted path with a
+    # space became two items as well.
+    mkdir -p "$MNT_SRC/a" "$MNT_SRC/my docs" "$MNT_SRC/c"
+    echo "data" > "$MNT_SRC/a/keep"
+    echo "data" > "$MNT_SRC/my docs/file"
+    echo "data" > "$MNT_SRC/c/small"
+    echo "data" > "$MNT_SRC/c/x.tmp"
+    # Single quotes, as in a real config: set_config's double quotes would
+    # end at the first quoted item.
+    sed -i '/^SOURCE_DIRS=/d; /^EXCLUDE_PATTERNS=/d' "$CONF_FILE"
+    cat >> "$CONF_FILE" <<EOF
+SOURCE_DIRS='
+    "$MNT_SRC/a"
+    # keep a copy, it is small
+	# indented with a tab
+    "$MNT_SRC/my docs" # and one behind an item
+    "$MNT_SRC/c"
+'
+EXCLUDE_PATTERNS='
+    "*.tmp"
+    # keep a copy of the cache, it is small
+'
+EOF
+    run_backup || { echo -e "    ${RED}[FAIL] run with comments in the lists failed${NC}"; return 1; }
+    local f
+    for f in a/keep "my docs/file" c/small; do
+        [ -e "$MNT_DEST/daily.0$MNT_SRC/$f" ] \
+            || { echo -e "    ${RED}[FAIL] $f missing from the snapshot${NC}"; return 1; }
+    done
+    assert_missing "$MNT_DEST/daily.0$MNT_SRC/c/x.tmp" || return 1
+    return 0
+}
+
 test_18_conditional_storage_creation() {
     # Goal: Verify that storage creation is strictly conditional.
     # Case A: --action version (Read-Only) -> MUST NOT create directory
@@ -1335,5 +1371,6 @@ run_test_case "49 Bad Numbers in Config" test_49_bad_numbers_in_config
 run_test_case "50 Lock Key Verifies the Result" test_50_lock_key_verifies_the_result
 run_test_case "51 Agent Lock Gives Up" test_51_agent_lock_gives_up
 run_test_case "52 Rotation Keeps the Old Timestamp" test_52_rotation_keeps_the_old_timestamp
+run_test_case "53 Comments in List Values" test_53_comments_in_list_values
 
 print_summary

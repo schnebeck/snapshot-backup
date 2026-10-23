@@ -1,6 +1,6 @@
 # snapshot-backup.sh - Intelligent Incremental Backup
 
-⚠️ **STATUS: STABLE / PRODUCTION READY (v18.8)**
+⚠️ **STATUS: STABLE / PRODUCTION READY (v18.9)**
 
 ### ⚖️ DISCLAIMER / LIMITATION OF LIABILITY
 
@@ -396,6 +396,19 @@ Space-separated list of local directories to back up. Example: `"/etc" "/home"`.
 **`EXCLUDE_PATTERNS`** (Default: `.cache *.tmp ...`)
 Space-separated list of file/folder patterns to exclude from rsync.
 
+**List values** (`SOURCE_DIRS`, `EXCLUDE_PATTERNS`, `EXCLUDE_MOUNTPOINTS`): items are separated by spaces, tabs or newlines; an item with a space in it goes in double quotes (`"/home/me/my docs"`). A word starting with `#` begins a comment up to the end of the line, between the quotes as well (since 18.9), so a list can carry its own notes:
+
+```
+SOURCE_DIRS='
+    "/"
+    "/boot"
+    # Own mount, so -x would skip it.
+    "/boot/efi"    # the bootloader
+'
+```
+
+An item that really starts with `#` is written in quotes: `"#*#"`.
+
 **`EXCLUDE_MOUNTPOINTS`** (Default: `/proc /sys /dev ...`)
 Mount points whose directory must exist in every snapshot, even when nothing is mounted there at backup time — so a restored system has `/proc`, `/dev` or `/mnt/data` to mount onto. The list does **not** exclude anything: the contents of another filesystem stay out because rsync runs with `-x`. A directory on the same filesystem listed here is copied like any other; to keep something out, use `EXCLUDE_PATTERNS`.
 
@@ -503,6 +516,9 @@ Consequently a client key can no longer **deploy** the agent (`--deploy-agent`, 
 ---
 
 ## 📆 Version History
+- **v18.9:** A comment in a list is a comment.
+  - A `#` line between the quotes of `SOURCE_DIRS`, `EXCLUDE_PATTERNS` or `EXCLUDE_MOUNTPOINTS` was not a comment: every word of it became a list item (issue #2). In `SOURCE_DIRS` those were missing sources — skipped silently up to 18.7, fatal since 18.8, which stopped the nightly backup of configs that had run for weeks. In `EXCLUDE_PATTERNS` each word became an exclude, and files or directories named `a`, `the`, `keep`, … were left out of every snapshot anywhere in the tree without a word. A word starting with `#` now ends the line, also behind an item; quoted (`"#*#"`) it is still an item.
+  - A quoted item with a space in it (`"/home/me/my docs"`) became two items, `/home/me/my` and `docs"`. Quoting works now; a quote left open hands on what it collected instead of dropping the item, and `""` is no item at all. Tabs separate items as spaces do — a tab-indented line used to be one item with its quotes still on. Test 53.
 - **v18.8:** Machines that sleep when idle, and no more success that was not one.
   - A run can hold a lease on a wakeserver (a separate project) (`POWER_*`) and a local blocking sleep inhibitor (`INHIBIT_SLEEP`), both released in the cleanup path. The wakeserver is optional for the run: unreachable, it costs a warning. curl or busybox wget; the token stays out of the process list with curl. Tests 38–43.
   - **Every snapshot shared one timestamp.** The rotation's `cp -al` links `.backup_timestamp` into the new snapshot, and `rsync -R` deletes only below the source paths, so the link survived — and the commit wrote into it. Each rotation gave the previous snapshot today's date as well; over the weeks the whole chain, weekly and monthly included, came to share one file. No period ever looked new, nothing was promoted, and retention deleted the history: after 60 days a chain held seven dailies and the very first snapshot, all dated today. Affected: every source other than `/`, in REMOTE mode and, since 18.7, in LOCAL mode (with `/` the `--delete` reaches the snapshot root and removed the link in time). The commit now writes a new file. Existing chains recover from the next run on; the dates shown for older snapshots stay wrong. Test 52.

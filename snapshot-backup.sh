@@ -3,7 +3,7 @@
 # ==============================================================================
 ## @file    snapshot-backup.sh
 ## @brief   Unified Snapshot Backup Client & Agent (POSIX sh)
-## @version 18.8
+## @version 18.9
 ##
 ## @note    DEVIATION FROM STRICT POSIX:
 ##          This script utilizes the 'local' keyword for variable scoping.
@@ -29,7 +29,7 @@ umask 0077
 # 1. CONSTANTS & CONFIGURATION DEFAULTS
 # ==============================================================================
 
-SCRIPT_VERSION="18.8"
+SCRIPT_VERSION="18.9"
 EXPECTED_CONFIG_VERSION="2.0"
 
 # --- System Paths ---
@@ -297,53 +297,56 @@ read_timestamp() {
 }
 
 ## @brief Helper to parse quoted words in a line.
+## An unquoted word starting with "#" ends the line, as in the shell: before
+## 18.9 every word of a comment between the quotes became a list item - a
+## fatal missing source in SOURCE_DIRS, a silent exclude in EXCLUDE_PATTERNS.
+## A pattern that really starts with "#" still works quoted ("#*#").
 _iterate_words_in_line() {
     local line="$1"
     local callback="$2"
     local old_ifs="$IFS"
-    IFS=" "
+    # Tabs as well: a tab-indented line was one word with its quotes still on.
+    IFS=" 	"
     set -f
     set -- $line
     set +f
     IFS="$old_ifs"
     
-    local accumulator=""
+    # A quoted item with spaces arrives in several words. Before 18.9 the test
+    # for "complete" (*\"?*) matched any word that starts with a quote, so
+    # "/my docs" became the two items '/my' and 'docs"'.
+    local accumulator="" in_quote=false content
     for word in "$@"; do
-        if [ -n "$accumulator" ]; then
+        if [ "$in_quote" = true ]; then
             accumulator="$accumulator $word"
             case "$word" in
                 *\")
-                    local content="${accumulator%\"}"
-                    "$callback" "$content"
-                    accumulator=""
+                    "$callback" "${accumulator%\"}"
+                    accumulator=""; in_quote=false
                     ;;
             esac
-        else
-            case "$word" in
-                \"*)
-                    case "$word" in
-                        *\"?*|*\")
-                            if [ "${#word}" -gt 1 ]; then
-                                local content="${word#\"}"
-                                content="${content%\"}"
-                                "$callback" "$content"
-                            else
-                                accumulator="${word#\"}"
-                            fi
-                            ;;
-                        *)
-                            accumulator="${word#\"}"
-                            ;;
-                    esac
-                    ;;
-                *)
-                    if [ -n "$word" ]; then
-                        "$callback" "$word"
-                    fi
-                    ;;
-            esac
+            continue
         fi
+        case "$word" in
+            \"*\")
+                content="${word#\"}"; content="${content%\"}"
+                [ -n "$content" ] && "$callback" "$content"
+                ;;
+            \"*)
+                accumulator="${word#\"}"; in_quote=true
+                ;;
+            \#*)
+                break
+                ;;
+            *)
+                [ -n "$word" ] && "$callback" "$word"
+                ;;
+        esac
     done
+    # A quote left open: hand on what was collected rather than drop an item
+    # without a word. A wrong path then fails as a missing source.
+    [ "$in_quote" = true ] && "$callback" "$accumulator"
+    return 0
 }
 
 ## @brief Iterates over a newline-separated list and calls callback for each item.
