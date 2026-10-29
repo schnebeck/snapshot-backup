@@ -227,7 +227,7 @@ runs the script against stubs, without root and without NetworkManager.
 Dispatcher 5.2 (2026-10-29): "done this period?" comes before any question to the backup server,
 and `--is-job-done` answers from the record of the last run (`JOB_DONE_FILE`). Before, the hourly
 timer asked the server for storage and "done" every hour, and each question over SSH spun up its
-disks. With a WOL-Server (next section) the dispatcher checks the WOL-Server instead of the
+disks. With a WOL-Server ([next section](#a-backup-server-that-sleeps-wol-server-optional)) the dispatcher checks the WOL-Server instead of the
 sleeping target; the run wakes it.
 
 Dispatcher 5.1 (2026-10-13): the timer, and the trust check looks at every active connection
@@ -445,7 +445,7 @@ Minimum free space (in GB) required on the target. If free space is below this l
 How many of the oldest base snapshots may be deleted before a transfer when `SPACE_LOW_LIMIT_GB` is reached. Only the base interval is touched, and never its `.0` — weekly and monthly history is not traded for space automatically. If space is still short afterwards, the run proceeds and fails loudly rather than purging further.
 
 **`WOL_SERVER_URL`** (Default: empty = off)
-Base URL of a [WOL-Server](https://github.com/schnebeck/wol-server), e.g. `https://wol.example.org`, for a backup server that sleeps (see *A Backup Server That Sleeps*). A run requests each device in `WOL_DEVICES` and ends the request in the cleanup path, so also after a failure or a signal; a request that is not ended expires after 15 minutes without heartbeat. The backup never depends on it — a WOL-Server that does not answer costs a warning in the log, nothing more. Needs `curl`: requests use PUT and DELETE, which busybox `wget` cannot send.
+Base URL of a [WOL-Server](https://github.com/schnebeck/wol-server), e.g. `https://wol.example.org`, for a backup server that sleeps (see [A Backup Server That Sleeps](#a-backup-server-that-sleeps-wol-server-optional)). A run requests each device in `WOL_DEVICES` and ends the request in the cleanup path, so also after a failure or a signal; a request that is not ended expires after 15 minutes without heartbeat. The backup never depends on it — a WOL-Server that does not answer costs a warning in the log, nothing more. Needs `curl`: requests use PUT and DELETE, which busybox `wget` cannot send.
 
 **`WOL_SERVER_TOKEN`** (Default: empty)
 An API token from *System → API tokens* on the WOL-Server. curl gets it through a mode-600 header file, so it never appears in the process list; keep the config file mode 600 as well.
