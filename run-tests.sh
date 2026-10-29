@@ -1,6 +1,6 @@
 #!/bin/bash
 # file: run-tests.sh
-# Test suite for snapshot-backup.sh v19.0
+# Test suite for snapshot-backup.sh v19.1
 
 source ./test-framework.sh
 
@@ -1139,6 +1139,24 @@ test_56_wakeserver_options_warn() {
         || { echo -e "    ${RED}[FAIL] no warning${NC}"; return 1; }
 }
 
+test_57_wol_by_address() {
+    # A client on the VPN reaches the WOL-Server by its VPN address; the name in
+    # the URL (which the certificate is for) does not resolve there at all.
+    _start_mock_wolserver
+    set_config "WOL_SERVER_URL" "http://wol.invalid:$(cat "$TEST_ROOT/api.port")"
+    set_config "WOL_RESOLVE" "127.0.0.1"
+    local ret; _run_with_wolserver 0
+    kill "$MOCK_API_PID" 2>/dev/null
+    [ "$ret" -eq 0 ] || { echo -e "    ${RED}[FAIL] backup failed${NC}"; return 1; }
+    grep -q "^POST /api/devices/backup/requests" "$TEST_ROOT/api.log" \
+        && grep -q "^DELETE /api/devices/backup/requests/abc123def456" "$TEST_ROOT/api.log" \
+        || { echo -e "    ${RED}[FAIL] $(cat "$TEST_ROOT/api.log" 2>&1)${NC}"; return 1; }
+    # Only an address: the value ends up on curl's command line.
+    set_config "WOL_RESOLVE" "10.1.1.8 --insecure"
+    run_backup && { echo -e "    ${RED}[FAIL] WOL_RESOLVE with options accepted${NC}"; return 1; }
+    return 0
+}
+
 test_43_inhibit_sleep_during_the_run() {
     # The host's own guard: a blocking inhibitor while rsync runs, gone afterwards.
     local mb="$TEST_ROOT/mock_inhibit"; mkdir -p "$mb"
@@ -1454,5 +1472,6 @@ run_test_case "53 Comments in List Values" test_53_comments_in_list_values
 run_test_case "54 WOL-Server Heartbeat" test_54_wol_heartbeat_while_the_run_lasts
 run_test_case "55 Job Done Answered Locally" test_55_job_done_answered_locally
 run_test_case "56 Wakeserver Options Warn" test_56_wakeserver_options_warn
+run_test_case "57 WOL-Server by Its VPN Address" test_57_wol_by_address
 
 print_summary

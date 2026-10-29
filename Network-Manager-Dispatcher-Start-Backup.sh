@@ -6,8 +6,7 @@
 # @details   Triggers snapshot-backup.sh based on network events, power state,
 #            trusted networks, and specific safety pre-checks.
 #
-# @version   5.2 (Added: "done" is checked before the server is asked; with a
-#                  WOL-Server the run wakes the target)
+# @version   5.3 (Added: WOL_RESOLVE - the WOL-Server by its VPN address)
 # @license   GPLv3
 # ==============================================================================
 
@@ -216,6 +215,9 @@ run_logic() {
         if [ "$host" = "$hostport" ]; then
             port=80; [ "${WOL_SERVER_URL%%://*}" = https ] && port=443
         fi
+        # WOL_RESOLVE: the WOL-Server's address where its name does not lead
+        # to it, e.g. over the VPN (see snapshot-backup.sh).
+        [ -n "${WOL_RESOLVE:-}" ] && host="$WOL_RESOLVE"
         log "CHECK: Connectivity to the WOL-Server ($host:$port)..."
         if timeout 5 bash -c "</dev/tcp/$host/$port" 2>/dev/null; then
             log "TEST: WOL-Server answers; the run wakes $WOL_DEVICES."

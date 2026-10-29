@@ -1,6 +1,6 @@
 # snapshot-backup.sh - Intelligent Incremental Backup
 
-⚠️ **STATUS: STABLE / PRODUCTION READY (v19.0)**
+⚠️ **STATUS: STABLE / PRODUCTION READY (v19.1)**
 
 ### ⚖️ DISCLAIMER / LIMITATION OF LIABILITY
 
@@ -243,7 +243,13 @@ Most setups do not need this: the backup server simply runs. If it sleeps and a
 WOL_SERVER_URL="https://wol.example.org"
 WOL_SERVER_TOKEN="…"            # WOL-Server: System → API tokens; then chmod 600 the config
 WOL_DEVICES="backup"            # the backup server's name (or ID) on the WOL-Server
+WOL_RESOLVE="10.1.1.8"          # only for a client that reaches it over the VPN alone
 ```
+
+A client outside the home network usually cannot use the WOL-Server's name: it points to wherever
+the certificate is obtained, and the WOL-Server's IP address does not match the certificate.
+`WOL_RESOLVE` gives the address to connect to — the VPN address — while the certificate is
+still checked against the name in `WOL_SERVER_URL`. Nothing on the client's system changes.
 
 The run requests the device before anything else, which wakes it and waits up to
 `WOL_WAIT_SECONDS` for it; keeps the request alive with heartbeats while it runs; and ends it in
@@ -453,6 +459,9 @@ An API token from *System → API tokens* on the WOL-Server. curl gets it throug
 **`WOL_DEVICES`** (Default: empty)
 Space-separated device names or IDs on the WOL-Server, usually the backup server.
 
+**`WOL_RESOLVE`** (Default: empty)
+The IP address to reach the WOL-Server at, for a client that sees it only over the VPN, e.g. `10.1.1.8`. curl connects there (`--resolve`) and still checks the certificate against the name in `WOL_SERVER_URL`, so it stays valid; the dispatcher checks this address, too. Empty: the name is resolved as usual. A laptop that is sometimes at home without the VPN leaves it empty, if the name leads to the WOL-Server there.
+
 **`WOL_WAIT_SECONDS`** (Default: `300`, at most `300`)
 How long the WOL-Server waits for a device it had to wake. A device that does not come up in time costs a warning; the run then finds out for itself whether the target is there.
 
@@ -542,6 +551,7 @@ Consequently a client key can no longer **deploy** the agent (`--deploy-agent`, 
 ---
 
 ## 📆 Version History
+- **v19.1:** The WOL-Server over the VPN. `WOL_RESOLVE` names the address to reach it at; the name in `WOL_SERVER_URL` need not resolve there, and the certificate stays valid — curl checks it against the name, not the address. Before, a client outside the home network reached the web server that obtains the certificate, or got a certificate error with the IP address. Dispatcher 5.3 checks the same address. Test 57.
 - **v19.0:** A backup server that sleeps, and an hourly timer that lets it.
   - **WOL-Server requests** (`WOL_*`, optional) replace the wakeserver leases (`POWER_*`): the wakeserver is no longer developed. A run requests the backup server on a [WOL-Server](https://github.com/schnebeck/wol-server), which wakes it, keeps the request alive with heartbeats and ends it in the cleanup path — asking for sleep if it woke the device (`WOL_SLEEP_AFTER`). Several clients share the server; it sleeps after the last one. A config that still sets `POWER_API_URL` backs up and logs a warning. Tests 38–42, 54, 56.
   - **`--is-job-done` answers locally** in REMOTE mode from the record of the last successful run (`JOB_DONE_FILE`), and the dispatcher (5.2) asks "done?" before it asks the server anything. Before, the hourly timer reached the server every hour over SSH — and the agent's storage check and `chmod` pass spun up its disks each time. Test 55, test 10.

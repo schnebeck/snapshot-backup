@@ -134,6 +134,13 @@ backup_conf 'WOL_SERVER_URL="http://127.0.0.1:1/"' 'WOL_DEVICES="backup"'
 dispatch - timer
 expect skipped "timer: WOL-Server does not answer -> no backup"
 
+# Over the VPN the name does not lead to the WOL-Server; WOL_RESOLVE does (5.3).
+setup 1 "schnebeck.de VPN" 0
+backup_conf "WOL_SERVER_URL=\"http://wol.invalid:$PORT\"" 'WOL_RESOLVE="127.0.0.1"' 'WOL_DEVICES="backup"'
+sed -i "s/^REMOTE_PORT=.*/REMOTE_PORT=\"1\"/" "$T/backup.conf"
+dispatch - timer
+expect triggered "timer: WOL-Server by its VPN address (WOL_RESOLVE) -> backs up"
+
 setup 1 "MeyersGarten" 0
 sed -i "s/^REMOTE_PORT=.*/REMOTE_PORT=\"1\"/" "$T/backup.conf"
 dispatch - timer

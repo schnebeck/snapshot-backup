@@ -3,7 +3,7 @@
 # ==============================================================================
 ## @file    snapshot-backup.sh
 ## @brief   Unified Snapshot Backup Client & Agent (POSIX sh)
-## @version 19.0
+## @version 19.1
 ##
 ## @note    DEVIATION FROM STRICT POSIX:
 ##          This script utilizes the 'local' keyword for variable scoping.
@@ -29,7 +29,7 @@ umask 0077
 # 1. CONSTANTS & CONFIGURATION DEFAULTS
 # ==============================================================================
 
-SCRIPT_VERSION="19.0"
+SCRIPT_VERSION="19.1"
 EXPECTED_CONFIG_VERSION="2.0"
 
 # --- System Paths ---
@@ -116,6 +116,7 @@ POST_RUN_CMD=""
 WOL_SERVER_URL=""
 WOL_SERVER_TOKEN=""
 WOL_DEVICES=""
+WOL_RESOLVE=""
 WOL_WAIT_SECONDS=300
 WOL_SLEEP_AFTER="woken"
 WOL_TTL=900
@@ -123,6 +124,7 @@ WOL_HEARTBEAT_SECONDS=300
 _WOL_HELD=""
 _WOL_HEADER=""
 _WOL_BEAT_PID=""
+_WOL_RESOLVE_ARG=""
 INHIBIT_SLEEP=false
 _INHIBIT_PID=""
 
@@ -1763,6 +1765,9 @@ load_config() {
                 ''|*[!0-9]*) die "Config $config_file: $var must be a whole number, not '$val'." ;;
             esac
         done
+        case "${WOL_RESOLVE:-}" in
+            *[!0-9A-Fa-f.:]*) die "Config $config_file: WOL_RESOLVE must be an IP address, not '$WOL_RESOLVE'." ;;
+        esac
         case "${WOL_SLEEP_AFTER:-}" in
             true|woken|false) ;;
             *) die "Config $config_file: WOL_SLEEP_AFTER must be true, woken or false, not '${WOL_SLEEP_AFTER:-}'." ;;
@@ -1852,20 +1857,44 @@ run_hook() {
 ## curl only: requests need PUT and DELETE, which busybox wget cannot send. The
 ## token comes from a mode-600 header file and never shows in the process list.
 wol_api() {
-    local out code rc
+    local out code rc resolve=""
     out=$(mktemp) || return 1
+    [ -n "${_WOL_RESOLVE_ARG:-}" ] && resolve="--resolve"
     if [ -n "${4:-}" ]; then
-        code=$(curl -sS --max-time "$1" -o "$out" -w '%{http_code}' -X "$2" -H "@$_WOL_HEADER" \
-            -H "Content-Type: application/json" --data "$4" "${WOL_SERVER_URL%/}$3" 2>/dev/null)
-    else
-        code=$(curl -sS --max-time "$1" -o "$out" -w '%{http_code}' -X "$2" -H "@$_WOL_HEADER" \
+        code=$(curl -sS --max-time "$1" ${resolve:+"$resolve"} ${resolve:+"$_WOL_RESOLVE_ARG"} -o "$out" \
+            -w '%{http_code}' -X "$2" -H "@$_WOL_HEADER" -H "Content-Type: application/json" --data "$4" \
             "${WOL_SERVER_URL%/}$3" 2>/dev/null)
+    else
+        code=$(curl -sS --max-time "$1" ${resolve:+"$resolve"} ${resolve:+"$_WOL_RESOLVE_ARG"} -o "$out" \
+            -w '%{http_code}' -X "$2" -H "@$_WOL_HEADER" "${WOL_SERVER_URL%/}$3" 2>/dev/null)
     fi
     rc=$?
     echo "${code:-000}"
     cat "$out"
     rm -f "$out"
     return $rc
+}
+
+## @brief Sets _WOL_RESOLVE_ARG for curl --resolve from WOL_RESOLVE: "host:port:address".
+##
+## A client that reaches the WOL-Server only over the VPN cannot use the name:
+## it points to wherever the certificate is obtained. Connecting to the VPN
+## address by name keeps the certificate valid - curl still checks it against
+## the name in WOL_SERVER_URL.
+wol_resolve_prepare() {
+    _WOL_RESOLVE_ARG=""
+    [ -n "${WOL_RESOLVE:-}" ] || return 0
+    local hostport host port addr="$WOL_RESOLVE"
+    hostport="${WOL_SERVER_URL#*://}"
+    hostport="${hostport%%/*}"
+    host="${hostport%:*}"
+    port="${hostport##*:}"
+    if [ "$host" = "$hostport" ]; then
+        port=80
+        [ "${WOL_SERVER_URL%%://*}" = https ] && port=443
+    fi
+    case "$addr" in *:*) addr="[$addr]" ;; esac  # IPv6
+    _WOL_RESOLVE_ARG="$host:$port:$addr"
 }
 
 ## @brief Prints one field of the flat JSON object on stdin, without quotes.
@@ -1889,6 +1918,7 @@ wol_request_acquire() {
     fi
     _WOL_HEADER=$(mktemp) || return 0
     printf 'Authorization: Bearer %s\n' "$WOL_SERVER_TOKEN" > "$_WOL_HEADER"
+    wol_resolve_prepare
 
     local wait dev res code id woken msg sleep_after
     wait=$(sanitize_int "${WOL_WAIT_SECONDS:-300}")
@@ -2207,12 +2237,15 @@ POST_RUN_CMD="$POST_RUN_CMD"
 # device this run woke, true = always, false = never. The WOL-Server lets the
 # device sleep only when no other client holds it any more. The token comes
 # from System -> API tokens on the WOL-Server; keep this file mode 600 then.
-# Needs curl.
+# WOL_RESOLVE: the WOL-Server's address for a client that reaches it only over
+# the VPN, e.g. 10.1.1.8 - the name in WOL_SERVER_URL then need not resolve
+# there, and the certificate stays valid. Needs curl.
 # INHIBIT_SLEEP=true holds a local blocking sleep inhibitor during a run;
 # leave it off on laptops, where closing the lid must still suspend.
 WOL_SERVER_URL="$WOL_SERVER_URL"
 WOL_SERVER_TOKEN="$WOL_SERVER_TOKEN"
 WOL_DEVICES="$WOL_DEVICES"
+WOL_RESOLVE="$WOL_RESOLVE"
 WOL_WAIT_SECONDS=$WOL_WAIT_SECONDS
 WOL_SLEEP_AFTER="$WOL_SLEEP_AFTER"
 INHIBIT_SLEEP=$INHIBIT_SLEEP
