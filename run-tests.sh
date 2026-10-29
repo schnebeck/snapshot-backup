@@ -1,6 +1,6 @@
 #!/bin/bash
 # file: run-tests.sh
-# Test suite for snapshot-backup.sh v19.4
+# Test suite for snapshot-backup.sh v19.5
 
 source ./test-framework.sh
 
@@ -655,6 +655,8 @@ test_25_wrapper_confines_a_client() {
         printf '#!/bin/sh\necho "%s $*"\n' "$s" > "$stubs/$s"; chmod +x "$stubs/$s"
         sed -i "s|^$s=.*|$s=\"$stubs/$s\"|" "$w"
     done
+    # The inhibitor around backup processes has its own test (63).
+    sed -i 's|^INHIBIT=.*|INHIBIT=""|' "$w"
     printf '#!/bin/sh\nexec busybox sh "$@"\n' > "$stubs/busybox_sh"; chmod +x "$stubs/busybox_sh"
 
     local failed="" sh out
@@ -1264,6 +1266,48 @@ test_62_waits_for_the_backup_server() {
         || { echo -e "    ${RED}[FAIL] no waiting message${NC}"; return 1; }
 }
 
+test_63_wrapper_holds_an_inhibitor() {
+    # Every backup process on the server announces itself: the wrapper runs agent
+    # actions and rsync under a block inhibitor against shutdown and sleep, named
+    # after the client. A power-off that respects inhibitors then names the client
+    # instead of guessing from command lines.
+    local w="$TEST_ROOT/wrapper63.sh" store="$TEST_ROOT/wstore63" stubs="$TEST_ROOT/stubs63" out
+    rm -rf "$store" "$stubs"; mkdir -p "$store/alice/daily.0" "$stubs"
+    AGENT_INSTALL_PATH="$TEST_ROOT/agent63.sh" WRAPPER_PATH="$w" WRAPPER_ENFORCE=1 \
+        BASE_STORAGE="$store" "$SCRIPT_BIN" --agent-mode --config "$CONF_FILE" --action install >> "$LOG_FILE" 2>&1
+    grep -q '^INHIBIT=' "$w" || { echo -e "    ${RED}[FAIL] the wrapper has no INHIBIT${NC}"; return 1; }
+    local s
+    for s in AGENT RSYNC; do
+        printf '#!/bin/sh\necho "%s $*"\n' "$s" > "$stubs/$s"; chmod +x "$stubs/$s"
+        sed -i "s|^$s=.*|$s=\"$stubs/$s\"|" "$w"
+    done
+    printf '#!/bin/sh\necho "$*" >> "%s/inhibit63.log"\nwhile [ "${1#--}" != "$1" ]; do shift; done\nexec "$@"\n' \
+        "$TEST_ROOT" > "$stubs/inhibit"; chmod +x "$stubs/inhibit"
+
+    # Under every POSIX shell present: the wrapper has to work on busybox machines too.
+    printf '#!/bin/sh\nexec busybox sh "$@"\n' > "$stubs/busybox_sh"; chmod +x "$stubs/busybox_sh"
+    local sh n=0
+    for sh in sh dash bash busybox; do
+        command -v "$sh" >/dev/null || continue
+        [ "$sh" = busybox ] && sh="$stubs/busybox_sh"
+        sed -i "s|^INHIBIT=.*|INHIBIT=\"$stubs/inhibit\"|" "$w"
+        out=$(SSH_ORIGINAL_COMMAND="/usr/local/sbin/snapshot-agent.sh --action purge --client alice --retain-daily 7" "$sh" "$w" alice 2>/dev/null)
+        case "$out" in "AGENT --action purge --client alice"*) ;; *) echo -e "    ${RED}[FAIL] $sh, agent: $out${NC}"; return 1 ;; esac
+        out=$(SSH_ORIGINAL_COMMAND="rsync --server -vlogDtprRze.iLsfxCIvu --numeric-ids --delete . $store/alice/daily.0.tmp/" "$sh" "$w" alice 2>/dev/null)
+        case "$out" in "RSYNC --server"*) ;; *) echo -e "    ${RED}[FAIL] $sh, rsync: $out${NC}"; return 1 ;; esac
+        n=$((n + 2))
+        [ "$(grep -c -- '--what=shutdown:sleep --who=snapshot-backup:alice --why=backup of alice running --mode=block' "$TEST_ROOT/inhibit63.log")" -eq "$n" ] \
+            || { echo -e "    ${RED}[FAIL] $sh, inhibitor: $(tail -2 "$TEST_ROOT/inhibit63.log" 2>&1)${NC}"; return 1; }
+        # A refused command takes no inhibitor.
+        SSH_ORIGINAL_COMMAND="rsync -av /etc/shadow $store/alice/" "$sh" "$w" alice >/dev/null 2>&1
+        [ "$(wc -l < "$TEST_ROOT/inhibit63.log")" -eq "$n" ] || { echo -e "    ${RED}[FAIL] $sh: a refused command took an inhibitor${NC}"; return 1; }
+        # Fallback without systemd-inhibit (busybox systems): the process runs directly.
+        sed -i 's|^INHIBIT=.*|INHIBIT=""|' "$w"
+        out=$(SSH_ORIGINAL_COMMAND="/usr/local/sbin/snapshot-agent.sh --agent-mode --action version" "$sh" "$w" alice 2>/dev/null)
+        case "$out" in "AGENT --agent-mode --action version") ;; *) echo -e "    ${RED}[FAIL] $sh, without systemd-inhibit: $out${NC}"; return 1 ;; esac
+    done
+}
+
 test_43_inhibit_sleep_during_the_run() {
     # The host's own guard: a blocking inhibitor while rsync runs, gone afterwards.
     local mb="$TEST_ROOT/mock_inhibit"; mkdir -p "$mb"
@@ -1585,5 +1629,6 @@ run_test_case "59 WOL-Server --mount Holds Until --umount" test_59_wol_mount_hol
 run_test_case "60 --config Replaces the Default" test_60_config_replaces_the_default
 run_test_case "61 Waits for the Network (WOL-Server)" test_61_waits_for_the_network_wol
 run_test_case "62 Waits for the Backup Server" test_62_waits_for_the_backup_server
+run_test_case "63 Wrapper Holds an Inhibitor" test_63_wrapper_holds_an_inhibitor
 
 print_summary

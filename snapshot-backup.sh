@@ -3,7 +3,7 @@
 # ==============================================================================
 ## @file    snapshot-backup.sh
 ## @brief   Unified Snapshot Backup Client & Agent (POSIX sh)
-## @version 19.4
+## @version 19.5
 ##
 ## @note    DEVIATION FROM STRICT POSIX:
 ##          This script utilizes the 'local' keyword for variable scoping.
@@ -29,7 +29,7 @@ umask 0077
 # 1. CONSTANTS & CONFIGURATION DEFAULTS
 # ==============================================================================
 
-SCRIPT_VERSION="19.4"
+SCRIPT_VERSION="19.5"
 EXPECTED_CONFIG_VERSION="2.0"
 
 # --- System Paths ---
@@ -1518,7 +1518,8 @@ do_install_agent() {
             || log "WARN" "Could not create the user '$target_user'."
     fi
     
-    local rsync_bin sftp_bin s
+    local rsync_bin sftp_bin inhibit_bin s
+    inhibit_bin=$(command -v systemd-inhibit 2>/dev/null || true)
     rsync_bin=$(command -v rsync 2>/dev/null || echo /usr/bin/rsync)
     sftp_bin=""
     for s in /usr/lib/openssh/sftp-server /usr/libexec/openssh/sftp-server /usr/libexec/sftp-server /usr/lib/ssh/sftp-server /usr/lib/sftp-server; do
@@ -1536,6 +1537,7 @@ do_install_agent() {
         echo "STORAGE_ROOT=\"$BASE_STORAGE_PATH\""
         echo "RSYNC=\"$rsync_bin\""
         echo "SFTP_SERVER=\"$sftp_bin\""
+        echo "INHIBIT=\"$inhibit_bin\""
         echo "ENFORCE=\"${WRAPPER_ENFORCE:-1}\""
         cat <<'WRAPPER'
 #
@@ -1560,6 +1562,19 @@ CMD="${SSH_ORIGINAL_COMMAND:-}"
 REASON=""
 
 note() { command -v logger >/dev/null 2>&1 && logger -t snapshot-wrapper -- "$*"; return 0; }
+
+# Runs a backup process (agent action, rsync) under a block inhibitor against
+# shutdown and sleep: the process tells the system itself that it is working,
+# so a "power off" that respects inhibitors (wol-sleep on a sleeping backup
+# server) can name it and refuse - no guessing from command lines. Without
+# systemd-inhibit (busybox machines) it runs as it is.
+run() {
+    if [ -n "${INHIBIT:-}" ] && [ -x "$INHIBIT" ]; then
+        exec "$INHIBIT" --what=shutdown:sleep --who="snapshot-backup:${CLIENT:-unpinned}" \
+            --why="backup of ${CLIENT:-an unpinned client} running" --mode=block "$@"
+    fi
+    exec "$@"
+}
 refuse() { REASON="$1"; return 1; }
 
 # a path may be used only inside this client's own tree - also after symlinks are resolved
@@ -1652,9 +1667,9 @@ legacy() {
     set -f
     # shellcheck disable=SC2086
     case "$CMD" in
-        *snapshot-agent.sh*|*--action*) exec "$AGENT" $CMD ;;
+        *snapshot-agent.sh*|*--action*) run "$AGENT" $CMD ;;
         *sftp-server*|internal-sftp) exec "${SFTP_SERVER:-/usr/lib/openssh/sftp-server}" ;;
-        rsync*) exec $CMD ;;
+        rsync*) run $CMD ;;
         *) echo "Access Denied."; exit 1 ;;
     esac
 }
@@ -1671,8 +1686,8 @@ if decide; then
     # shellcheck disable=SC2086
     set -- $CMD
     case "$1" in
-        *snapshot-agent.sh) shift; exec "$AGENT" "$@" ;;
-        *rsync) shift; exec "$RSYNC" "$@" ;;
+        *snapshot-agent.sh) shift; run "$AGENT" "$@" ;;
+        *rsync) shift; run "$RSYNC" "$@" ;;
         *) exec "$SFTP_SERVER" -R -d "$STORAGE_ROOT/$CLIENT" ;;
     esac
 fi
