@@ -3,7 +3,7 @@
 # ==============================================================================
 ## @file    snapshot-backup.sh
 ## @brief   Unified Snapshot Backup Client & Agent (POSIX sh)
-## @version 18.9
+## @version 19.0
 ##
 ## @note    DEVIATION FROM STRICT POSIX:
 ##          This script utilizes the 'local' keyword for variable scoping.
@@ -29,7 +29,7 @@ umask 0077
 # 1. CONSTANTS & CONFIGURATION DEFAULTS
 # ==============================================================================
 
-SCRIPT_VERSION="18.9"
+SCRIPT_VERSION="19.0"
 EXPECTED_CONFIG_VERSION="2.0"
 
 # --- System Paths ---
@@ -109,17 +109,27 @@ PRE_RUN_CMD=""
 PRE_RSYNC_CMD=""
 POST_RUN_CMD=""
 
-# Wakeserver (optional): a machine that sleeps when idle is kept awake for the
-# length of a run through a lease, and/or a local sleep inhibitor.
-POWER_API_URL=""
-POWER_API_TOKEN=""
-POWER_LEASE_HOSTS=""
-POWER_LEASE_MINUTES=240
-POWER_WAIT_SECONDS=0
-POWER_HTTP_CLIENT="auto"
+# WOL-Server (optional, https://github.com/schnebeck/wol-server): a run requests
+# the devices in WOL_DEVICES, which wakes them, keeps them awake with heartbeats
+# and ends the request afterwards. Several clients can share a backup server
+# that way; it sleeps after the last one is done. Empty URL: off.
+WOL_SERVER_URL=""
+WOL_SERVER_TOKEN=""
+WOL_DEVICES=""
+WOL_WAIT_SECONDS=300
+WOL_SLEEP_AFTER="woken"
+WOL_TTL=900
+WOL_HEARTBEAT_SECONDS=300
+_WOL_HELD=""
+_WOL_HEADER=""
+_WOL_BEAT_PID=""
 INHIBIT_SLEEP=false
-_POWER_LEASED=""
 _INHIBIT_PID=""
+
+# The last successful REMOTE run, so that --is-job-done can answer without
+# asking the server: the hourly timer would otherwise wake its disks, or the
+# whole machine, only to hear "done". Empty: always ask the server.
+JOB_DONE_FILE="/var/lib/snapshot-backup/job_done"
 
 RSYNC_PROGRESS_OPTS=""
 RSYNC_ACL_OPT=""
@@ -1747,12 +1757,20 @@ load_config() {
         local var val
         for var in RETAIN_HOURLY RETAIN_DAILY RETAIN_WEEKLY RETAIN_MONTHLY RETAIN_YEARLY \
                    SPACE_LOW_LIMIT_GB SMART_PURGE_SLOTS DEEP_VERIFY_INTERVAL_DAYS \
-                   NETWORK_TIMEOUT LOG_PROGRESS_INTERVAL POWER_LEASE_MINUTES POWER_WAIT_SECONDS; do
+                   NETWORK_TIMEOUT LOG_PROGRESS_INTERVAL WOL_WAIT_SECONDS WOL_TTL WOL_HEARTBEAT_SECONDS; do
             eval "val=\"\${$var:-}\""
             case "$val" in
                 ''|*[!0-9]*) die "Config $config_file: $var must be a whole number, not '$val'." ;;
             esac
         done
+        case "${WOL_SLEEP_AFTER:-}" in
+            true|woken|false) ;;
+            *) die "Config $config_file: WOL_SLEEP_AFTER must be true, woken or false, not '${WOL_SLEEP_AFTER:-}'." ;;
+        esac
+        # The wakeserver (18.8) is no longer developed; its options do nothing now.
+        if [ -n "${POWER_API_URL:-}" ]; then
+            log "WARN" "Config $config_file: POWER_API_URL (wakeserver) is no longer supported - see WOL_SERVER_URL."
+        fi
     fi
     
     if [ -n "${LOCK_DIR:-}" ]; then AGENT_LOCK_DIR="$LOCK_DIR"; fi
@@ -1827,94 +1845,174 @@ run_hook() {
     return $rc
 }
 
-## @brief One request to the wakeserver API; prints the response body.
+## @brief One request to the WOL-Server API: prints the HTTP status on the first
+## line and the answer after it.
 ##
-## $1 = path below /api/v1, $2 = form-encoded body (empty: GET). curl gets the
-## token from a header file, so it never shows in the process list; busybox
-## wget has no such option and takes it as an argument - visible to local
-## users for the duration of the call.
-power_api() {
-    local url="${POWER_API_URL%/}/api/v1/$1" client="${POWER_HTTP_CLIENT:-auto}" rc hfile
-    if [ "$client" = auto ]; then
-        if command -v curl >/dev/null 2>&1; then client=curl
-        elif command -v wget >/dev/null 2>&1; then client=wget
-        else return 127
-        fi
+## $1 = seconds to allow, $2 = method, $3 = path, $4 = JSON body (empty: none).
+## curl only: requests need PUT and DELETE, which busybox wget cannot send. The
+## token comes from a mode-600 header file and never shows in the process list.
+wol_api() {
+    local out code rc
+    out=$(mktemp) || return 1
+    if [ -n "${4:-}" ]; then
+        code=$(curl -sS --max-time "$1" -o "$out" -w '%{http_code}' -X "$2" -H "@$_WOL_HEADER" \
+            -H "Content-Type: application/json" --data "$4" "${WOL_SERVER_URL%/}$3" 2>/dev/null)
+    else
+        code=$(curl -sS --max-time "$1" -o "$out" -w '%{http_code}' -X "$2" -H "@$_WOL_HEADER" \
+            "${WOL_SERVER_URL%/}$3" 2>/dev/null)
     fi
-    case "$client" in
-        curl)
-            hfile=$(mktemp) || return 1
-            chmod 600 "$hfile"
-            printf 'Authorization: Bearer %s\n' "$POWER_API_TOKEN" > "$hfile"
-            if [ -n "$2" ]; then
-                curl -fsS --max-time 20 -H "@$hfile" --data "$2" "$url"
-            else
-                curl -fsS --max-time 20 -H "@$hfile" "$url"
-            fi
-            rc=$?
-            rm -f "$hfile"
-            return $rc
-            ;;
-        wget)
-            if [ -n "$2" ]; then
-                wget -q -O - -T 20 --header "Authorization: Bearer $POWER_API_TOKEN" --post-data "$2" "$url"
-            else
-                wget -q -O - -T 20 --header "Authorization: Bearer $POWER_API_TOKEN" "$url"
-            fi
-            ;;
-        *) return 127 ;;
-    esac
+    rc=$?
+    echo "${code:-000}"
+    cat "$out"
+    rm -f "$out"
+    return $rc
 }
 
-## @brief Waits up to POWER_WAIT_SECONDS for the wakeserver to report $1 awake.
-power_wait_awake() {
-    local wait end state
-    wait=$(sanitize_int "${POWER_WAIT_SECONDS:-0}")
-    [ "$wait" -gt 0 ] || return 0
-    end=$(( $(date +%s) + wait ))
-    while :; do
-        state=$(power_api "hosts/$1/state" "" 2>/dev/null)
-        if [ "$state" = awake ]; then
-            log "INFO" "Wakeserver: $1 is awake."
-            return 0
-        fi
-        if [ "$(date +%s)" -ge "$end" ]; then
-            log "WARN" "Wakeserver: $1 not awake after ${wait}s (state: ${state:-unknown})."
-            return 0
-        fi
-        sleep 5
-    done
+## @brief Prints one field of the flat JSON object on stdin, without quotes.
+## Enough for the WOL-Server's answers, and no jq on the client.
+json_field() {
+    sed -n "s/.*\"$1\": *\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" | head -n 1
 }
 
-## @brief Takes a lease on every POWER_LEASE_HOSTS host for this run.
+## @brief Requests every WOL_DEVICES device for this run.
 ##
-## A lease keeps the wakeserver from putting the host to sleep, and wakes it if
-## it is asleep - the backup client itself, or a sleeping target. The backup
-## never depends on it: a wakeserver that does not answer costs a warning.
-power_lease_acquire() {
-    [ -n "${POWER_API_URL:-}" ] && [ -n "${POWER_LEASE_HOSTS:-}" ] || return 0
-    local holder="snapshot-backup:${CLIENT_NAME}" host minutes
-    minutes=$(sanitize_int "${POWER_LEASE_MINUTES:-240}")
-    for host in $POWER_LEASE_HOSTS; do
-        if power_api "hosts/$host/lease" "holder=$holder&minutes=$minutes" >/dev/null 2>&1; then
-            _POWER_LEASED="$_POWER_LEASED $host"
-            log "INFO" "Wakeserver: lease on $host for $minutes min."
-            power_wait_awake "$host"
-        else
-            log "WARN" "Wakeserver: no lease on $host ($POWER_API_URL did not accept it) - backing up without."
+## The WOL-Server wakes a device that does not answer and waits up to
+## WOL_WAIT_SECONDS for it. While the request is held, it neither puts the
+## device to sleep by schedule nor switches off its plug. The backup never
+## depends on it: a WOL-Server that does not answer costs a warning, and the
+## run finds out by itself whether the target is there.
+wol_request_acquire() {
+    [ -n "${WOL_SERVER_URL:-}" ] && [ -n "${WOL_DEVICES:-}" ] || return 0
+    if ! command -v curl >/dev/null 2>&1; then
+        log "WARN" "WOL-Server: curl is not installed - backing up without requesting $WOL_DEVICES."
+        return 0
+    fi
+    _WOL_HEADER=$(mktemp) || return 0
+    printf 'Authorization: Bearer %s\n' "$WOL_SERVER_TOKEN" > "$_WOL_HEADER"
+
+    local wait dev res code id woken msg sleep_after
+    wait=$(sanitize_int "${WOL_WAIT_SECONDS:-300}")
+    [ "$wait" -gt 300 ] && wait=300  # the WOL-Server's limit
+    for dev in $WOL_DEVICES; do
+        res=$(wol_api $((wait + 30)) POST "/api/devices/$dev/requests?wait=$wait" \
+            "{\"client\": \"snapshot-backup:$CLIENT_NAME\", \"ttl\": $(sanitize_int "$WOL_TTL")}")
+        code=$(echo "$res" | head -n 1)
+        id=$(echo "$res" | sed 1d | json_field id)
+        msg=$(echo "$res" | sed 1d | json_field message)
+        [ -z "$msg" ] && msg=$(echo "$res" | sed 1d | json_field error)
+        if [ -z "$id" ]; then
+            log "WARN" "WOL-Server: no request for $dev (HTTP $code${msg:+: $msg}) - backing up without."
+            continue
         fi
+        # The request stays open on 502 and 504 too: it has to be ended.
+        woken=$(echo "$res" | sed 1d | json_field woken)
+        sleep_after=no
+        if [ "$code" = 201 ]; then
+            case "${WOL_SLEEP_AFTER:-woken}" in
+                true)  sleep_after=yes ;;
+                woken) [ "$woken" = true ] && sleep_after=yes ;;
+            esac
+            if [ "$woken" = true ]; then
+                log "INFO" "WOL-Server: $dev requested and woken."
+            else
+                log "INFO" "WOL-Server: $dev requested (it was awake)."
+            fi
+        else
+            log "WARN" "WOL-Server: $dev requested, but not awake (HTTP $code${msg:+: $msg})."
+        fi
+        _WOL_HELD="$_WOL_HELD $dev=$id=$sleep_after"
     done
+    wol_heartbeat_start
 }
 
-## @brief Gives back every lease this run took; a lease not given back expires.
-power_lease_release() {
-    [ -n "${_POWER_LEASED:-}" ] || return 0
-    local holder="snapshot-backup:${CLIENT_NAME}" host
-    for host in $_POWER_LEASED; do
-        power_api "hosts/$host/release" "holder=$holder" >/dev/null 2>&1 \
-            || log "WARN" "Wakeserver: could not release the lease on $host; it expires by itself."
-    done
-    _POWER_LEASED=""
+## @brief Renews the held requests every WOL_HEARTBEAT_SECONDS while the run lives.
+##
+## Like the sleep inhibitor, the loop watches this process and ends with it:
+## after a kill -9 the requests expire after WOL_TTL instead of holding the
+## device awake for ever.
+wol_heartbeat_start() {
+    [ -n "${_WOL_HELD:-}" ] || return 0
+    local beat step
+    beat=$(sanitize_int "${WOL_HEARTBEAT_SECONDS:-300}")
+    [ "$beat" -gt 0 ] || beat=300
+    step=10
+    [ "$beat" -lt "$step" ] && step=$beat
+    (
+        trap - EXIT HUP INT TERM
+        n=0
+        while kill -0 $$ 2>/dev/null; do
+            sleep "$step"
+            n=$((n + step))
+            [ "$n" -ge "$beat" ] || continue
+            n=0
+            for entry in $_WOL_HELD; do
+                dev=${entry%%=*}; rest=${entry#*=}; id=${rest%%=*}
+                code=$(wol_api 30 PUT "/api/devices/$dev/requests/$id" "" | head -n 1)
+                [ "$code" = 200 ] || log "WARN" "WOL-Server: heartbeat for $dev failed (HTTP $code)."
+            done
+        done
+    ) >/dev/null 2>&1 &
+    _WOL_BEAT_PID=$!
+}
+
+## @brief Ends every request this run holds; a request not ended expires by itself.
+##
+## With sleep_after, the WOL-Server puts the device to sleep once no other
+## client holds it any more, after a short grace period.
+wol_request_release() {
+    # No heartbeat for a request that is about to end
+    if [ -n "${_WOL_BEAT_PID:-}" ]; then
+        kill "$_WOL_BEAT_PID" 2>/dev/null
+        _WOL_BEAT_PID=""
+    fi
+    if [ -n "${_WOL_HELD:-}" ]; then
+        local entry dev rest id sleep_after query code
+        for entry in $_WOL_HELD; do
+            dev=${entry%%=*}; rest=${entry#*=}; id=${rest%%=*}; sleep_after=${rest#*=}
+            query=""
+            [ "$sleep_after" = yes ] && query="?then=sleep"
+            code=$(wol_api 30 DELETE "/api/devices/$dev/requests/$id$query" "" | head -n 1)
+            case "$code" in
+                200) if [ -n "$query" ]; then log "INFO" "WOL-Server: request on $dev ended, sleep requested."
+                     else log "INFO" "WOL-Server: request on $dev ended."; fi ;;
+                404) log "WARN" "WOL-Server: the request on $dev had already expired." ;;
+                *)   log "WARN" "WOL-Server: could not end the request on $dev (HTTP $code); it expires by itself." ;;
+            esac
+        done
+        _WOL_HELD=""
+    fi
+    [ -n "${_WOL_HEADER:-}" ] && rm -f "$_WOL_HEADER"
+    _WOL_HEADER=""
+}
+
+## @brief The job-done record names client, target and base interval: a record
+## made for another config must not answer for this one.
+job_done_key() {
+    echo "$CLIENT_NAME@$REMOTE_HOST:$REMOTE_PORT:$REMOTE_STORAGE_ROOT/$BASE_INTERVAL"
+}
+
+## @brief Notes that the current period is backed up (REMOTE only).
+record_job_done() {
+    [ "$BACKUP_MODE" = "REMOTE" ] && [ -n "${JOB_DONE_FILE:-}" ] || return 0
+    mkdir -p "$(dirname "$JOB_DONE_FILE")" 2>/dev/null
+    printf '%s %s\n' "$(job_done_key)" "$(date +%s)" > "$JOB_DONE_FILE.tmp" 2>/dev/null \
+        && mv -f "$JOB_DONE_FILE.tmp" "$JOB_DONE_FILE" \
+        || log "WARN" "Could not write $JOB_DONE_FILE; --is-job-done will ask the server."
+}
+
+## @brief True if the job-done record covers the current period.
+##
+## Only "done" is trusted: a missing or older record asks the server, which may
+## know better (a run from another config, a record written before an update).
+## A snapshot deleted on the server by hand is noticed in the next period.
+job_done_recorded() {
+    [ -n "${JOB_DONE_FILE:-}" ] && [ -r "$JOB_DONE_FILE" ] || return 1
+    local line ts
+    line=$(head -n 1 "$JOB_DONE_FILE" 2>/dev/null)
+    [ "${line% *}" = "$(job_done_key)" ] || return 1
+    ts=$(sanitize_int "${line##* }")
+    [ "$ts" -gt 0 ] || return 1
+    [ "$(is_backup_older_than_current_period "$BASE_INTERVAL" "$ts" "$START_TIME")" = "false" ]
 }
 
 ## @brief Holds a blocking sleep inhibitor for as long as this run lives.
@@ -1978,7 +2076,7 @@ cleanup() {
     fi
 
     # After the POST hook, which may still need the machine awake.
-    power_lease_release
+    wol_request_release
     inhibit_sleep_stop
 }
 
@@ -2100,25 +2198,30 @@ PRE_RUN_CMD="$PRE_RUN_CMD"
 PRE_RSYNC_CMD="$PRE_RSYNC_CMD"
 POST_RUN_CMD="$POST_RUN_CMD"
 
-# Wakeserver (optional)
+# WOL-Server (optional; empty URL: off)
 #
-# For a machine that sleeps when idle. POWER_LEASE_HOSTS names the hosts the
-# wakeserver keeps awake (and wakes) while a run lasts - usually this machine
-# itself, or a sleeping backup server. The token comes from
-# "python3 -m wakeserver new-token NAME" on the wakeserver. Empty URL: off.
-# INHIBIT_SLEEP=true also holds a local blocking sleep inhibitor during a run;
+# For a backup server that sleeps and is woken by a WOL-Server
+# (https://github.com/schnebeck/wol-server). A run requests the devices in
+# WOL_DEVICES (their names or IDs on the WOL-Server), which wakes them, and ends
+# the request afterwards. WOL_SLEEP_AFTER: woken = ask for sleep only for a
+# device this run woke, true = always, false = never. The WOL-Server lets the
+# device sleep only when no other client holds it any more. The token comes
+# from System -> API tokens on the WOL-Server; keep this file mode 600 then.
+# Needs curl.
+# INHIBIT_SLEEP=true holds a local blocking sleep inhibitor during a run;
 # leave it off on laptops, where closing the lid must still suspend.
-POWER_API_URL="$POWER_API_URL"
-POWER_API_TOKEN="$POWER_API_TOKEN"
-POWER_LEASE_HOSTS="$POWER_LEASE_HOSTS"
-POWER_LEASE_MINUTES=$POWER_LEASE_MINUTES
-POWER_WAIT_SECONDS=$POWER_WAIT_SECONDS
-POWER_HTTP_CLIENT="$POWER_HTTP_CLIENT"
+WOL_SERVER_URL="$WOL_SERVER_URL"
+WOL_SERVER_TOKEN="$WOL_SERVER_TOKEN"
+WOL_DEVICES="$WOL_DEVICES"
+WOL_WAIT_SECONDS=$WOL_WAIT_SECONDS
+WOL_SLEEP_AFTER="$WOL_SLEEP_AFTER"
 INHIBIT_SLEEP=$INHIBIT_SLEEP
 
 # System
 LOGFILE="$LOGFILE"
 PIDFILE="$PIDFILE"
+# REMOTE: the last successful run, so --is-job-done need not ask the server.
+JOB_DONE_FILE="$JOB_DONE_FILE"
 LOG_PROGRESS_INTERVAL=$LOG_PROGRESS_INTERVAL
 RSYNC_EXTRA_OPTS="$RSYNC_EXTRA_OPTS"
 ENABLE_NOTIFICATIONS=$ENABLE_NOTIFICATIONS
@@ -2497,9 +2600,16 @@ check_is_job_done_cli() {
         local res
         # Query the agent using the configured timeout to prevent hanging on network issues.
         # We filter the output (tail/tr) to strip potential SSH banners or MOTD noise.
+        # The local record first: the hourly timer asks every hour, and every
+        # question over SSH spins up the server's disks, or wakes it.
+        if job_done_recorded; then
+            echo "true"
+            exit 0
+        fi
         res=$(run_remote_cmd_with_timeout "$NETWORK_TIMEOUT" "$REMOTE_AGENT --action check-job-done --client $CLIENT_NAME" 2>/dev/null | tail -n 1 | tr -d '[:space:]')
 
         if [ "$res" = "true" ]; then
+            record_job_done
             echo "true"
             exit 0
         else
@@ -2659,7 +2769,7 @@ client_main() {
             _HOOKS_ARMED=true
             _RUN_EXIT_CODE=1
             inhibit_sleep_start
-            power_lease_acquire
+            wol_request_acquire
             if ! run_hook "PRE_RUN_CMD" "${PRE_RUN_CMD:-}"; then
                 die "PRE_RUN_CMD failed - not backing up."
             fi
@@ -2683,6 +2793,7 @@ client_main() {
             fi
             
             _RUN_EXIT_CODE=0
+            record_job_done
             rmdir "$LOCK_DIR" 2>/dev/null
             rm -f "$PIDFILE"
             collect_stats "$LOGFILE"

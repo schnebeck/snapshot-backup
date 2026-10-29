@@ -6,8 +6,8 @@
 # @details   Triggers snapshot-backup.sh based on network events, power state,
 #            trusted networks, and specific safety pre-checks.
 #
-# @version   5.1 (Added: timer trigger, trust over all active connections,
-#                  RUN_ONCE_PER_PERIOD)
+# @version   5.2 (Added: "done" is checked before the server is asked; with a
+#                  WOL-Server the run wakes the target)
 # @license   GPLv3
 # ==============================================================================
 
@@ -55,6 +55,8 @@ declare -a HOME_NETWORKS=()
 # true:  a network event backs up only if this period has no backup yet.
 # The timer always behaves as "true".
 RUN_ONCE_PER_PERIOD=false
+# Set in section 6: the target is woken by the run (WOL-Server), not checked here.
+WOKEN_BY_RUN=false
 
 # ==============================================================================
 # 2. HELPER FUNCTIONS
@@ -180,9 +182,47 @@ run_logic() {
         exit 1
     fi
 
-    # 5. Basic Connectivity Checks
+    # 5. Local checks first: they never touch the backup server. Before 5.2 the
+    #    hourly timer asked the server for storage and "done" every hour, and
+    #    each question spun up its disks (snapshot-backup.sh now answers
+    #    --is-job-done from its record of the last run).
+
+    # Check A: Prevent concurrent backup executions
+    if "$BACKUP_SCRIPT" --is-running --timeout "$CHECK_TIMEOUT" >/dev/null 2>&1; then
+        log "SKIP: Safety Check 'is-running' failed (Instance already active)."
+        exit 0
+    fi
+    log "TEST: No existing backup process detected."
+
+    # Check B: Verify if the job is already completed for the current interval.
+    # Always for the timer, which would otherwise back up every hour; for network
+    # events only with RUN_ONCE_PER_PERIOD=true (see section 1).
+    if [ "$MODE" = timer ] || [ "$RUN_ONCE_PER_PERIOD" = true ]; then
+        if "$BACKUP_SCRIPT" --is-job-done --timeout "$CHECK_TIMEOUT" >/dev/null 2>&1; then
+            log "SKIP: Safety Check 'is-job-done' failed (Interval already covered)."
+            exit 0
+        fi
+        log "TEST: Backup interval is open; job is required."
+    fi
+
+    # 6. The target. With a WOL-Server (WOL_SERVER_URL and WOL_DEVICES in the
+    #    backup config) the target may be asleep: the run requests it, which
+    #    wakes it. Then only the WOL-Server has to answer.
     local connectivity_ok=false
-    if [ "$BACKUP_MODE" == "REMOTE" ]; then
+    if [ "$BACKUP_MODE" == "REMOTE" ] && [ -n "${WOL_SERVER_URL:-}" ] && [ -n "${WOL_DEVICES:-}" ]; then
+        local hostport host port
+        hostport="${WOL_SERVER_URL#*://}"; hostport="${hostport%%/*}"
+        host="${hostport%:*}"; port="${hostport##*:}"
+        if [ "$host" = "$hostport" ]; then
+            port=80; [ "${WOL_SERVER_URL%%://*}" = https ] && port=443
+        fi
+        log "CHECK: Connectivity to the WOL-Server ($host:$port)..."
+        if timeout 5 bash -c "</dev/tcp/$host/$port" 2>/dev/null; then
+            log "TEST: WOL-Server answers; the run wakes $WOL_DEVICES."
+            connectivity_ok=true
+            WOKEN_BY_RUN=true
+        fi
+    elif [ "$BACKUP_MODE" == "REMOTE" ]; then
         log "CHECK: Connectivity to Remote Host ($REMOTE_HOST)..."
         local port
         port=$(echo "$REMOTE_PORT" | awk '{print $1}')
@@ -201,31 +241,14 @@ run_logic() {
         exit 0
     fi
 
-    # 6. Advanced Safety Invariants (Script-based checks)
-    
-    # Check A: Verify storage availability and writability
-    if ! "$BACKUP_SCRIPT" --has-storage --timeout "$CHECK_TIMEOUT" >/dev/null 2>&1; then
-        log "SKIP: Safety Check 'has-storage' failed (Target unreachable/unwritable)."
-        exit 0
-    fi
-    log "TEST: Storage is verified and available."
-
-    # Check B: Prevent concurrent backup executions
-    if "$BACKUP_SCRIPT" --is-running --timeout "$CHECK_TIMEOUT" >/dev/null 2>&1; then
-        log "SKIP: Safety Check 'is-running' failed (Instance already active)."
-        exit 0
-    fi
-    log "TEST: No existing backup process detected."
-
-    # Check C: Verify if the job is already completed for the current interval.
-    # Always for the timer, which would otherwise back up every hour; for network
-    # events only with RUN_ONCE_PER_PERIOD=true (see section 1).
-    if [ "$MODE" = timer ] || [ "$RUN_ONCE_PER_PERIOD" = true ]; then
-        if "$BACKUP_SCRIPT" --is-job-done --timeout "$CHECK_TIMEOUT" >/dev/null 2>&1; then
-            log "SKIP: Safety Check 'is-job-done' failed (Interval already covered)."
+    # Check C: Verify storage availability and writability - not for a target
+    # that the run has yet to wake.
+    if [ "$WOKEN_BY_RUN" = false ]; then
+        if ! "$BACKUP_SCRIPT" --has-storage --timeout "$CHECK_TIMEOUT" >/dev/null 2>&1; then
+            log "SKIP: Safety Check 'has-storage' failed (Target unreachable/unwritable)."
             exit 0
         fi
-        log "TEST: Backup interval is open; job is required."
+        log "TEST: Storage is verified and available."
     fi
 
     # 7. Final Execution via Systemd

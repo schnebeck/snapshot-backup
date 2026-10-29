@@ -30,9 +30,11 @@ printf '#!/bin/sh\necho "$*" >> "%s/triggered"\n' "$T" > "$T/bin/systemd-run"
 printf '#!/bin/sh\nexit 1\n' > "$T/bin/on_ac_power"
 # nmcli: the active connections, one per line, in the order of $T/active
 printf '#!/bin/sh\ncat "%s/active"\n' "$T" > "$T/bin/nmcli"
-# snapshot-backup.sh: --has-storage succeeds, --is-running fails, --is-job-done reads $T/done
+# snapshot-backup.sh: --has-storage succeeds, --is-running fails, --is-job-done reads $T/done;
+# every call is noted in $T/calls
 cat > "$T/bin/backup" <<EOF
 #!/bin/sh
+echo "\$1" >> "$T/calls"
 case "\$1" in
   --has-storage) exit 0 ;;
   --is-running)  exit 1 ;;
@@ -41,15 +43,19 @@ esac
 exit 0
 EOF
 chmod +x "$T/bin/"*
-cat > "$T/backup.conf" <<EOF
-BACKUP_MODE="REMOTE"
-REMOTE_HOST="127.0.0.1"
-REMOTE_PORT="$PORT"
-EOF
+
+# backup_conf [extra lines...]: the backup config, the server's sshd on $PORT
+backup_conf() {
+    { echo 'BACKUP_MODE="REMOTE"'
+      echo 'REMOTE_HOST="127.0.0.1"'
+      echo "REMOTE_PORT=\"$PORT\""
+      printf '%s\n' "$@"; } > "$T/backup.conf"
+}
 
 # setup <ac 0|1> <active connections, comma separated> <done 0|1> [dispatcher config lines...]
 setup() {
-    rm -f "$T/triggered" "$T/log" "$T/done"
+    rm -f "$T/triggered" "$T/log" "$T/done" "$T/calls"
+    backup_conf
     echo "$1" > "$T/ps/AC/online"
     printf '%s\n' "$2" | tr ',' '\n' > "$T/active"
     [ "$3" = 1 ] && touch "$T/done"
@@ -73,6 +79,12 @@ dispatch() {
         grep -qE "^(SKIP|TRIGGER|ERROR)" "$T/log" 2>/dev/null && break
         sleep 0.1; i=$((i+1))
     done
+}
+
+not_asked() {  # not_asked <option> <name>: the check never reached the backup script
+    RUN=$((RUN+1))
+    if ! grep -qx -- "$1" "$T/calls" 2>/dev/null; then printf "%-66s ${GREEN}PASS${NC}\n" "$2"
+    else FAILED=$((FAILED+1)); printf "%-66s ${RED}FAIL${NC} (calls: %s)\n" "$2" "$(tr '\n' ' ' < "$T/calls")"; fi
 }
 
 expect() {  # expect <triggered|skipped> <name>
@@ -102,6 +114,30 @@ expect skipped "timer: on battery -> no backup"
 setup 1 "Hotel-WiFi,schnebeck.de VPN" 0
 dispatch - timer
 expect triggered "timer: away, VPN up and trusted -> backs up over the VPN"
+
+# --- 5.2: the server is asked only when a backup is due --------------------
+setup 1 "MeyersGarten" 1
+dispatch - timer
+expect skipped "timer: done this period -> skips"
+not_asked --has-storage "timer: done this period -> the server is not asked for storage"
+
+# A sleeping target: its sshd does not answer (port 1), the WOL-Server does.
+setup 1 "MeyersGarten" 0
+backup_conf "WOL_SERVER_URL=\"http://127.0.0.1:$PORT\"" 'WOL_DEVICES="backup"'
+sed -i "s/^REMOTE_PORT=.*/REMOTE_PORT=\"1\"/" "$T/backup.conf"
+dispatch - timer
+expect triggered "timer: target asleep, WOL-Server answers -> backs up (the run wakes it)"
+not_asked --has-storage "timer: target asleep -> no storage check before the run"
+
+setup 1 "MeyersGarten" 0
+backup_conf 'WOL_SERVER_URL="http://127.0.0.1:1/"' 'WOL_DEVICES="backup"'
+dispatch - timer
+expect skipped "timer: WOL-Server does not answer -> no backup"
+
+setup 1 "MeyersGarten" 0
+sed -i "s/^REMOTE_PORT=.*/REMOTE_PORT=\"1\"/" "$T/backup.conf"
+dispatch - timer
+expect skipped "timer: target asleep, no WOL-Server -> no backup (as before)"
 
 # --- event behaviour that must not change -----------------------------------
 setup 1 "MeyersGarten" 0

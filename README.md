@@ -188,8 +188,8 @@ A single line handles all retention levels (Daily, Weekly, Monthly...):
 
 Ideal for laptops: backs up automatically when on a trusted network and on AC power.
 The repository's `Network-Manager-Dispatcher-Start-Backup.sh` does that, with checks before
-every run: AC power, a trusted network, the backup server reachable and writable, no backup
-running already — and, where wanted, none done yet this period.
+every run: AC power, a trusted network, no backup running already, where wanted none done yet
+this period — and only then the backup server reachable and writable.
 
 ```
 sudo install -m 755 Network-Manager-Dispatcher-Start-Backup.sh /etc/NetworkManager/dispatcher.d/30-backup-control.sh
@@ -224,9 +224,35 @@ Decisions are logged to the journal: `journalctl -t nm-backup-dispatcher`. Every
 reason (battery, untrusted network, target unreachable, already done). `bash test-dispatcher.sh`
 runs the script against stubs, without root and without NetworkManager.
 
+Dispatcher 5.2 (2026-10-29): "done this period?" comes before any question to the backup server,
+and `--is-job-done` answers from the record of the last run (`JOB_DONE_FILE`). Before, the hourly
+timer asked the server for storage and "done" every hour, and each question over SSH spun up its
+disks. With a WOL-Server (next section) the dispatcher checks the WOL-Server instead of the
+sleeping target; the run wakes it.
+
 Dispatcher 5.1 (2026-10-13): the timer, and the trust check looks at every active connection
 when no event names one — before, it took the first line of `nmcli connection show --active`,
 which with a VPN up is the tunnel, not the home Wi-Fi.
+
+### A Backup Server That Sleeps (WOL-Server, optional)
+
+Most setups do not need this: the backup server simply runs. If it sleeps and a
+[WOL-Server](https://github.com/schnebeck/wol-server) wakes it, a run can **request** it there:
+
+```
+WOL_SERVER_URL="https://wol.example.org"
+WOL_SERVER_TOKEN="…"            # WOL-Server: System → API tokens; then chmod 600 the config
+WOL_DEVICES="backup"            # the backup server's name (or ID) on the WOL-Server
+```
+
+The run requests the device before anything else, which wakes it and waits up to
+`WOL_WAIT_SECONDS` for it; keeps the request alive with heartbeats while it runs; and ends it in
+the cleanup path, also after a failure. While a request is open, the WOL-Server neither puts the
+device to sleep by schedule nor switches off its plug. When the last client is done, it puts the
+device to sleep — several clients share one backup server without cutting each other off.
+`WOL_SLEEP_AFTER` (default `woken`) asks for that sleep only if this run woke the device: a
+server that was already on because someone works on it stays on. The backup never depends on
+the WOL-Server; unreachable, it costs a warning. Needs `curl`.
 
 ## 📂 Restore
 
@@ -303,7 +329,7 @@ What it does *not* do is verify authorship: HTTPS establishes that the file came
 
 **`--is-running`** Checks if a backup process is currently active. Returns exit code `0` if running, `1` if idle. Useful for monitoring scripts or status bars.
 
-**`--is-job-done`** Checks if a valid backup for the current Base Interval (e.g., today for `daily`) already exists. Returns exit code `0` (true) if done, `1` (false) if a backup is needed.
+**`--is-job-done`** Checks if a valid backup for the current Base Interval (e.g., today for `daily`) already exists. Returns exit code `0` (true) if done, `1` (false) if a backup is needed. In REMOTE mode it first reads the record of the last successful run (`JOB_DONE_FILE`) and asks the server only if that does not cover the current period.
 
 **`--has-storage`** Checks if the backup storage is accessible and writable. Returns exit code `0` (true) on success, `1` (false) on failure.
 
@@ -418,26 +444,26 @@ Minimum free space (in GB) required on the target. If free space is below this l
 **`SMART_PURGE_SLOTS`** (Default: `0`)
 How many of the oldest base snapshots may be deleted before a transfer when `SPACE_LOW_LIMIT_GB` is reached. Only the base interval is touched, and never its `.0` — weekly and monthly history is not traded for space automatically. If space is still short afterwards, the run proceeds and fails loudly rather than purging further.
 
-**`POWER_API_URL`** (Default: empty = off)
-Base URL of a wakeserver (a separate project), e.g. `http://10.1.1.8:8080`, for machines that sleep when idle. While a run lasts, it holds a lease on each host in `POWER_LEASE_HOSTS`: the wakeserver neither puts that host to sleep nor leaves it asleep. The backup never depends on it — a wakeserver that does not answer costs a warning in the log, nothing more. The lease is released in the cleanup path, so also after a failure or a signal; one that is not released expires by itself.
+**`WOL_SERVER_URL`** (Default: empty = off)
+Base URL of a [WOL-Server](https://github.com/schnebeck/wol-server), e.g. `https://wol.example.org`, for a backup server that sleeps (see *A Backup Server That Sleeps*). A run requests each device in `WOL_DEVICES` and ends the request in the cleanup path, so also after a failure or a signal; a request that is not ended expires after 15 minutes without heartbeat. The backup never depends on it — a WOL-Server that does not answer costs a warning in the log, nothing more. Needs `curl`: requests use PUT and DELETE, which busybox `wget` cannot send.
 
-**`POWER_API_TOKEN`** (Default: empty)
-The bearer token from `python3 -m wakeserver new-token NAME` on the wakeserver. With curl it is passed through a mode-600 header file and never appears in the process list; busybox `wget` only takes it as an argument, visible to local users for the length of the call.
+**`WOL_SERVER_TOKEN`** (Default: empty)
+An API token from *System → API tokens* on the WOL-Server. curl gets it through a mode-600 header file, so it never appears in the process list; keep the config file mode 600 as well.
 
-**`POWER_LEASE_HOSTS`** (Default: empty)
-Space-separated wakeserver host names to keep awake: usually this machine itself, or a backup server that sleeps.
+**`WOL_DEVICES`** (Default: empty)
+Space-separated device names or IDs on the WOL-Server, usually the backup server.
 
-**`POWER_LEASE_MINUTES`** (Default: `240`)
-Length of the lease. A run that outlasts it is not interrupted; the host's own agent refuses to sleep while `INHIBIT_SLEEP` holds its inhibitor.
+**`WOL_WAIT_SECONDS`** (Default: `300`, at most `300`)
+How long the WOL-Server waits for a device it had to wake. A device that does not come up in time costs a warning; the run then finds out for itself whether the target is there.
 
-**`POWER_WAIT_SECONDS`** (Default: `0`)
-After taking a lease, wait up to this long for the wakeserver to report the host `awake` — for a target that had to be woken. `0` does not wait.
-
-**`POWER_HTTP_CLIENT`** (Default: `auto`)
-`curl`, `wget` (also busybox), or `auto`: curl if installed, otherwise wget.
+**`WOL_SLEEP_AFTER`** (Default: `woken`)
+When the request ends, ask the WOL-Server to put the device to sleep: `woken` only if this run woke it, `true` always, `false` never. The WOL-Server waits for every other client that holds the device, plus a grace period of two minutes.
 
 **`INHIBIT_SLEEP`** (Default: `false`)
 Hold a blocking `systemd-inhibit` sleep lock while a run lasts. The lock watches the backup process and ends with it, even after `kill -9`. Leave it off on laptops, where closing the lid must still suspend.
+
+**`JOB_DONE_FILE`** (Default: `/var/lib/snapshot-backup/job_done`)
+REMOTE mode: the record of the last successful run (client, server, base interval, time). `--is-job-done` answers from it while it covers the current period, without asking the server — the hourly timer would otherwise spin up the server's disks, or wake it, every hour only to hear "done". A missing or older record asks the server, as before. A snapshot deleted on the server by hand is noticed in the next period. Empty: always ask the server.
 
 **`DEEP_VERIFY_INTERVAL_DAYS`** (Default: `35`)
 Automatically force a `--verify` run every N days to detect bit-rot.
@@ -516,11 +542,14 @@ Consequently a client key can no longer **deploy** the agent (`--deploy-agent`, 
 ---
 
 ## 📆 Version History
+- **v19.0:** A backup server that sleeps, and an hourly timer that lets it.
+  - **WOL-Server requests** (`WOL_*`, optional) replace the wakeserver leases (`POWER_*`): the wakeserver is no longer developed. A run requests the backup server on a [WOL-Server](https://github.com/schnebeck/wol-server), which wakes it, keeps the request alive with heartbeats and ends it in the cleanup path — asking for sleep if it woke the device (`WOL_SLEEP_AFTER`). Several clients share the server; it sleeps after the last one. A config that still sets `POWER_API_URL` backs up and logs a warning. Tests 38–42, 54, 56.
+  - **`--is-job-done` answers locally** in REMOTE mode from the record of the last successful run (`JOB_DONE_FILE`), and the dispatcher (5.2) asks "done?" before it asks the server anything. Before, the hourly timer reached the server every hour over SSH — and the agent's storage check and `chmod` pass spun up its disks each time. Test 55, test 10.
 - **v18.9:** A comment in a list is a comment.
   - A `#` line between the quotes of `SOURCE_DIRS`, `EXCLUDE_PATTERNS` or `EXCLUDE_MOUNTPOINTS` was not a comment: every word of it became a list item (issue #2). In `SOURCE_DIRS` those were missing sources — skipped silently up to 18.7, fatal since 18.8, which stopped the nightly backup of configs that had run for weeks. In `EXCLUDE_PATTERNS` each word became an exclude, and files or directories named `a`, `the`, `keep`, … were left out of every snapshot anywhere in the tree without a word. A word starting with `#` now ends the line, also behind an item; quoted (`"#*#"`) it is still an item.
   - A quoted item with a space in it (`"/home/me/my docs"`) became two items, `/home/me/my` and `docs"`. Quoting works now; a quote left open hands on what it collected instead of dropping the item, and `""` is no item at all. Tabs separate items as spaces do — a tab-indented line used to be one item with its quotes still on. Test 53.
 - **v18.8:** Machines that sleep when idle, and no more success that was not one.
-  - A run can hold a lease on a wakeserver (a separate project) (`POWER_*`) and a local blocking sleep inhibitor (`INHIBIT_SLEEP`), both released in the cleanup path. The wakeserver is optional for the run: unreachable, it costs a warning. curl or busybox wget; the token stays out of the process list with curl. Tests 38–43.
+  - A run can hold a lease on a wakeserver (a separate project; replaced by the WOL-Server in 19.0) (`POWER_*`) and a local blocking sleep inhibitor (`INHIBIT_SLEEP`), both released in the cleanup path. The wakeserver is optional for the run: unreachable, it costs a warning. curl or busybox wget; the token stays out of the process list with curl. Tests 38–43.
   - **Every snapshot shared one timestamp.** The rotation's `cp -al` links `.backup_timestamp` into the new snapshot, and `rsync -R` deletes only below the source paths, so the link survived — and the commit wrote into it. Each rotation gave the previous snapshot today's date as well; over the weeks the whole chain, weekly and monthly included, came to share one file. No period ever looked new, nothing was promoted, and retention deleted the history: after 60 days a chain held seven dailies and the very first snapshot, all dated today. Affected: every source other than `/`, in REMOTE mode and, since 18.7, in LOCAL mode (with `/` the `--delete` reaches the snapshot root and removed the link in time). The commit now writes a new file. Existing chains recover from the next run on; the dates shown for older snapshots stay wrong. Test 52.
   - `--setup-remote` and `--deploy-agent` reported `Agent deployed.` and exit 0 when nothing reached the server (issue #1). Each step is checked now, setup stops at the first one that fails, and the exit code says so; copy, install and lock all go to the host on the command line (the install and the lock used to go to the configured one); `ssh-copy-id` is given `REMOTE_PORT`. Test 44.
   - The commit's and the promotion's renames were not checked: a rotation that failed reported success, and the next `mv` put the new snapshot *inside* the old `.0`. They now stop at the first failure and the run fails — locally, and through the agent's `commit` and `purge`, which never failed before. Test 48.
