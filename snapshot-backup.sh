@@ -3,7 +3,7 @@
 # ==============================================================================
 ## @file    snapshot-backup.sh
 ## @brief   Unified Snapshot Backup Client & Agent (POSIX sh)
-## @version 19.1
+## @version 19.2
 ##
 ## @note    DEVIATION FROM STRICT POSIX:
 ##          This script utilizes the 'local' keyword for variable scoping.
@@ -29,7 +29,7 @@ umask 0077
 # 1. CONSTANTS & CONFIGURATION DEFAULTS
 # ==============================================================================
 
-SCRIPT_VERSION="19.1"
+SCRIPT_VERSION="19.2"
 EXPECTED_CONFIG_VERSION="2.0"
 
 # --- System Paths ---
@@ -121,6 +121,8 @@ WOL_WAIT_SECONDS=300
 WOL_SLEEP_AFTER="woken"
 WOL_TTL=900
 WOL_HEARTBEAT_SECONDS=300
+# The requests a --mount holds until --umount: "<mountpoint> device=id=sleep ..."
+WOL_MOUNT_FILE="/var/lib/snapshot-backup/wol_mount"
 _WOL_HELD=""
 _WOL_HEADER=""
 _WOL_BEAT_PID=""
@@ -1903,39 +1905,54 @@ json_field() {
     sed -n "s/.*\"$1\": *\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" | head -n 1
 }
 
-## @brief Requests every WOL_DEVICES device for this run.
+## @brief Prepares the calls to the WOL-Server: the header file with the token
+## and --resolve. False when no WOL-Server is configured or curl is missing.
+wol_open() {
+    [ -n "${WOL_SERVER_URL:-}" ] && [ -n "${WOL_DEVICES:-}" ] || return 1
+    if ! command -v curl >/dev/null 2>&1; then
+        log "WARN" "WOL-Server: curl is not installed - going on without requesting $WOL_DEVICES."
+        return 1
+    fi
+    if [ -z "${_WOL_HEADER:-}" ]; then
+        _WOL_HEADER=$(mktemp) || return 1
+        printf 'Authorization: Bearer %s\n' "$WOL_SERVER_TOKEN" > "$_WOL_HEADER"
+    fi
+    wol_resolve_prepare
+}
+
+## @brief Requests every WOL_DEVICES device.
+##
+## $1 = what for: empty for a backup run, "status" or "mount" - it shows in the
+## client name on the WOL-Server; $2 = ttl in seconds (0: until released).
 ##
 ## The WOL-Server wakes a device that does not answer and waits up to
 ## WOL_WAIT_SECONDS for it. While the request is held, it neither puts the
-## device to sleep by schedule nor switches off its plug. The backup never
-## depends on it: a WOL-Server that does not answer costs a warning, and the
-## run finds out by itself whether the target is there.
+## device to sleep by schedule nor switches off its plug. Nothing here depends
+## on it: a WOL-Server that does not answer costs a warning, and the caller
+## finds out by itself whether the target is there.
 wol_request_acquire() {
-    [ -n "${WOL_SERVER_URL:-}" ] && [ -n "${WOL_DEVICES:-}" ] || return 0
-    if ! command -v curl >/dev/null 2>&1; then
-        log "WARN" "WOL-Server: curl is not installed - backing up without requesting $WOL_DEVICES."
-        return 0
-    fi
-    _WOL_HEADER=$(mktemp) || return 0
-    printf 'Authorization: Bearer %s\n' "$WOL_SERVER_TOKEN" > "$_WOL_HEADER"
-    wol_resolve_prepare
-
-    local wait dev res code id woken msg sleep_after
+    wol_open || return 0
+    local purpose="${1:-}" ttl="${2:-$WOL_TTL}" client wait dev res code id woken waited msg sleep_after
+    client="snapshot-backup:$CLIENT_NAME${purpose:+ ($purpose)}"
     wait=$(sanitize_int "${WOL_WAIT_SECONDS:-300}")
     [ "$wait" -gt 300 ] && wait=300  # the WOL-Server's limit
     for dev in $WOL_DEVICES; do
+        # Waking takes as long as the machine needs to start. Said before the
+        # call that waits for it, or an interactive --status seems to hang.
+        log "INFO" "WOL-Server: requesting $dev - if it is asleep, waking it can take up to $wait s."
         res=$(wol_api $((wait + 30)) POST "/api/devices/$dev/requests?wait=$wait" \
-            "{\"client\": \"snapshot-backup:$CLIENT_NAME\", \"ttl\": $(sanitize_int "$WOL_TTL")}")
+            "{\"client\": \"$client\", \"ttl\": $(sanitize_int "$ttl")}")
         code=$(echo "$res" | head -n 1)
         id=$(echo "$res" | sed 1d | json_field id)
         msg=$(echo "$res" | sed 1d | json_field message)
         [ -z "$msg" ] && msg=$(echo "$res" | sed 1d | json_field error)
         if [ -z "$id" ]; then
-            log "WARN" "WOL-Server: no request for $dev (HTTP $code${msg:+: $msg}) - backing up without."
+            log "WARN" "WOL-Server: no request for $dev (HTTP $code${msg:+: $msg}) - going on without."
             continue
         fi
         # The request stays open on 502 and 504 too: it has to be ended.
         woken=$(echo "$res" | sed 1d | json_field woken)
+        waited=$(echo "$res" | sed 1d | json_field waited)
         sleep_after=no
         if [ "$code" = 201 ]; then
             case "${WOL_SLEEP_AFTER:-woken}" in
@@ -1943,7 +1960,7 @@ wol_request_acquire() {
                 woken) [ "$woken" = true ] && sleep_after=yes ;;
             esac
             if [ "$woken" = true ]; then
-                log "INFO" "WOL-Server: $dev requested and woken."
+                log "INFO" "WOL-Server: $dev requested and woken${waited:+ (awake after $waited s)}."
             else
                 log "INFO" "WOL-Server: $dev requested (it was awake)."
             fi
@@ -1952,7 +1969,37 @@ wol_request_acquire() {
         fi
         _WOL_HELD="$_WOL_HELD $dev=$id=$sleep_after"
     done
-    wol_heartbeat_start
+}
+
+## @brief Hands the requests of a --mount over to WOL_MOUNT_FILE: the command
+## ends, the mount stays, and --umount ends them.
+wol_hold_for_mount() {
+    [ -n "${_WOL_HELD:-}" ] || return 0
+    if [ -z "${WOL_MOUNT_FILE:-}" ] || ! { mkdir -p "$(dirname "$WOL_MOUNT_FILE")" 2>/dev/null \
+            && printf '%s%s\n' "$1" "$_WOL_HELD" >> "$WOL_MOUNT_FILE"; }; then
+        log "WARN" "WOL-Server: cannot note the request in ${WOL_MOUNT_FILE:-WOL_MOUNT_FILE}; it ends now, and $WOL_DEVICES may sleep while mounted."
+        return 0
+    fi
+    _WOL_HELD=""
+    log "INFO" "WOL-Server: $WOL_DEVICES stays awake until --umount $1."
+}
+
+## @brief Ends the requests a --mount of $1 holds.
+wol_release_for_mount() {
+    [ -n "${WOL_MOUNT_FILE:-}" ] && [ -f "$WOL_MOUNT_FILE" ] || return 0
+    local held
+    held=$(awk -v mp="$1" '$1 == mp { $1 = ""; print }' "$WOL_MOUNT_FILE" | tr '\n' ' ')
+    [ -n "$(echo $held)" ] || return 0
+    awk -v mp="$1" '$1 != mp' "$WOL_MOUNT_FILE" > "$WOL_MOUNT_FILE.tmp" && mv -f "$WOL_MOUNT_FILE.tmp" "$WOL_MOUNT_FILE"
+    [ -s "$WOL_MOUNT_FILE" ] || rm -f "$WOL_MOUNT_FILE"
+    wol_open || return 0
+    _WOL_HELD="$held"
+    wol_request_release
+}
+
+## @brief The mount point as --mount and --umount both name it.
+mount_key() {
+    readlink -f "$1" 2>/dev/null || echo "$1"
 }
 
 ## @brief Renews the held requests every WOL_HEARTBEAT_SECONDS while the run lives.
@@ -2354,6 +2401,8 @@ show_status() {
     echo "LATEST SNAPSHOTS:"
     if [ "$BACKUP_MODE" = "REMOTE" ]; then
         echo "Fetching remote status from $REMOTE_HOST..."
+        # A sleeping server is woken for this; the cleanup ends the request.
+        wol_request_acquire status
         if ! run_remote_cmd "$REMOTE_AGENT --action status --client $CLIENT_NAME" 2>/dev/null; then
              echo "Error: Connection failed or Agent not found."
         fi
@@ -2591,10 +2640,15 @@ do_mount() {
 
     if [ "$BACKUP_MODE" = "REMOTE" ]; then
         command -v sshfs >/dev/null || die "sshfs required."
+        # Held until --umount: the WOL-Server must not put the server to sleep
+        # while files are being restored from it. A failed mount ends it again
+        # (cleanup).
+        wol_request_acquire mount 0
         if ! sshfs -p "$REMOTE_PORT" -o "IdentityFile=$REMOTE_KEY" "$REMOTE_USER@$REMOTE_HOST:$REMOTE_STORAGE_ROOT/$client" "$mountpoint"; then
             log "ERROR" "Mounting $REMOTE_HOST:$REMOTE_STORAGE_ROOT/$client on $mountpoint failed."
             return 1
         fi
+        wol_hold_for_mount "$(mount_key "$mountpoint")"
     else
         if ! mount --bind "$BACKUP_ROOT" "$mountpoint"; then
             log "ERROR" "Mounting $BACKUP_ROOT on $mountpoint failed."
@@ -2610,9 +2664,12 @@ do_umount() {
     [ -z "$mp" ] && mp="$BACKUP_ROOT"
     if ! umount "$mp"; then
         log "ERROR" "Unmounting $mp failed."
+        # Unmounted some other way (fusermount -u): the request goes all the same.
+        mountpoint -q "$mp" 2>/dev/null || wol_release_for_mount "$(mount_key "$mp")"
         return 1
     fi
     log "SUCCESS" "Unmounted $mp"
+    wol_release_for_mount "$(mount_key "$mp")"
 }
 
 ## @brief CLI Check: Is a backup currently running?
@@ -2703,10 +2760,12 @@ Usage: $(basename "$0") [OPTIONS]
 Options:
   --version, -v          Print version.
   --show-config          Print configuration.
-  --status               Show status report.
+  --status               Show status report. With a WOL-Server it wakes a
+                         sleeping backup server first (up to WOL_WAIT_SECONDS).
   --verify               Force Deep-Checksum Verification.
   --kill, -k             Stop running backups.
-  --mount [PATH]         Mount backup storage.
+  --mount [PATH]         Mount backup storage. With a WOL-Server it wakes the
+                         backup server and keeps it awake until --umount.
   --umount [PATH]        Unmount backup storage.
   --deploy-agent [TG]    Deploy agent to target (user@host).
   --setup-remote [TG]    Wizard: SSH Setup & Deployment.
@@ -2803,6 +2862,7 @@ client_main() {
             _RUN_EXIT_CODE=1
             inhibit_sleep_start
             wol_request_acquire
+            wol_heartbeat_start
             if ! run_hook "PRE_RUN_CMD" "${PRE_RUN_CMD:-}"; then
                 die "PRE_RUN_CMD failed - not backing up."
             fi

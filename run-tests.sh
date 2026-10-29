@@ -1,6 +1,6 @@
 #!/bin/bash
 # file: run-tests.sh
-# Test suite for snapshot-backup.sh v19.1
+# Test suite for snapshot-backup.sh v19.2
 
 source ./test-framework.sh
 
@@ -1157,6 +1157,58 @@ test_57_wol_by_address() {
     return 0
 }
 
+test_58_wol_status_wakes_and_says_so() {
+    # --status on a client whose backup server sleeps: it is requested (woken)
+    # for the length of the command, and the user is told about the wait.
+    _start_mock_wolserver
+    local bin="$TEST_ROOT/mock58" out; mkdir -p "$bin"
+    printf '#!/bin/sh\necho "daily.0  (snapshot table)"\n' > "$bin/ssh"; chmod +x "$bin/ssh"
+    set_config "BACKUP_MODE" "REMOTE"
+    out=$(PATH="$bin:$PATH" "$SCRIPT_BIN" --config "$CONF_FILE" --status 2>&1)
+    kill "$MOCK_API_PID" 2>/dev/null
+    echo "$out" | grep -q "daily.0  (snapshot table)" || { echo -e "    ${RED}[FAIL] no table: $out${NC}"; return 1; }
+    echo "$out" | grep -q "waking it can take up to 300 s" \
+        || { echo -e "    ${RED}[FAIL] the user is not told about the wait${NC}"; return 1; }
+    local seq; seq=$(awk '{print $1, $2}' "$TEST_ROOT/api.log" | tr '\n' '|')
+    [ "$seq" = "POST /api/devices/backup/requests?wait=300|DELETE /api/devices/backup/requests/abc123def456?then=sleep|" ] \
+        || { echo -e "    ${RED}[FAIL] requests: $seq${NC}"; return 1; }
+    grep -q '"client": "snapshot-backup:test-client (status)", "ttl": 900' "$TEST_ROOT/api.log" \
+        || { echo -e "    ${RED}[FAIL] $(head -1 "$TEST_ROOT/api.log")${NC}"; return 1; }
+}
+
+test_59_wol_mount_holds_until_umount() {
+    # Restoring from a mount takes as long as it takes: the request has no
+    # expiry and ends with --umount, not with the --mount command.
+    _start_mock_wolserver
+    local bin="$TEST_ROOT/mock59"; mkdir -p "$bin"
+    printf '#!/bin/sh\nexit 0\n' > "$bin/sshfs"
+    printf '#!/bin/sh\nexit 0\n' > "$bin/umount"
+    printf '#!/bin/sh\nexit 1\n' > "$bin/mountpoint"
+    chmod +x "$bin"/*
+    set_config "BACKUP_MODE" "REMOTE"
+    PATH="$bin:$PATH" "$SCRIPT_BIN" --config "$CONF_FILE" --mount "$TEST_ROOT/mp59" >/dev/null 2>&1 \
+        || { kill "$MOCK_API_PID"; echo -e "    ${RED}[FAIL] --mount failed${NC}"; return 1; }
+    grep -q '"client": "snapshot-backup:test-client (mount)", "ttl": 0' "$TEST_ROOT/api.log" \
+        || { kill "$MOCK_API_PID"; echo -e "    ${RED}[FAIL] $(head -1 "$TEST_ROOT/api.log")${NC}"; return 1; }
+    if grep -q "^DELETE" "$TEST_ROOT/api.log"; then
+        kill "$MOCK_API_PID"; echo -e "    ${RED}[FAIL] the request ended with --mount${NC}"; return 1
+    fi
+    grep -q "^$TEST_ROOT/mp59 backup=abc123def456=yes$" "$TEST_ROOT/wol_mount" \
+        || { kill "$MOCK_API_PID"; echo -e "    ${RED}[FAIL] not noted: $(cat "$TEST_ROOT/wol_mount" 2>&1)${NC}"; return 1; }
+    PATH="$bin:$PATH" "$SCRIPT_BIN" --config "$CONF_FILE" --umount "$TEST_ROOT/mp59" >/dev/null 2>&1
+    grep -q "^DELETE /api/devices/backup/requests/abc123def456?then=sleep " "$TEST_ROOT/api.log" \
+        || { kill "$MOCK_API_PID"; echo -e "    ${RED}[FAIL] --umount did not end it${NC}"; return 1; }
+    assert_missing "$TEST_ROOT/wol_mount" || { kill "$MOCK_API_PID"; return 1; }
+    # A mount that fails ends its request at once.
+    rm -f "$TEST_ROOT/api.log"
+    printf '#!/bin/sh\nexit 1\n' > "$bin/sshfs"
+    PATH="$bin:$PATH" "$SCRIPT_BIN" --config "$CONF_FILE" --mount "$TEST_ROOT/mp59" >/dev/null 2>&1
+    kill "$MOCK_API_PID" 2>/dev/null
+    grep -q "^DELETE /api/devices/backup/requests/abc123def456" "$TEST_ROOT/api.log" \
+        || { echo -e "    ${RED}[FAIL] a failed mount kept its request${NC}"; return 1; }
+    assert_missing "$TEST_ROOT/wol_mount" || return 1
+}
+
 test_43_inhibit_sleep_during_the_run() {
     # The host's own guard: a blocking inhibitor while rsync runs, gone afterwards.
     local mb="$TEST_ROOT/mock_inhibit"; mkdir -p "$mb"
@@ -1473,5 +1525,7 @@ run_test_case "54 WOL-Server Heartbeat" test_54_wol_heartbeat_while_the_run_last
 run_test_case "55 Job Done Answered Locally" test_55_job_done_answered_locally
 run_test_case "56 Wakeserver Options Warn" test_56_wakeserver_options_warn
 run_test_case "57 WOL-Server by Its VPN Address" test_57_wol_by_address
+run_test_case "58 WOL-Server --status Wakes, Says So" test_58_wol_status_wakes_and_says_so
+run_test_case "59 WOL-Server --mount Holds Until --umount" test_59_wol_mount_holds_until_umount
 
 print_summary

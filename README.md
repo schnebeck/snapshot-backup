@@ -1,6 +1,6 @@
 # snapshot-backup.sh - Intelligent Incremental Backup
 
-⚠️ **STATUS: STABLE / PRODUCTION READY (v19.1)**
+⚠️ **STATUS: STABLE / PRODUCTION READY (v19.2)**
 
 ### ⚖️ DISCLAIMER / LIMITATION OF LIABILITY
 
@@ -260,6 +260,13 @@ device to sleep — several clients share one backup server without cutting each
 server that was already on because someone works on it stays on. The backup never depends on
 the WOL-Server; unreachable, it costs a warning. Needs `curl`.
 
+`--status` and `--mount` request the server as well. `--status` wakes a sleeping server, shows its
+snapshots and ends the request. `--mount` keeps the server awake until `--umount`, so it cannot be
+put to sleep while files are being restored; the device card on the WOL-Server shows
+"snapshot-backup:CLIENT (mount)" meanwhile. Waking takes as long as the server needs to start —
+often one to three minutes. Before every request the command says so ("waking it can take up to
+300 s"), and afterwards how long it took.
+
 ## 📂 Restore
 
 Since backups are standard file systems, you can use any file manager or `cp`.
@@ -309,7 +316,7 @@ The script automatically detects the currently logged-in GUI user and sends stat
 
 ### E. CLI Options Reference
 
-**`--status`** Connects to the storage (local or remote) and displays a formatted table of all existing snapshots, their timestamps, and age. Also shows storage usage and mount status.
+**`--status`** Connects to the storage (local or remote) and displays a formatted table of all existing snapshots, their timestamps, and age. Also shows storage usage and mount status. With a [WOL-Server](#a-backup-server-that-sleeps-wol-server-optional) it wakes a sleeping backup server first, which can take a few minutes; the command says so before it waits.
 
 **`--config [FILE]`, `-c [FILE]`** Loads a custom configuration file instead of the default `/etc/snapshot-backup.conf`. Useful for managing multiple backup jobs or testing.
 
@@ -321,9 +328,9 @@ The script automatically detects the currently logged-in GUI user and sends stat
 
 - **Local Mode:** Performs a bind mount.
 
-- **Remote Mode:** Uses `sshfs` to mount the remote storage locally. This needs sftp, which a key locked to the wrapper does not get unless its `authorized_keys` line says `--allow-mount` (section I).
+- **Remote Mode:** Uses `sshfs` to mount the remote storage locally. This needs sftp, which a key locked to the wrapper does not get unless its `authorized_keys` line says `--allow-mount` (section I). With a [WOL-Server](#a-backup-server-that-sleeps-wol-server-optional) it wakes the backup server and keeps it awake until `--umount`.
 
-**`--umount [PATH]`** Unmounts the backup storage from `[PATH]`. Safe wrapper around `umount` or `fusermount`.
+**`--umount [PATH]`** Unmounts the backup storage from `[PATH]`. Safe wrapper around `umount` or `fusermount`. Ends the WOL-Server request that `--mount` took, also when the mount was already gone.
 
 **`--deploy-agent [TARGET]`** Manually deploys or updates the agent script on a remote host. `TARGET` is usually `user@host`. Useful for upgrading the agent without running the full setup wizard.
 
@@ -465,6 +472,9 @@ The IP address to reach the WOL-Server at, for a client that sees it only over t
 **`WOL_WAIT_SECONDS`** (Default: `300`, at most `300`)
 How long the WOL-Server waits for a device it had to wake. A device that does not come up in time costs a warning; the run then finds out for itself whether the target is there.
 
+**`WOL_MOUNT_FILE`** (Default: `/var/lib/snapshot-backup/wol_mount`)
+Where `--mount` notes the requests it holds, for `--umount` to end them. A request whose mount is gone without `--umount` stays open: end it on the WOL-Server's device card.
+
 **`WOL_SLEEP_AFTER`** (Default: `woken`)
 When the request ends, ask the WOL-Server to put the device to sleep: `woken` only if this run woke it, `true` always, `false` never. The WOL-Server waits for every other client that holds the device, plus a grace period of two minutes.
 
@@ -551,6 +561,7 @@ Consequently a client key can no longer **deploy** the agent (`--deploy-agent`, 
 ---
 
 ## 📆 Version History
+- **v19.2:** `--status` and `--mount` with a sleeping backup server. With `WOL_*` set, `--status` requests the server (wakes it), shows its snapshots and ends the request; `--mount` holds a request without expiry until `--umount` (`WOL_MOUNT_FILE`), so the server is not put to sleep during a restore, and a mount that fails ends it at once. Before each request the user is told how long waking may take, afterwards how long it did. Tests 58, 59.
 - **v19.1:** The WOL-Server over the VPN. `WOL_RESOLVE` names the address to reach it at; the name in `WOL_SERVER_URL` need not resolve there, and the certificate stays valid — curl checks it against the name, not the address. Before, a client outside the home network reached the web server that obtains the certificate, or got a certificate error with the IP address. Dispatcher 5.3 checks the same address. Test 57.
 - **v19.0:** A backup server that sleeps, and an hourly timer that lets it.
   - **WOL-Server requests** (`WOL_*`, optional) replace the wakeserver leases (`POWER_*`): the wakeserver is no longer developed. A run requests the backup server on a [WOL-Server](https://github.com/schnebeck/wol-server), which wakes it, keeps the request alive with heartbeats and ends it in the cleanup path — asking for sleep if it woke the device (`WOL_SLEEP_AFTER`). Several clients share the server; it sleeps after the last one. A config that still sets `POWER_API_URL` backs up and logs a warning. Tests 38–42, 54, 56.
