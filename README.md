@@ -1,6 +1,6 @@
 # snapshot-backup.sh - Intelligent Incremental Backup
 
-⚠️ **STATUS: STABLE / PRODUCTION READY (v19.2)**
+⚠️ **STATUS: STABLE / PRODUCTION READY (v19.3)**
 
 ### ⚖️ DISCLAIMER / LIMITATION OF LIABILITY
 
@@ -318,7 +318,7 @@ The script automatically detects the currently logged-in GUI user and sends stat
 
 **`--status`** Connects to the storage (local or remote) and displays a formatted table of all existing snapshots, their timestamps, and age. Also shows storage usage and mount status. With a [WOL-Server](#a-backup-server-that-sleeps-wol-server-optional) it wakes a sleeping backup server first, which can take a few minutes; the command says so before it waits.
 
-**`--config [FILE]`, `-c [FILE]`** Loads a custom configuration file instead of the default `/etc/snapshot-backup.conf`. Useful for managing multiple backup jobs or testing.
+**`--config [FILE]`, `-c [FILE]`** Loads a custom configuration file instead of the default `/etc/snapshot-backup.conf`: nothing is taken from the default then (since 19.3). Useful for managing multiple backup jobs or testing.
 
 **`--version`, `-v`** Displays the current version of the script and exits.
 
@@ -561,6 +561,7 @@ Consequently a client key can no longer **deploy** the agent (`--deploy-agent`, 
 ---
 
 ## 📆 Version History
+- **v19.3:** `--config FILE` replaces the default config, as documented. Before, `/etc/snapshot-backup.conf` was loaded first and the named file on top: whatever the named file left out came from the default — a test suite run as root inherited the host's `WOL_*` and requested the real backup server — and a default readable only by root (mode 600, recommended with a WOL-Server token) stopped every call by another user, even with a config of its own. Test 23 printed the host's own config (with any token in it) into the test directory; it uses the suite's config now. Test 60.
 - **v19.2:** `--status` and `--mount` with a sleeping backup server. With `WOL_*` set, `--status` requests the server (wakes it), shows its snapshots and ends the request; `--mount` holds a request without expiry until `--umount` (`WOL_MOUNT_FILE`), so the server is not put to sleep during a restore, and a mount that fails ends it at once. Before each request the user is told how long waking may take, afterwards how long it did. Tests 58, 59.
 - **v19.1:** The WOL-Server over the VPN. `WOL_RESOLVE` names the address to reach it at; the name in `WOL_SERVER_URL` need not resolve there, and the certificate stays valid — curl checks it against the name, not the address. Before, a client outside the home network reached the web server that obtains the certificate, or got a certificate error with the IP address. Dispatcher 5.3 checks the same address. Test 57.
 - **v19.0:** A backup server that sleeps, and an hourly timer that lets it.

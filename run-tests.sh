@@ -1,6 +1,6 @@
 #!/bin/bash
 # file: run-tests.sh
-# Test suite for snapshot-backup.sh v19.2
+# Test suite for snapshot-backup.sh v19.3
 
 source ./test-framework.sh
 
@@ -575,7 +575,8 @@ test_23_show_config_is_valid_shell() {
     # fed back in - which is exactly what a config template is for.
     local generated="$TEST_ROOT/generated.conf"
 
-    if ! "$SCRIPT_BIN" --show-config > "$generated" 2>/dev/null; then
+    # The suite's config, not the host's: that one may carry a WOL-Server token.
+    if ! "$SCRIPT_BIN" --config "$CONF_FILE" --show-config > "$generated" 2>/dev/null; then
         echo -e "    ${RED}[FAIL] --show-config exited non-zero.${NC}"
         return 1
     fi
@@ -1209,6 +1210,23 @@ test_59_wol_mount_holds_until_umount() {
     assert_missing "$TEST_ROOT/wol_mount" || return 1
 }
 
+test_60_config_replaces_the_default() {
+    # --config FILE is the whole config: nothing comes from the default one.
+    # A copy of the script whose default is a file of this test stands in for
+    # /etc/snapshot-backup.conf.
+    local bin="$TEST_ROOT/sb60.sh"
+    sed "s#^CONFIG_FILE=.*#CONFIG_FILE=\"$TEST_ROOT/default60.conf\"#" "$SCRIPT_BIN" > "$bin"; chmod +x "$bin"
+    printf 'CONFIG_VERSION="1.0"\n' > "$TEST_ROOT/default60.conf"
+    "$bin" --config "$CONF_FILE" --show-config >/dev/null 2>&1 \
+        || { echo -e "    ${RED}[FAIL] the default config was read despite --config${NC}"; return 1; }
+    printf 'CONFIG_VERSION="2.0"\nWOL_SERVER_URL="http://from-the-default.invalid"\n' > "$TEST_ROOT/default60.conf"
+    "$bin" --config "$CONF_FILE" --show-config 2>/dev/null | grep -q "from-the-default" \
+        && { echo -e "    ${RED}[FAIL] a value from the default config leaked in${NC}"; return 1; }
+    # Without --config the default is the config.
+    "$bin" --show-config 2>/dev/null | grep -q '^WOL_SERVER_URL="http://from-the-default.invalid"$' \
+        || { echo -e "    ${RED}[FAIL] the default config was not read without --config${NC}"; return 1; }
+}
+
 test_43_inhibit_sleep_during_the_run() {
     # The host's own guard: a blocking inhibitor while rsync runs, gone afterwards.
     local mb="$TEST_ROOT/mock_inhibit"; mkdir -p "$mb"
@@ -1527,5 +1545,6 @@ run_test_case "56 Wakeserver Options Warn" test_56_wakeserver_options_warn
 run_test_case "57 WOL-Server by Its VPN Address" test_57_wol_by_address
 run_test_case "58 WOL-Server --status Wakes, Says So" test_58_wol_status_wakes_and_says_so
 run_test_case "59 WOL-Server --mount Holds Until --umount" test_59_wol_mount_holds_until_umount
+run_test_case "60 --config Replaces the Default" test_60_config_replaces_the_default
 
 print_summary

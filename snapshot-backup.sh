@@ -3,7 +3,7 @@
 # ==============================================================================
 ## @file    snapshot-backup.sh
 ## @brief   Unified Snapshot Backup Client & Agent (POSIX sh)
-## @version 19.2
+## @version 19.3
 ##
 ## @note    DEVIATION FROM STRICT POSIX:
 ##          This script utilizes the 'local' keyword for variable scoping.
@@ -29,7 +29,7 @@ umask 0077
 # 1. CONSTANTS & CONFIGURATION DEFAULTS
 # ==============================================================================
 
-SCRIPT_VERSION="19.2"
+SCRIPT_VERSION="19.3"
 EXPECTED_CONFIG_VERSION="2.0"
 
 # --- System Paths ---
@@ -2785,7 +2785,16 @@ EOF
 
 ## @brief Main entry point for Client mode operations.
 client_main() {
-    load_config "$CONFIG_FILE"
+    # A config named with --config replaces the default one, as --help and the
+    # README say. Before 19.3 the default was loaded first and the named one on
+    # top: whatever the named file left out came from /etc - a test suite run
+    # as root inherited the host's WOL-Server and requested the real backup
+    # server - and a default readable only by root stopped every other user.
+    local arg named=false
+    for arg in "$@"; do
+        case "$arg" in --config|-c) named=true ;; esac
+    done
+    [ "$named" = true ] || load_config "$CONFIG_FILE"
 
     local action="BACKUP"
     local action_target=""
