@@ -3,7 +3,7 @@
 # ==============================================================================
 ## @file    snapshot-backup.sh
 ## @brief   Unified Snapshot Backup Client & Agent (POSIX sh)
-## @version 19.3
+## @version 19.4
 ##
 ## @note    DEVIATION FROM STRICT POSIX:
 ##          This script utilizes the 'local' keyword for variable scoping.
@@ -29,7 +29,7 @@ umask 0077
 # 1. CONSTANTS & CONFIGURATION DEFAULTS
 # ==============================================================================
 
-SCRIPT_VERSION="19.3"
+SCRIPT_VERSION="19.4"
 EXPECTED_CONFIG_VERSION="2.0"
 
 # --- System Paths ---
@@ -97,6 +97,9 @@ RSYNC_EXTRA_OPTS=""
 DEEP_VERIFY_INTERVAL_DAYS="35"
 ENABLE_NOTIFICATIONS=true
 NETWORK_TIMEOUT=10
+# How long a run waits for a network that is not there yet - a machine woken
+# from standby by its timer starts the backup before DHCP is done.
+NETWORK_WAIT_SECONDS=60
 FORCE_VERIFY=false
 
 # Hook state. _HOOKS_ARMED says a PRE hook may have set something up, so the
@@ -239,6 +242,24 @@ compat_run_with_timeout() {
     
     kill -9 "$killer_pid" 2>/dev/null
     return $exit_code
+}
+
+## @brief Gives the backup server NETWORK_WAIT_SECONDS to become reachable.
+##
+## A machine that its timer woke from standby starts the backup in the same
+## second, before the link is back and DHCP is done; until 19.4 that run ended
+## at once with "Server unreachable".
+wait_for_target() {
+    local wait end
+    wait=$(sanitize_int "${NETWORK_WAIT_SECONDS:-60}")
+    [ "$wait" -gt 0 ] || return 1
+    log "INFO" "Backup server not reachable yet - waiting up to $wait s, the network may still be starting."
+    end=$(( $(date +%s) + wait ))
+    while [ "$(date +%s)" -lt "$end" ]; do
+        sleep 5
+        test_remote_connection && return 0
+    done
+    return 1
 }
 
 ## @brief Executes a command on the remote host via SSH.
@@ -1252,7 +1273,7 @@ _perform_local_backup_logic() {
 
 ## @brief Orchestrates the remote backup process via agent.
 _perform_remote_backup_logic() {
-    if ! test_remote_connection; then die "Server unreachable."; fi
+    if ! test_remote_connection && ! wait_for_target; then die "Server unreachable."; fi
     check_agent_version
     
     local c_opts
@@ -1761,7 +1782,8 @@ load_config() {
         local var val
         for var in RETAIN_HOURLY RETAIN_DAILY RETAIN_WEEKLY RETAIN_MONTHLY RETAIN_YEARLY \
                    SPACE_LOW_LIMIT_GB SMART_PURGE_SLOTS DEEP_VERIFY_INTERVAL_DAYS \
-                   NETWORK_TIMEOUT LOG_PROGRESS_INTERVAL WOL_WAIT_SECONDS WOL_TTL WOL_HEARTBEAT_SECONDS; do
+                   NETWORK_TIMEOUT NETWORK_WAIT_SECONDS LOG_PROGRESS_INTERVAL WOL_WAIT_SECONDS WOL_TTL \
+                   WOL_HEARTBEAT_SECONDS; do
             eval "val=\"\${$var:-}\""
             case "$val" in
                 ''|*[!0-9]*) die "Config $config_file: $var must be a whole number, not '$val'." ;;
@@ -1933,6 +1955,8 @@ wol_open() {
 wol_request_acquire() {
     wol_open || return 0
     local purpose="${1:-}" ttl="${2:-$WOL_TTL}" client wait dev res code id woken waited msg sleep_after
+    local net_wait net_end
+    net_wait=$(sanitize_int "${NETWORK_WAIT_SECONDS:-60}")
     client="snapshot-backup:$CLIENT_NAME${purpose:+ ($purpose)}"
     wait=$(sanitize_int "${WOL_WAIT_SECONDS:-300}")
     [ "$wait" -gt 300 ] && wait=300  # the WOL-Server's limit
@@ -1943,6 +1967,19 @@ wol_request_acquire() {
         res=$(wol_api $((wait + 30)) POST "/api/devices/$dev/requests?wait=$wait" \
             "{\"client\": \"$client\", \"ttl\": $(sanitize_int "$ttl")}")
         code=$(echo "$res" | head -n 1)
+        # No connection at all (000): woken from standby, the network may still
+        # be starting - DHCP done, the WOL-Server answers. Waited for once.
+        if [ "$code" = 000 ] && [ "$net_wait" -gt 0 ]; then
+            log "INFO" "WOL-Server: not reachable yet - waiting up to $net_wait s, the network may still be starting."
+            net_end=$(( $(date +%s) + net_wait ))
+            while [ "$code" = 000 ] && [ "$(date +%s)" -lt "$net_end" ]; do
+                sleep 5
+                res=$(wol_api $((wait + 30)) POST "/api/devices/$dev/requests?wait=$wait" \
+                    "{\"client\": \"$client\", \"ttl\": $(sanitize_int "$ttl")}")
+                code=$(echo "$res" | head -n 1)
+            done
+        fi
+        net_wait=0
         id=$(echo "$res" | sed 1d | json_field id)
         msg=$(echo "$res" | sed 1d | json_field message)
         [ -z "$msg" ] && msg=$(echo "$res" | sed 1d | json_field error)
@@ -2306,6 +2343,8 @@ LOG_PROGRESS_INTERVAL=$LOG_PROGRESS_INTERVAL
 RSYNC_EXTRA_OPTS="$RSYNC_EXTRA_OPTS"
 ENABLE_NOTIFICATIONS=$ENABLE_NOTIFICATIONS
 NETWORK_TIMEOUT=$NETWORK_TIMEOUT
+# Seconds a run waits for the network when it is not up yet (woken from standby).
+NETWORK_WAIT_SECONDS=$NETWORK_WAIT_SECONDS
 
 # Flags
 FORCE_VERIFY=$FORCE_VERIFY

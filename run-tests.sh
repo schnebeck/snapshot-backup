@@ -1,6 +1,6 @@
 #!/bin/bash
 # file: run-tests.sh
-# Test suite for snapshot-backup.sh v19.3
+# Test suite for snapshot-backup.sh v19.4
 
 source ./test-framework.sh
 
@@ -980,7 +980,7 @@ class H(http.server.BaseHTTPRequestHandler):
                              "message": "Magic packet sent"})
     def do_PUT(self): self.answer(200, {"ok": True, "id": "abc123def456"})
     def do_DELETE(self): self.answer(200, {"ok": True, "message": "Done", "sleep": None, "waiting_for": []})
-s = http.server.HTTPServer(("127.0.0.1", 0), H)
+s = http.server.HTTPServer(("127.0.0.1", int(sys.argv[2]) if len(sys.argv) > 2 else 0), H)
 open(os.path.join(root, "api.port"), "w").write(str(s.server_address[1]))
 s.serve_forever()
 EOF
@@ -1225,6 +1225,43 @@ test_60_config_replaces_the_default() {
     # Without --config the default is the config.
     "$bin" --show-config 2>/dev/null | grep -q '^WOL_SERVER_URL="http://from-the-default.invalid"$' \
         || { echo -e "    ${RED}[FAIL] the default config was not read without --config${NC}"; return 1; }
+}
+
+test_61_waits_for_the_network_wol() {
+    # Woken from standby by its timer, a client starts before DHCP is done: the
+    # WOL-Server does not answer for a few seconds. The run waits for it.
+    _start_mock_wolserver
+    local port; port=$(cat "$TEST_ROOT/api.port")
+    kill "$MOCK_API_PID"; wait "$MOCK_API_PID" 2>/dev/null
+    ( sleep 6; exec python3 "$TEST_ROOT/mock_api.py" "$TEST_ROOT" "$port" ) &
+    local late=$!
+    set_config "NETWORK_WAIT_SECONDS" "30"
+    local mark; mark=$(wc -l < "$LOG_FILE")
+    local ret; _run_with_wolserver 0
+    kill "$late" 2>/dev/null; pkill -f "mock_api.py $TEST_ROOT $port" 2>/dev/null
+    [ "$ret" -eq 0 ] || { echo -e "    ${RED}[FAIL] backup failed${NC}"; return 1; }
+    tail -n +$((mark + 1)) "$LOG_FILE" | grep -q "WOL-Server: not reachable yet - waiting up to 30 s" \
+        || { echo -e "    ${RED}[FAIL] no waiting message${NC}"; return 1; }
+    grep -q "^POST /api/devices/backup/requests" "$TEST_ROOT/api.log" 2>/dev/null \
+        && grep -q "^DELETE /api/devices/backup/requests/abc123def456" "$TEST_ROOT/api.log" \
+        || { echo -e "    ${RED}[FAIL] the late WOL-Server got no request${NC}"; return 1; }
+}
+
+test_62_waits_for_the_backup_server() {
+    # Without a WOL-Server the same start meets an unreachable backup server:
+    # tried again for NETWORK_WAIT_SECONDS before "Server unreachable".
+    local bin="$TEST_ROOT/mock62"; mkdir -p "$bin"
+    printf '#!/bin/sh\necho call >> "%s/ssh62.calls"\nexit 255\n' "$TEST_ROOT" > "$bin/ssh"; chmod +x "$bin/ssh"
+    set_config "BACKUP_MODE" "REMOTE"
+    set_config "NETWORK_WAIT_SECONDS" "6"
+    local mark start
+    mark=$(wc -l < "$LOG_FILE"); start=$(date +%s)
+    PATH="$bin:$PATH" "$SCRIPT_BIN" --config "$CONF_FILE" >> "$LOG_FILE" 2>&1 \
+        && { echo -e "    ${RED}[FAIL] an unreachable server did not fail the run${NC}"; return 1; }
+    [ $(( $(date +%s) - start )) -ge 6 ] || { echo -e "    ${RED}[FAIL] did not wait${NC}"; return 1; }
+    [ "$(wc -l < "$TEST_ROOT/ssh62.calls")" -ge 2 ] || { echo -e "    ${RED}[FAIL] not tried again${NC}"; return 1; }
+    tail -n +$((mark + 1)) "$LOG_FILE" | grep -q "Backup server not reachable yet - waiting up to 6 s" \
+        || { echo -e "    ${RED}[FAIL] no waiting message${NC}"; return 1; }
 }
 
 test_43_inhibit_sleep_during_the_run() {
@@ -1546,5 +1583,7 @@ run_test_case "57 WOL-Server by Its VPN Address" test_57_wol_by_address
 run_test_case "58 WOL-Server --status Wakes, Says So" test_58_wol_status_wakes_and_says_so
 run_test_case "59 WOL-Server --mount Holds Until --umount" test_59_wol_mount_holds_until_umount
 run_test_case "60 --config Replaces the Default" test_60_config_replaces_the_default
+run_test_case "61 Waits for the Network (WOL-Server)" test_61_waits_for_the_network_wol
+run_test_case "62 Waits for the Backup Server" test_62_waits_for_the_backup_server
 
 print_summary

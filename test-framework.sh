@@ -55,6 +55,8 @@ PIDFILE="$TEST_ROOT/snapshot-backup.pid"
 # Its own job-done record, for the same reason.
 JOB_DONE_FILE="$TEST_ROOT/job_done"
 WOL_MOUNT_FILE="$TEST_ROOT/wol_mount"
+# No waiting for a network that is meant to be unreachable (tests 61, 62 set it).
+NETWORK_WAIT_SECONDS=0
 ENABLE_NOTIFICATIONS=false
 SPACE_LOW_LIMIT_GB=0
 SMART_PURGE_SLOTS=0
