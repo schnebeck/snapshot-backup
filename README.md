@@ -1,6 +1,6 @@
 # snapshot-backup.sh - Intelligent Incremental Backup
 
-⚠️ **STATUS: STABLE / PRODUCTION READY (v19.5)**
+⚠️ **STATUS: STABLE / PRODUCTION READY (v19.6)**
 
 ### ⚖️ DISCLAIMER / LIMITATION OF LIABILITY
 
@@ -350,7 +350,7 @@ What it does *not* do is verify authorship: HTTPS establishes that the file came
 
 **`--kill`, `-k`** Safely stops running backup processes. It attempts a SIGTERM first to allow cleanup, then force kills if necessary. Removes stale lock files.
 
-**`--debug`** Enables verbose logging to stdout and the log file. Useful for troubleshooting connection or rsync issues.
+**`--debug`** Enables verbose logging to stdout and the log file. Useful for troubleshooting connection or rsync issues. Only in debug mode does rsync list every file it sends (`-v`) and the log keep that list; it costs time on runs with many changed files.
 
 **`--timeout [SEC]`** Sets a custom timeout for network operations and checks. Overrides the default `NETWORK_TIMEOUT` (10s).
 
@@ -565,6 +565,7 @@ Consequently a client key can no longer **deploy** the agent (`--deploy-agent`, 
 ---
 
 ## 📆 Version History
+- **v19.6:** Remote backups with many changed files no longer crawl. The loop that reads rsync's output holds rsync up while it works on a line, and every line cost about a dozen processes (`grep`, `date`, `sed`, `dirname`) — even the file names of `-v`, which outside debug mode were thrown away afterwards. A run with tens of thousands of changed files, such as after a kernel update, crawled at about 100 files per second. Now rsync lists the files only with `--debug`, the loop uses shell patterns instead of `grep` and reads the clock from `/proc/uptime`, and `log()` returns from a discarded DEBUG line before it starts anything. Measured with 20,000 new small files over ssh: 200–234 s before, 4.3 s now (debug mode: 199 s → 50 s). The progress notification keeps working: `--info=progress2` ends its updates with `\r`, which now become lines. The installed wrappers accept the shorter option string; nothing to do on the server. Test 64.
 - **v19.5:** Backup processes on the server announce themselves. The wrapper runs every agent action and every `rsync` it allows under a block inhibitor against shutdown and sleep, named after the client (`snapshot-backup:CLIENT`). A backup server that is switched off when idle can then refuse, and say which client is still writing, by asking the system — before, a sleep guard had to guess from command lines, and a shell that only mentioned "snapshot-agent" kept the server on. Without `systemd-inhibit` (busybox) the wrapper runs the process directly; `--install` writes the path, or nothing, into the wrapper. Run `--install` on the server to get it. Test 63, under sh, dash, bash and busybox.
 - **v19.4:** A run waits for a network that is still starting. Woken from standby by its timer, a client started the backup in the same second, before DHCP was done, and ended with "Server unreachable" — every night, unnoticed. It now tries the WOL-Server, or the backup server, every 5 seconds for up to `NETWORK_WAIT_SECONDS` (60). Tests 61, 62.
 - **v19.3:** `--config FILE` replaces the default config, as documented. Before, `/etc/snapshot-backup.conf` was loaded first and the named file on top: whatever the named file left out came from the default — a test suite run as root inherited the host's `WOL_*` and requested the real backup server — and a default readable only by root (mode 600, recommended with a WOL-Server token) stopped every call by another user, even with a config of its own. Test 23 printed the host's own config (with any token in it) into the test directory; it uses the suite's config now. Test 60.

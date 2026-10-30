@@ -3,7 +3,7 @@
 # ==============================================================================
 ## @file    snapshot-backup.sh
 ## @brief   Unified Snapshot Backup Client & Agent (POSIX sh)
-## @version 19.5
+## @version 19.6
 ##
 ## @note    DEVIATION FROM STRICT POSIX:
 ##          This script utilizes the 'local' keyword for variable scoping.
@@ -29,7 +29,7 @@ umask 0077
 # 1. CONSTANTS & CONFIGURATION DEFAULTS
 # ==============================================================================
 
-SCRIPT_VERSION="19.5"
+SCRIPT_VERSION="19.6"
 EXPECTED_CONFIG_VERSION="2.0"
 
 # --- System Paths ---
@@ -151,19 +151,27 @@ RSYNC_XATTR_OPT=""
 ## @param msg The message to log
 log() {
     local level="$1"
+    # A DEBUG line outside debug mode goes nowhere: return before date and sed run.
+    # rsync's file list passes through here line by line, and each of those
+    # processes cost the transfer time.
+    [ "$level" = "DEBUG" ] && [ "${DEBUG_MODE:-false}" != "true" ] && return 0
     shift
     local msg="$*"
     local ts
     ts=$(date "+%Y-%m-%d %H:%M:%S")
-    local clean_msg
-    clean_msg=$(echo "$msg" | sed 's/\\e\[[0-9;]*m//g')
+    # sed and dirname only where they change something: in debug mode every
+    # file of the transfer comes through here.
+    local clean_msg="$msg"
+    case "$msg" in *'\e['*) clean_msg=$(echo "$msg" | sed 's/\\e\[[0-9;]*m//g') ;; esac
     local log_entry="[$ts] [$level] $clean_msg"
+    local log_dir
+    case "$LOGFILE" in */*) log_dir="${LOGFILE%/*}"; log_dir="${log_dir:-/}" ;; *) log_dir="." ;; esac
 
-    if [ ! -d "$(dirname "$LOGFILE")" ]; then
-        mkdir -p "$(dirname "$LOGFILE")" 2>/dev/null
+    if [ ! -d "$log_dir" ]; then
+        mkdir -p "$log_dir" 2>/dev/null
     fi
     
-    if [ -w "$(dirname "$LOGFILE")" ]; then
+    if [ -w "$log_dir" ]; then
         if [ "$level" != "DEBUG" ] || [ "${DEBUG_MODE:-false}" = "true" ]; then
             echo "$log_entry" >> "$LOGFILE"
         fi
@@ -1098,15 +1106,29 @@ run_monitored_rsync() {
     local status_file
     status_file=$(mktemp 2>/dev/null) || { status_file="/tmp/snapshot_rsync_status.$$.$(date +%s)"; : > "$status_file"; }
     
-    ("$@" --timeout=300 $RSYNC_PROGRESS_OPTS 2>&1; echo $? > "$status_file") | while IFS= read -r line; do
-            if echo "$line" | grep -q "[0-9]%[ ]"; then
+    # The loop reads rsync's output line by line, and rsync waits while it does:
+    # whatever runs per line runs per file. So no process per line - shell
+    # patterns instead of grep, the clock from /proc/uptime instead of date.
+    # Before 19.6 a line cost about a dozen processes, and a run with tens of
+    # thousands of changed files (a kernel update) crawled at ~100 files/s.
+    # --info=progress2 ends its updates with \r: tr makes lines of them, or
+    # without -v the progress would only arrive with the summary at the end.
+    ("$@" --timeout=300 $RSYNC_PROGRESS_OPTS 2>&1; echo $? > "$status_file") | tr '\r' '\n' | while IFS= read -r line; do
+            case "$line" in
+                *[0-9]%" "*)
                 local now
-                now=$(date +%s)
+                if [ -r /proc/uptime ]; then
+                    read -r now _ < /proc/uptime
+                    now=${now%%.*}
+                else
+                    now=$(date +%s)
+                fi
                 if [ $((now - last_log_time)) -ge "$log_interval" ]; then
                      [ "${ENABLE_NOTIFICATIONS:-false}" = true ] && notify "Snapshot Backup" "Progress: $(echo "$line" | grep -o "[0-9]*%" | head -1)" "low"
                      last_log_time=$now
                 fi
-            else
+                ;;
+                *)
                 # Anchored on purpose. Unanchored "denied", "failed:" and
                 # "fatal:" also match rsync's ordinary file listing: a backup
                 # containing AccessDeniedException.php or
@@ -1119,12 +1141,19 @@ run_monitored_rsync() {
                 # "rsync warning: ... vanished" is deliberately absent: files
                 # disappearing while a live filesystem is copied is normal, and
                 # reporting it would produce noise every night.
-                if echo "$line" | grep -qiE "^rsync(:| error)|^IO error|^ERROR:|^fatal:|: Permission denied|: No space left"; then
-                    log "ERROR" "$line"
-                else
-                    log "DEBUG" "$line"
-                fi
-            fi
+                #
+                # Only a line with one of the words in it can match, so only
+                # such a line pays for grep; the pattern itself is unchanged.
+                case "$line" in
+                    *[Rr][Ss][Yy][Nn][Cc]*|*[Ee][Rr][Rr][Oo][Rr]*|*[Ff][Aa][Tt][Aa][Ll]*|*[Dd][Ee][Nn][Ii][Ee][Dd]*|*[Ss][Pp][Aa][Cc][Ee]*)
+                        if echo "$line" | grep -qiE "^rsync(:| error)|^IO error|^ERROR:|^fatal:|: Permission denied|: No space left"; then
+                            log "ERROR" "$line"
+                            continue
+                        fi ;;
+                esac
+                log "DEBUG" "$line"
+                ;;
+            esac
     done
     
     # No status means rsync's exit was never recorded - the subshell was killed.
@@ -1293,7 +1322,10 @@ _perform_remote_backup_logic() {
     local t_raw_unused="$REMOTE_STORAGE_ROOT/$CLIENT_NAME/$target_suffix" 
     local ssh_cmd="ssh -p $REMOTE_PORT $REMOTE_SSH_OPTS -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -i $REMOTE_KEY"
     
-    local r_opts="-avzH $RSYNC_ACL_OPT $RSYNC_XATTR_OPT --numeric-ids --delete --stats -x"
+    # -v lists every file sent; the list only goes to the log in debug mode, so
+    # only then is it asked for. The summary comes from --stats either way.
+    local r_opts="-azH $RSYNC_ACL_OPT $RSYNC_XATTR_OPT --numeric-ids --delete --stats -x"
+    [ "${DEBUG_MODE:-false}" = "true" ] && r_opts="-v $r_opts"
     [ -n "${RSYNC_EXTRA_OPTS:-}" ] && r_opts="$r_opts $RSYNC_EXTRA_OPTS"
     
     local v_status=0

@@ -1,6 +1,6 @@
 #!/bin/bash
 # file: run-tests.sh
-# Test suite for snapshot-backup.sh v19.5
+# Test suite for snapshot-backup.sh v19.6
 
 source ./test-framework.sh
 
@@ -1550,6 +1550,52 @@ EOF
     return 0
 }
 
+test_64_monitor_keeps_up_with_rsync() {
+    # The loop that reads rsync's output holds rsync up for as long as it works on
+    # a line. Before 19.6 every line cost about a dozen processes (grep, date, sed,
+    # dirname): a run with tens of thousands of changed files - a kernel update -
+    # crawled at ~100 files/s. Now rsync lists the files only in debug mode, and a
+    # line costs no process unless it can be an error.
+    setup_loopback_ssh
+    local stub="$TEST_ROOT/stub64" old_path="$PATH" p0 p1 n
+    mkdir -p "$stub"
+    cat > "$stub/rsync" <<STUB
+#!/bin/sh
+case "\$*" in *--version*) echo "rsync  version 3.2.7  protocol version 31"; exit 0 ;; esac
+echo "\$*" >> "$TEST_ROOT/rsync64.args"
+i=0
+while [ \$i -lt 5000 ]; do
+    printf 'usr/src/linux-headers/include/config/F%d\\n' \$i
+    i=\$((i + 1))
+done
+printf '      1,234  10%%    1.00MB/s    0:00:01 (xfr#1, to-chk=10/20)\\r      2,468  20%%    1.00MB/s    0:00:02\\n'
+echo "deleting var/app/Exception/AccessDeniedException.php"
+echo 'rsync: [sender] send_files failed to open "/x": Permission denied (13)'
+exit 0
+STUB
+    chmod +x "$stub/rsync"
+    export PATH="$stub:$PATH"
+
+    p0=$(awk '/^processes/{print $2}' /proc/stat)
+    "$SCRIPT_BIN" --config "$CONF_FILE" >> "$LOG_FILE" 2>&1
+    p1=$(awk '/^processes/{print $2}' /proc/stat)
+    "$SCRIPT_BIN" --config "$CONF_FILE" --debug >> "$LOG_FILE" 2>&1
+    export PATH="$old_path"
+
+    # -v only in debug mode
+    case "$(sed -n 1p "$TEST_ROOT/rsync64.args")" in -azH*) ;; *) echo -e "    ${RED}[FAIL] normal run: $(sed -n 1p "$TEST_ROOT/rsync64.args")${NC}"; return 1 ;; esac
+    case "$(sed -n 2p "$TEST_ROOT/rsync64.args")" in "-v -azH"*) ;; *) echo -e "    ${RED}[FAIL] debug run: $(sed -n 2p "$TEST_ROOT/rsync64.args")${NC}"; return 1 ;; esac
+    # 5000 lines in the normal run: well below one process per line (before: ~13 per line)
+    n=$((p1 - p0))
+    [ "$n" -lt 2500 ] || { echo -e "    ${RED}[FAIL] $n processes for 5000 lines of rsync output${NC}"; return 1; }
+    # The error is still an error, the file name still is not, and the debug log has the list
+    [ "$(grep -c '\[ERROR\] rsync: \[sender\] send_files failed' "$LOG_FILE")" -ge 2 ] \
+        || { echo -e "    ${RED}[FAIL] the rsync error was not logged in both runs${NC}"; return 1; }
+    grep -q '\[ERROR\].*AccessDeniedException' "$LOG_FILE" && { echo -e "    ${RED}[FAIL] a file name was logged as an error${NC}"; return 1; }
+    grep -q '\[DEBUG\] usr/src/linux-headers/include/config/F4999$' "$LOG_FILE" \
+        || { echo -e "    ${RED}[FAIL] the debug log lacks the file list${NC}"; return 1; }
+}
+
 # ==============================================================================
 # MAIN RUNNER
 # ==============================================================================
@@ -1630,5 +1676,6 @@ run_test_case "60 --config Replaces the Default" test_60_config_replaces_the_def
 run_test_case "61 Waits for the Network (WOL-Server)" test_61_waits_for_the_network_wol
 run_test_case "62 Waits for the Backup Server" test_62_waits_for_the_backup_server
 run_test_case "63 Wrapper Holds an Inhibitor" test_63_wrapper_holds_an_inhibitor
+run_test_case "64 Monitor Keeps Up with rsync" test_64_monitor_keeps_up_with_rsync
 
 print_summary
