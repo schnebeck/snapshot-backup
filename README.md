@@ -1,6 +1,6 @@
 # snapshot-backup.sh - Intelligent Incremental Backup
 
-⚠️ **STATUS: STABLE / PRODUCTION READY (v19.6)**
+⚠️ **STATUS: STABLE / PRODUCTION READY (v19.7)**
 
 ### ⚖️ DISCLAIMER / LIMITATION OF LIABILITY
 
@@ -472,6 +472,9 @@ The IP address to reach the WOL-Server at, for a client that sees it only over t
 **`WOL_WAIT_SECONDS`** (Default: `300`, at most `300`)
 How long the WOL-Server waits for a device it had to wake. A device that does not come up in time costs a warning; the run then finds out for itself whether the target is there.
 
+**`WOL_WAKE_RETRIES`** (Default: `1`)
+How many further requests a run makes when the device did not come up within `WOL_WAIT_SECONDS` (HTTP 504 or 502). Each waits up to `WOL_WAIT_SECONDS` again. A device that hung while starting comes up after the WOL-Server's *Restart when it hangs* has power-cycled and woken it; with *Restart after* at 300 s that is about seven minutes after the first wake, which the first request alone does not cover. The new request is open before the old one ends, so the device is held throughout. `0`: one request only.
+
 **`WOL_MOUNT_FILE`** (Default: `/var/lib/snapshot-backup/wol_mount`)
 Where `--mount` notes the requests it holds, for `--umount` to end them. A request whose mount is gone without `--umount` stays open: end it on the WOL-Server's device card.
 
@@ -565,6 +568,7 @@ Consequently a client key can no longer **deploy** the agent (`--deploy-agent`, 
 ---
 
 ## 📆 Version History
+- **v19.7:** A run asks the WOL-Server again when the device did not come up in time. A backup server that hung while starting (in the firmware, before the kernel) stays deaf to magic packets; the WOL-Server's *Restart when it hangs* power-cycles and wakes it, but only after its *Restart after* time, and the first request had given up with HTTP 504 by then — the run ended with "Server unreachable" although the server was back minutes later. `WOL_WAKE_RETRIES` (default `1`) makes that many further requests, each waiting up to `WOL_WAIT_SECONDS` again; the new request is open before the old one ends, and a device the run woke is still put to sleep afterwards. Test 65.
 - **v19.6:** Remote backups with many changed files no longer crawl. The loop that reads rsync's output holds rsync up while it works on a line, and every line cost about a dozen processes (`grep`, `date`, `sed`, `dirname`) — even the file names of `-v`, which outside debug mode were thrown away afterwards. A run with tens of thousands of changed files, such as after a kernel update, crawled at about 100 files per second. Now rsync lists the files only with `--debug`, the loop uses shell patterns instead of `grep` and reads the clock from `/proc/uptime`, and `log()` returns from a discarded DEBUG line before it starts anything. Measured with 20,000 new small files over ssh: 200–234 s before, 4.3 s now (debug mode: 199 s → 50 s). The progress notification keeps working: `--info=progress2` ends its updates with `\r`, which now become lines. The installed wrappers accept the shorter option string; nothing to do on the server. Test 64.
 - **v19.5:** Backup processes on the server announce themselves. The wrapper runs every agent action and every `rsync` it allows under a block inhibitor against shutdown and sleep, named after the client (`snapshot-backup:CLIENT`). A backup server that is switched off when idle can then refuse, and say which client is still writing, by asking the system — before, a sleep guard had to guess from command lines, and a shell that only mentioned "snapshot-agent" kept the server on. Without `systemd-inhibit` (busybox) the wrapper runs the process directly; `--install` writes the path, or nothing, into the wrapper. Run `--install` on the server to get it. Test 63, under sh, dash, bash and busybox.
 - **v19.4:** A run waits for a network that is still starting. Woken from standby by its timer, a client started the backup in the same second, before DHCP was done, and ended with "Server unreachable" — every night, unnoticed. It now tries the WOL-Server, or the backup server, every 5 seconds for up to `NETWORK_WAIT_SECONDS` (60). Tests 61, 62.

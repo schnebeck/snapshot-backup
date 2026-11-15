@@ -3,7 +3,7 @@
 # ==============================================================================
 ## @file    snapshot-backup.sh
 ## @brief   Unified Snapshot Backup Client & Agent (POSIX sh)
-## @version 19.6
+## @version 19.7
 ##
 ## @note    DEVIATION FROM STRICT POSIX:
 ##          This script utilizes the 'local' keyword for variable scoping.
@@ -29,7 +29,7 @@ umask 0077
 # 1. CONSTANTS & CONFIGURATION DEFAULTS
 # ==============================================================================
 
-SCRIPT_VERSION="19.6"
+SCRIPT_VERSION="19.7"
 EXPECTED_CONFIG_VERSION="2.0"
 
 # --- System Paths ---
@@ -121,6 +121,7 @@ WOL_SERVER_TOKEN=""
 WOL_DEVICES=""
 WOL_RESOLVE=""
 WOL_WAIT_SECONDS=300
+WOL_WAKE_RETRIES=1
 WOL_SLEEP_AFTER="woken"
 WOL_TTL=900
 WOL_HEARTBEAT_SECONDS=300
@@ -1830,7 +1831,7 @@ load_config() {
         for var in RETAIN_HOURLY RETAIN_DAILY RETAIN_WEEKLY RETAIN_MONTHLY RETAIN_YEARLY \
                    SPACE_LOW_LIMIT_GB SMART_PURGE_SLOTS DEEP_VERIFY_INTERVAL_DAYS \
                    NETWORK_TIMEOUT NETWORK_WAIT_SECONDS LOG_PROGRESS_INTERVAL WOL_WAIT_SECONDS WOL_TTL \
-                   WOL_HEARTBEAT_SECONDS; do
+                   WOL_HEARTBEAT_SECONDS WOL_WAKE_RETRIES; do
             eval "val=\"\${$var:-}\""
             case "$val" in
                 ''|*[!0-9]*) die "Config $config_file: $var must be a whole number, not '$val'." ;;
@@ -2002,7 +2003,7 @@ wol_open() {
 wol_request_acquire() {
     wol_open || return 0
     local purpose="${1:-}" ttl="${2:-$WOL_TTL}" client wait dev res code id woken waited msg sleep_after
-    local net_wait net_end
+    local net_wait net_end try retries res2 id2
     net_wait=$(sanitize_int "${NETWORK_WAIT_SECONDS:-60}")
     client="snapshot-backup:$CLIENT_NAME${purpose:+ ($purpose)}"
     wait=$(sanitize_int "${WOL_WAIT_SECONDS:-300}")
@@ -2036,6 +2037,30 @@ wol_request_acquire() {
         fi
         # The request stays open on 502 and 504 too: it has to be ended.
         woken=$(echo "$res" | sed 1d | json_field woken)
+        # Not awake in time (504, 502): a device that hung while starting may
+        # come up after the WOL-Server's plug has restarted it. A new request
+        # waits for that; it is open before the old one ends, so the device is
+        # held all the time. A device this run woke stays "woken" for the sleep.
+        try=0
+        retries=$(sanitize_int "${WOL_WAKE_RETRIES:-1}")
+        while [ "$code" != 201 ] && [ "$try" -lt "$retries" ]; do
+            try=$((try + 1))
+            log "WARN" "WOL-Server: $dev not awake (HTTP $code${msg:+: $msg}) - requesting it again ($try/$retries), up to $wait s."
+            res2=$(wol_api $((wait + 30)) POST "/api/devices/$dev/requests?wait=$wait" \
+                "{\"client\": \"$client\", \"ttl\": $(sanitize_int "$ttl")}")
+            id2=$(echo "$res2" | sed 1d | json_field id)
+            if [ -z "$id2" ]; then
+                log "WARN" "WOL-Server: no second request for $dev (HTTP $(echo "$res2" | head -n 1)) - keeping the first."
+                break
+            fi
+            wol_api 30 DELETE "/api/devices/$dev/requests/$id" "" >/dev/null
+            [ "$(echo "$res2" | sed 1d | json_field woken)" = true ] && woken=true
+            res=$res2
+            id=$id2
+            code=$(echo "$res" | head -n 1)
+            msg=$(echo "$res" | sed 1d | json_field message)
+            [ -z "$msg" ] && msg=$(echo "$res" | sed 1d | json_field error)
+        done
         waited=$(echo "$res" | sed 1d | json_field waited)
         sleep_after=no
         if [ "$code" = 201 ]; then
@@ -2378,6 +2403,9 @@ WOL_SERVER_TOKEN="$WOL_SERVER_TOKEN"
 WOL_DEVICES="$WOL_DEVICES"
 WOL_RESOLVE="$WOL_RESOLVE"
 WOL_WAIT_SECONDS=$WOL_WAIT_SECONDS
+# Further requests after one that did not wake the device in time, each waiting
+# WOL_WAIT_SECONDS again: time for the WOL-Server to restart a hanging device.
+WOL_WAKE_RETRIES=$WOL_WAKE_RETRIES
 WOL_SLEEP_AFTER="$WOL_SLEEP_AFTER"
 INHIBIT_SLEEP=$INHIBIT_SLEEP
 

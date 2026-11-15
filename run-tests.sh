@@ -958,7 +958,8 @@ test_37_install_replaces_atomically() {
 # A stand-in WOL-Server: logs every request as "METHOD PATH AUTH BODY" to
 # $TEST_ROOT/api.log. POST answers with the status in $TEST_ROOT/wol.status
 # (default 201) and "woken" from $TEST_ROOT/wol.woken (default true); PUT and
-# DELETE answer 200.
+# DELETE answer 200. wol.status and wol.ids may list several values: the n-th
+# POST gets the n-th value, the last one repeats (ids default abc123def456).
 _start_mock_wolserver() {
     cat > "$TEST_ROOT/mock_api.py" <<'EOF'
 import http.server, json, os, sys
@@ -975,9 +976,15 @@ class H(http.server.BaseHTTPRequestHandler):
         data = json.dumps(payload).encode()
         self.send_response(status); self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data))); self.end_headers(); self.wfile.write(data)
+    def nth(self, name, default, n):
+        values = setting(name, default).split()
+        return values[min(n, len(values) - 1)]
     def do_POST(self):
-        status = int(setting("wol.status", "201"))
-        self.answer(status, {"ok": status == 201, "device": "backup", "id": "abc123def456", "client": "x",
+        n = int(setting("wol.count", "0"))
+        open(os.path.join(root, "wol.count"), "w").write(str(n + 1))
+        status = int(self.nth("wol.status", "201", n))
+        self.answer(status, {"ok": status == 201, "device": "backup", "id": self.nth("wol.ids", "abc123def456", n),
+                             "client": "x",
                              "ttl": 900, "online": status == 201, "woken": setting("wol.woken", "true") == "true",
                              "message": "Magic packet sent"})
     def do_PUT(self): self.answer(200, {"ok": True, "id": "abc123def456"})
@@ -986,7 +993,7 @@ s = http.server.HTTPServer(("127.0.0.1", int(sys.argv[2]) if len(sys.argv) > 2 e
 open(os.path.join(root, "api.port"), "w").write(str(s.server_address[1]))
 s.serve_forever()
 EOF
-    rm -f "$TEST_ROOT/api.port" "$TEST_ROOT/api.log"
+    rm -f "$TEST_ROOT/api.port" "$TEST_ROOT/api.log" "$TEST_ROOT/wol.count" "$TEST_ROOT/wol.ids"
     python3 "$TEST_ROOT/mock_api.py" "$TEST_ROOT" &
     MOCK_API_PID=$!
     local i=0; while [ ! -s "$TEST_ROOT/api.port" ] && [ $i -lt 50 ]; do sleep 0.1; i=$((i+1)); done
@@ -1074,6 +1081,7 @@ test_42_wol_device_not_awake() {
     # and is ended - without asking for sleep, the device was never seen awake.
     _start_mock_wolserver
     echo 504 > "$TEST_ROOT/wol.status"
+    set_config "WOL_WAKE_RETRIES" "0"
     local mark; mark=$(wc -l < "$LOG_FILE")
     local ret; _run_with_wolserver 0
     kill "$MOCK_API_PID" 2>/dev/null
@@ -1081,6 +1089,35 @@ test_42_wol_device_not_awake() {
         || { echo -e "    ${RED}[FAIL] $(grep DELETE "$TEST_ROOT/api.log")${NC}"; return 1; }
     tail -n +$((mark + 1)) "$LOG_FILE" | grep -q "WOL-Server: backup requested, but not awake (HTTP 504" \
         || { echo -e "    ${RED}[FAIL] no warning${NC}"; return 1; }
+}
+
+test_65_wol_wake_retry_after_a_hang() {
+    # 504, then 201: the device hung and came up after the plug restarted it.
+    # The second request is open before the first ends (without sleep); the
+    # backup runs, and the device this run woke is put to sleep afterwards.
+    _start_mock_wolserver
+    echo "504 201" > "$TEST_ROOT/wol.status"
+    echo "abc123def456 abc123def457" > "$TEST_ROOT/wol.ids"
+    local mark; mark=$(wc -l < "$LOG_FILE")
+    local ret; _run_with_wolserver 0
+    kill "$MOCK_API_PID" 2>/dev/null
+    [ "$ret" -eq 0 ] || { echo -e "    ${RED}[FAIL] backup failed${NC}"; return 1; }
+    local seq; seq=$(awk '{print $1, $2}' "$TEST_ROOT/api.log" | tr '\n' '|')
+    case "$seq" in
+        "POST /api/devices/backup/requests?wait=300|POST /api/devices/backup/requests?wait=300|DELETE /api/devices/backup/requests/abc123def456|RSYNC "*"|DELETE /api/devices/backup/requests/abc123def457?then=sleep|") ;;
+        *) echo -e "    ${RED}[FAIL] order: $seq${NC}"; return 1 ;;
+    esac
+    tail -n +$((mark + 1)) "$LOG_FILE" | grep -q "WOL-Server: backup not awake (HTTP 504: Magic packet sent) - requesting it again (1/1)" \
+        || { echo -e "    ${RED}[FAIL] no retry message${NC}"; return 1; }
+    # Two 504s with one retry: the second request is the one that is ended
+    _start_mock_wolserver
+    echo 504 > "$TEST_ROOT/wol.status"
+    echo "abc123def456 abc123def457" > "$TEST_ROOT/wol.ids"
+    _run_with_wolserver 0
+    kill "$MOCK_API_PID" 2>/dev/null
+    seq=$(awk '{print $1, $2}' "$TEST_ROOT/api.log" | grep -v RSYNC | tr '\n' '|')
+    [ "$seq" = "POST /api/devices/backup/requests?wait=300|POST /api/devices/backup/requests?wait=300|DELETE /api/devices/backup/requests/abc123def456|DELETE /api/devices/backup/requests/abc123def457|" ] \
+        || { echo -e "    ${RED}[FAIL] two 504s: $seq${NC}"; return 1; }
 }
 
 test_54_wol_heartbeat_while_the_run_lasts() {
@@ -1677,5 +1714,6 @@ run_test_case "61 Waits for the Network (WOL-Server)" test_61_waits_for_the_netw
 run_test_case "62 Waits for the Backup Server" test_62_waits_for_the_backup_server
 run_test_case "63 Wrapper Holds an Inhibitor" test_63_wrapper_holds_an_inhibitor
 run_test_case "64 Monitor Keeps Up with rsync" test_64_monitor_keeps_up_with_rsync
+run_test_case "65 WOL-Server Wake Retry After a Hang" test_65_wol_wake_retry_after_a_hang
 
 print_summary
