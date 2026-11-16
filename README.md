@@ -1,6 +1,6 @@
 # snapshot-backup.sh - Intelligent Incremental Backup
 
-⚠️ **STATUS: STABLE / PRODUCTION READY (v19.7)**
+⚠️ **STATUS: STABLE / PRODUCTION READY (v19.8)**
 
 ### ⚖️ DISCLAIMER / LIMITATION OF LIABILITY
 
@@ -294,7 +294,7 @@ sudo snapshot-backup.sh --umount /tmp/restore_point
 
 ### A. Strict Side-Effect Isolation
 
-The remote agent is designed to be "clean". Commands like `--version`, `--status`, or `--check-storage` do **not** create directories or modify the filesystem on the server. Storage folders are only initialized when a write operation (like `prepare` or `commit`) is explicitly requested.
+The remote agent is designed to be "clean". Commands like `--version`, `--status`, or `--check-storage` do **not** create directories or modify the filesystem on the server. A client's storage folder is created only by `prepare`, the first step of a backup; `--check-storage` answers for a client without one whether `prepare` could create it. `commit` and `purge` without a folder fail.
 
 ### B. Why are snapshots missing from the Base Level?
 
@@ -502,24 +502,42 @@ How long a run waits for a network that is not there yet. A machine that its tim
 **`RSYNC_EXTRA_OPTS`** (Default: empty)
 Additional flags to pass directly to the `rsync` command.
 
-###The client connects to the server and starts a temporary, unprivileged agent. 
+**`RSYNC_ACCEPT_CODES`** (Default: `24`)
+rsync exit codes besides `0` that count as a complete transfer, separated by spaces. `24` means files vanished while a live filesystem was read — normal every night, and not logged. Any other code in the list is logged as a warning and the snapshot is committed. `"23 24"` also accepts code 23, files that could not be read — useful for a Windows share with locked files, but the snapshot then lacks those files; rsync's line for each of them stays in the log as an error. A code not in the list fails the run, and nothing is committed.
 
 ### G. Agent Configuration (Server-Side)
 
-When running in Agent Mode (on the backup server), the script optionally reads `/etc/snapshot-agent.conf`. This file is not created by default but can be used to override server-side defaults.
+In Agent Mode (on the backup server) the script reads `/etc/snapshot-agent.conf` if it exists. The file is sourced as shell code by every client's key, so it is read only when it **belongs to root and is writable by nobody else** (e.g. mode `600` or `644`); otherwise every agent action fails with a message saying so. `--config FILE` (for an administrator; the wrapper refuses it from clients) reads `FILE` instead. `version` answers without reading either. Client and server must run 19.8 or later for everything below.
+
+The config holds what belongs to the server. A client cannot send commands or settings: it triggers only the known actions (`prepare`, `commit`, `purge`, `release`, …), and what runs at each of them is written here, in a file owned by root.
 
 **Key Variables:**
 
-- `BASE_STORAGE_PATH`: (Default: `/var/backups/snapshots`) The root directory where all client backups are stored.
+- `BASE_STORAGE_PATH` (or `BASE_STORAGE`): (Default: `/var/backups/snapshots`) The root directory where all client backups are stored. Run `--install` after changing it: the wrapper takes its storage root from here.
 
-- `AGENT_LOCK_DIR`: (Default: `/var/run/snapshot-agent`) Directory for lock files to prevent concurrent access to the same client store.
+- `AGENT_LOCK_DIR`: (Default: `/var/run/snapshot-agent`) Directory for lock files to prevent concurrent access to the same client store. `LOCK_DIR` in this file sets it too.
 
-**Example `/etc/snapshot-agent.conf`:**
+- `STORAGE_REQUIRE_MOUNT`: (Default: empty) A mount point that must be mounted before the agent touches the storage, e.g. `/backup`. `BASE_STORAGE_PATH` must lie below it. Without the mount every action is refused (`check-storage` answers `false`; with `AGENT_PRE_CMD` set it answers `true`, see below), and no folder is created below the empty mount point — a backup does not quietly fill the system disk while the RAID is missing.
+
+- `AGENT_PRE_CMD`: (Default: empty) Runs at `prepare`, after the client's lock is taken and before the storage is checked, with the client name as `$1`. A failure stops `prepare`.
+
+- `AGENT_POST_CMD`: (Default: empty) Runs after a successful `purge` with `$1` = client, `$2` = `0`, and on `release` with `$2` = `1`. Its failure is logged and changes nothing else.
+
+- `AGENT_HOOK_TIMEOUT`: (Default: `600`) Seconds each hook may take; `0` = no limit.
+
+**Storage mounted on demand.** Transfer, `commit` and `purge` are separate SSH calls, so whatever `AGENT_PRE_CMD` sets up has to last from `prepare` until after `purge`. A client run that fails in between sends `release` from its cleanup path, which runs only `AGENT_POST_CMD`. A client that crashes sends nothing: the storage then stays mounted until this client's next run ends — the safe side, the data lands on the RAID and not on the system disk. Mount scripts that keep one mark per caller and unmount only when no mark is left fit this well:
 
 ```
 CONFIG_VERSION="2.0"
-BASE_STORAGE_PATH="/mnt/bigraid/backups"
+BASE_STORAGE_PATH="/backup/snapshots"
+STORAGE_REQUIRE_MOUNT="/backup"
+AGENT_PRE_CMD='/usr/local/sbin/mount.sh "snapshot-$1"'
+AGENT_POST_CMD='/usr/local/sbin/umount.sh "snapshot-$1"'
 ```
+
+Use **single quotes** around a hook that refers to `$1`: in double quotes it is expanded while the file is read. Hook output goes to the agent's log and stderr, never to the client's answer.
+
+With `AGENT_PRE_CMD` set, `check-storage` (the client's `--has-storage`, which the dispatcher asks before a run) answers `true` while the mount is missing: the storage comes with `prepare`, and whether that works shows at `prepare`. `status` and `check-job-done` are refused while it is missing.
 
 ### H. Root Requirement & Security Trade-Off
 
@@ -553,7 +571,7 @@ This tool is designed for **System Backups**, which inherently requires root pri
 
 The wrapper (`snapshot-wrapper.sh`, generated by `--install`, plain POSIX `sh` so that it also runs on busybox machines) confines the key to **CLIENT**:
 
-- **Agent:** only `prepare`, `commit`, `purge`, `status`, `check-storage`, `check-job-done` with `--client CLIENT`, plus `version`. Refused: `install`, any other client, and **`--config`** — the agent sources that file as shell code, so a client that uploaded one could have run anything as root.
+- **Agent:** only `prepare`, `commit`, `purge`, `release`, `status`, `check-storage`, `check-job-done` with `--client CLIENT`, plus `version`. Refused: `install`, any other client, and **`--config`** — the agent sources that file as shell code, so a client that uploaded one could have run anything as root.
 - **rsync:** only as a server, only below `BASE_STORAGE_PATH/CLIENT` (resolved through symlinks, so a link a client planted in its own tree does not lead out of it), only with known options. Refused among others: protect-args (`-s`, it would hide the paths from the check), `-K`/`-L`/`-k` (follow links out of the tree), `--log-file`, `--temp-dir`, a `--link-dest` into another client.
 - **sftp** (`--mount`): **not by default.** `sftp-server` cannot be confined — `-R -d` means read-only and a starting directory, not a jail — so it reads the whole server as root, other clients' backups and `/etc/shadow` included. A key that needs `--mount` gets it explicitly, knowing what it grants: `command="/usr/local/bin/snapshot-wrapper.sh CLIENT --allow-mount",…`. Real confinement would take a server-side `ChrootDirectory` in `sshd_config`, which a forced command cannot provide.
 - anything else, interactive logins included: refused, and logged with `logger -t snapshot-wrapper`.
@@ -568,6 +586,14 @@ Consequently a client key can no longer **deploy** the agent (`--deploy-agent`, 
 ---
 
 ## 📆 Version History
+- **v19.8:** Storage on the server that is mounted only while a client backs up. Run `--install` on the server: the wrapper has to let `release` through.
+  - **The agent reads `/etc/snapshot-agent.conf`.** The README promised it, but the agent read a config only with `--config`, which the wrapper refuses from clients — a setting in that file had no effect. The file is read only when it belongs to root and nobody else can write it. **Before upgrading a server that has one,** check it: a `BASE_STORAGE_PATH` there now applies and must match the clients' `REMOTE_STORAGE_ROOT`, and the file needs `CONFIG_VERSION="2.0"`.
+  - `STORAGE_REQUIRE_MOUNT`: without that mount the agent refuses every storage action and creates nothing below the empty mount point.
+  - `AGENT_PRE_CMD` before `prepare`, `AGENT_POST_CMD` after `purge` or on the new action `release`, each with the client name, defined only on the server; `AGENT_HOOK_TIMEOUT` limits them. A client run that fails after `prepare` sends `release` from its cleanup path (only to an agent of 19.8 or later).
+  - A client's storage folder is created only by `prepare`. Every other action created it as well, `status` and `check-storage` included — on a server with storage mounted on demand, below the empty mount point on the system disk.
+  - `RSYNC_ACCEPT_CODES` (default `24`): rsync exit codes that count as a complete transfer. `"23 24"` accepts unreadable files, e.g. on a Windows share; the code is logged as a warning.
+  - Tests 66–68; test 18 now expects `check-storage` to leave the folder alone.
+  - The test suite removes its loopback key from root's `authorized_keys` again; every remote test used to leave one unrestricted key behind. Keys from earlier runs end in `root@HOSTNAME` and have to be removed by hand once. Test 69.
 - **v19.7:** A run asks the WOL-Server again when the device did not come up in time. A backup server that hung while starting (in the firmware, before the kernel) stays deaf to magic packets; the WOL-Server's *Restart when it hangs* power-cycles and wakes it, but only after its *Restart after* time, and the first request had given up with HTTP 504 by then — the run ended with "Server unreachable" although the server was back minutes later. `WOL_WAKE_RETRIES` (default `1`) makes that many further requests, each waiting up to `WOL_WAIT_SECONDS` again; the new request is open before the old one ends, and a device the run woke is still put to sleep afterwards. Test 65.
 - **v19.6:** Remote backups with many changed files no longer crawl. The loop that reads rsync's output holds rsync up while it works on a line, and every line cost about a dozen processes (`grep`, `date`, `sed`, `dirname`) — even the file names of `-v`, which outside debug mode were thrown away afterwards. A run with tens of thousands of changed files, such as after a kernel update, crawled at about 100 files per second. Now rsync lists the files only with `--debug`, the loop uses shell patterns instead of `grep` and reads the clock from `/proc/uptime`, and `log()` returns from a discarded DEBUG line before it starts anything. Measured with 20,000 new small files over ssh: 200–234 s before, 4.3 s now (debug mode: 199 s → 50 s). The progress notification keeps working: `--info=progress2` ends its updates with `\r`, which now become lines. The installed wrappers accept the shorter option string; nothing to do on the server. Test 64.
 - **v19.5:** Backup processes on the server announce themselves. The wrapper runs every agent action and every `rsync` it allows under a block inhibitor against shutdown and sleep, named after the client (`snapshot-backup:CLIENT`). A backup server that is switched off when idle can then refuse, and say which client is still writing, by asking the system — before, a sleep guard had to guess from command lines, and a shell that only mentioned "snapshot-agent" kept the server on. Without `systemd-inhibit` (busybox) the wrapper runs the process directly; `--install` writes the path, or nothing, into the wrapper. Run `--install` on the server to get it. Test 63, under sh, dash, bash and busybox.

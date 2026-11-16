@@ -3,7 +3,7 @@
 # ==============================================================================
 ## @file    snapshot-backup.sh
 ## @brief   Unified Snapshot Backup Client & Agent (POSIX sh)
-## @version 19.7
+## @version 19.8
 ##
 ## @note    DEVIATION FROM STRICT POSIX:
 ##          This script utilizes the 'local' keyword for variable scoping.
@@ -29,7 +29,7 @@ umask 0077
 # 1. CONSTANTS & CONFIGURATION DEFAULTS
 # ==============================================================================
 
-SCRIPT_VERSION="19.7"
+SCRIPT_VERSION="19.8"
 EXPECTED_CONFIG_VERSION="2.0"
 
 # --- System Paths ---
@@ -59,6 +59,15 @@ readonly DEFAULT_AGENT_CONFIG="/etc/snapshot-agent.conf"
 AGENT_LOCK_DIR="/var/run/snapshot-agent"
 AGENT_CONFIG_FILE="$DEFAULT_AGENT_CONFIG"
 BASE_STORAGE_PATH="/var/backups/snapshots"
+# A mount point that must be mounted before the agent touches BASE_STORAGE_PATH,
+# so that nothing lands on the system disk below an empty mount point. Empty: no check.
+STORAGE_REQUIRE_MOUNT=""
+# Server-side hooks, run with the client name as $1. AGENT_PRE_CMD before
+# prepare; AGENT_POST_CMD after purge ($2=0) or on release ($2=1). Transfer,
+# commit and purge are separate SSH calls, so what PRE sets up spans all of them.
+AGENT_PRE_CMD=""
+AGENT_POST_CMD=""
+AGENT_HOOK_TIMEOUT=600
 
 # --- Configuration Defaults (Global) ---
 BACKUP_MODE="LOCAL"
@@ -94,6 +103,9 @@ SPACE_LOW_LIMIT_GB=0
 SMART_PURGE_SLOTS=0
 LOG_PROGRESS_INTERVAL=60
 RSYNC_EXTRA_OPTS=""
+# rsync exit codes besides 0 that count as a complete transfer. 24: files
+# vanished while a live filesystem was read.
+RSYNC_ACCEPT_CODES="24"
 DEEP_VERIFY_INTERVAL_DAYS="35"
 ENABLE_NOTIFICATIONS=true
 NETWORK_TIMEOUT=10
@@ -106,6 +118,11 @@ FORCE_VERIFY=false
 # POST hook is owed; _RUN_EXIT_CODE is what the POST hook is told.
 _HOOKS_ARMED=false
 _RUN_EXIT_CODE=1
+# Seconds a hook may take; 0: no limit. The agent sets it from AGENT_HOOK_TIMEOUT.
+_HOOK_TIMEOUT=0
+# REMOTE: set from prepare until purge succeeded; the cleanup then sends release.
+_AGENT_RELEASE_OWED=false
+REMOTE_AGENT_VERSION=""
 
 # Hook commands, normally set in the config file.
 PRE_RUN_CMD=""
@@ -1058,6 +1075,16 @@ check_rsync_capabilities() {
     fi
 }
 
+## @brief Returns 0 when rsync's exit code $1 counts as a complete transfer:
+## 0, or one of RSYNC_ACCEPT_CODES.
+rsync_code_accepted() {
+    [ "$1" -eq 0 ] && return 0
+    case " $RSYNC_ACCEPT_CODES " in
+        *" $1 "*) return 0 ;;
+    esac
+    return 1
+}
+
 ## @brief Wrapper for rsync with retry logic (Remote only).
 run_with_retry() {
     local max_retries=3
@@ -1072,8 +1099,7 @@ run_with_retry() {
         run_monitored_rsync "$@"
         exit_code=$?
         
-        # 0=Success, 24=Vanished files (Success for backup)
-        if [ "$exit_code" -eq 0 ] || [ "$exit_code" -eq 24 ]; then
+        if rsync_code_accepted "$exit_code"; then
             return "$exit_code"
         fi
         
@@ -1164,8 +1190,11 @@ run_monitored_rsync() {
     rm -f "$status_file"
     case "$rsync_exit" in ''|*[!0-9]*) log "ERROR" "rsync ended without an exit status."; rsync_exit=255 ;; esac
     
-    if [ "$rsync_exit" -ne 0 ] && [ "$rsync_exit" -ne 24 ]; then
+    # 24 stays quiet: files vanish from a live filesystem every night.
+    if ! rsync_code_accepted "$rsync_exit"; then
         log "ERROR" "Rsync failed with code $rsync_exit"
+    elif [ "$rsync_exit" -ne 0 ] && [ "$rsync_exit" -ne 24 ]; then
+        log "WARN" "Rsync ended with code $rsync_exit - accepted as complete (RSYNC_ACCEPT_CODES)."
     fi
     return "$rsync_exit"
 }
@@ -1239,9 +1268,8 @@ core_backup_execution() {
             return
         fi
 
-        # 0 and 24 (files vanished while being read) are both a complete
-        # copy of a live filesystem; anything else is not. A plain "if !"
-        # counted 24 as a failure, and the caller then ignored the result.
+        # 0 and the codes in RSYNC_ACCEPT_CODES are a complete copy; anything
+        # else is not, and the run must not commit it.
         local rc=0
         if [ "$_CTX_MODE" = "REMOTE" ]; then
              run_with_retry rsync $_CTX_RSYNC_OPTS -e "$_CTX_SSH_CMD_OPTS" --exclude-from="$TEMP_EXCLUDE_FILE" -R "$src" "$_CTX_DEST_BASE/" || rc=$?
@@ -1252,7 +1280,7 @@ core_backup_execution() {
              # than "/" such a pattern silently matched nothing.
              run_monitored_rsync rsync $_CTX_RSYNC_OPTS --exclude-from="$TEMP_EXCLUDE_FILE" -R "$src" "$_CTX_DEST_BASE/" || rc=$?
         fi
-        case "$rc" in 0|24) ;; *) _CTX_VERIFY_STATUS=1 ;; esac
+        rsync_code_accepted "$rc" || _CTX_VERIFY_STATUS=1
     }
     
     iterate_list "$SOURCE_DIRS" _exec_item
@@ -1309,12 +1337,14 @@ _perform_remote_backup_logic() {
     local c_opts
     c_opts="$(get_retention_args)"
 
-    # The agent reads no config of its own, so it only knows what it is told.
+    # Retention and purge limits come from the client; the agent's own config
+    # holds only what belongs to the server (storage, mount, hooks).
     # An agent older than 18.7 skips options it does not know.
     local p_opts=""
     [ "$SPACE_LOW_LIMIT_GB" -gt 0 ] && p_opts="--smart-purge-limit $SPACE_LOW_LIMIT_GB --smart-purge-slots $SMART_PURGE_SLOTS"
     
     local target_suffix
+    _AGENT_RELEASE_OWED=true
     target_suffix=$(run_remote_cmd "$REMOTE_AGENT --action prepare --client $CLIENT_NAME $c_opts $p_opts") || die "Remote preparation failed."
     target_suffix=$(echo "$target_suffix" | grep -E "^${BASE_INTERVAL}\.0(\.tmp)?$")
     if [ -z "$target_suffix" ]; then die "Invalid remote target received."; fi
@@ -1345,7 +1375,8 @@ _perform_remote_backup_logic() {
     [ "$FORCE_VERIFY" = true ] && record_verify_done
     
     run_remote_cmd "$REMOTE_AGENT --action purge --client $CLIENT_NAME $c_opts $p_opts" || exit 1
-    
+    _AGENT_RELEASE_OWED=false
+
     log "INFO" "Backup Summary: Success."
 }
 
@@ -1418,17 +1449,76 @@ validate_client_name() {
     esac
 }
 
-## @brief Main entry point for Agent mode operations.
-agent_main() {
-    for arg in "$@"; do
-        if [ "$arg" = "--version" ]; then echo "$SCRIPT_VERSION"; exit 0; fi
-    done
+## @brief Reads the server's agent configuration, if there is one.
+##
+## Every client key reaches the agent as root, and the agent sources this file
+## as shell code: it is read only when it belongs to root and nobody else can
+## write it.
+load_agent_config() {
+    local f="$1" owner mode
+    [ -f "$f" ] || return 0
+    owner=$(stat -c %u "$f" 2>/dev/null)
+    mode=$(stat -c %a "$f" 2>/dev/null)
+    case "$mode" in ''|*[!0-7]*) die "Could not read owner and mode of $f." ;; esac
+    [ "$owner" = "0" ] || die "$f does not belong to root - not reading it."
+    [ $(( 0$mode & 022 )) -eq 0 ] || die "$f is writable by group or others - not reading it."
+    load_config "$f"
+}
 
-    local action=""
+## @brief Returns 0 when STORAGE_REQUIRE_MOUNT is unset or mounted.
+storage_mounted() {
+    [ -n "$STORAGE_REQUIRE_MOUNT" ] || return 0
+    local m="${STORAGE_REQUIRE_MOUNT%/}"
+    [ -n "$m" ] || m="/"
+    if command -v mountpoint >/dev/null 2>&1; then
+        mountpoint -q "$m"
+        return
+    fi
+    awk -v m="$m" '$2 == m { found = 1 } END { exit !found }' /proc/mounts
+}
+
+## @brief Answers check-storage: can this client's snapshots be written?
+##
+## A client without a tree yet gets one only from prepare; until then the
+## question is whether prepare could create it, which access(2) answers for the
+## nearest existing parent without writing anything there.
+agent_check_storage() {
+    if [ -d "$BACKUP_ROOT" ]; then
+        if touch "$BACKUP_ROOT/.w_test" 2>/dev/null; then
+            rm -f "$BACKUP_ROOT/.w_test"
+            return 0
+        fi
+        return 1
+    fi
+    local p="$BACKUP_ROOT"
+    while [ ! -d "$p" ]; do p=$(dirname "$p"); done
+    [ -w "$p" ]
+}
+
+## @brief Main entry point for Agent mode operations.
+##
+## Without --config the agent reads DEFAULT_AGENT_CONFIG; with it, that file
+## instead. Arguments given on the command line override both.
+agent_main() {
+    local arg prev="" explicit_config=false
+    for arg in "$@"; do
+        case "$arg" in
+            --version) echo "$SCRIPT_VERSION"; exit 0 ;;
+            --config|-c) explicit_config=true ;;
+        esac
+        # The version answers without reading the config: a broken config
+        # then fails prepare with its own message, instead of making the
+        # connection test report an unreachable server.
+        if [ "$prev" = "--action" ] && [ "$arg" = "version" ]; then echo "$SCRIPT_VERSION"; exit 0; fi
+        prev="$arg"
+    done
+    [ "$explicit_config" = true ] || load_agent_config "$DEFAULT_AGENT_CONFIG"
+
+    local action="" client_given=false
     while [ $# -gt 0 ]; do
         case $1 in
             --action) action="$2"; shift 2 ;;
-            --client) CLIENT_NAME="$2"; validate_client_name "$CLIENT_NAME"; shift 2 ;;
+            --client) CLIENT_NAME="$2"; validate_client_name "$CLIENT_NAME"; client_given=true; shift 2 ;;
             --retain-hourly) RETAIN_HOURLY=$(sanitize_int "$2"); shift 2 ;;
             --retain-daily) RETAIN_DAILY=$(sanitize_int "$2"); shift 2 ;;
             --retain-weekly) RETAIN_WEEKLY=$(sanitize_int "$2"); shift 2 ;;
@@ -1457,31 +1547,64 @@ agent_main() {
     }
     
     BACKUP_ROOT="$BASE_STORAGE_PATH/${CLIENT_NAME:-unknown}"
-    
-    if [ ! -d "$BACKUP_ROOT" ]; then
-        log "INFO" "Creating new client root: $BACKUP_ROOT"
-        log "DEBUG" "used by action: $action"
-        mkdir -p "$BACKUP_ROOT"
-    else
-        for snap_dir in "$BACKUP_ROOT"/*; do
-            if [ -d "$snap_dir" ]; then
-                # chmod ist schnell bei Verzeichnissen (Metadaten-Operation)
-                chmod 700 "$snap_dir"
-            fi
-        done
+    _HOOK_TIMEOUT="$AGENT_HOOK_TIMEOUT"
+
+    # Hook output goes to stderr: the client reads prepare's stdout as the target.
+    if [ "$action" = "release" ]; then
+        [ "$client_given" = true ] || die "release without --client."
+        run_hook "AGENT_POST_CMD" "$AGENT_POST_CMD" "$CLIENT_NAME" 1 >&2
+        exit $?
     fi
-    chmod 700 "$BACKUP_ROOT"
-    
+
+    if [ -n "$STORAGE_REQUIRE_MOUNT" ]; then
+        case "${BASE_STORAGE_PATH%/}/" in
+            "${STORAGE_REQUIRE_MOUNT%/}/"*) ;;
+            *) die "BASE_STORAGE_PATH '$BASE_STORAGE_PATH' is not below STORAGE_REQUIRE_MOUNT '$STORAGE_REQUIRE_MOUNT'." ;;
+        esac
+    fi
+
+    if [ "$action" = "prepare" ]; then
+        agent_lock
+        run_hook "AGENT_PRE_CMD" "$AGENT_PRE_CMD" "$CLIENT_NAME" >&2 \
+            || die "AGENT_PRE_CMD failed - not preparing '$CLIENT_NAME'."
+    fi
+
+    if ! storage_mounted; then
+        # Storage that AGENT_PRE_CMD mounts is there for a backup, though not now.
+        if [ "$action" = "check-storage" ]; then
+            if [ -n "$AGENT_PRE_CMD" ]; then
+                log "INFO" "$STORAGE_REQUIRE_MOUNT is not mounted; AGENT_PRE_CMD mounts it at prepare."
+                echo "true"
+                exit 0
+            fi
+            echo "false"
+        fi
+        die "$STORAGE_REQUIRE_MOUNT is not mounted - refusing '$action' for '$CLIENT_NAME'."
+    fi
+
+    # Only prepare creates a client's tree (core_prepare_backup_target).
+    if [ -d "$BACKUP_ROOT" ]; then
+        for snap_dir in "$BACKUP_ROOT"/*; do
+            [ -d "$snap_dir" ] && chmod 700 "$snap_dir"
+        done
+        chmod 700 "$BACKUP_ROOT"
+    fi
+
     BASE_INTERVAL=$(detect_base_interval)
-    
+
     if [ "$action" = "prepare" ] || [ "$action" = "commit" ] || [ "$action" = "purge" ] || [ "$action" = "check-storage" ]; then
         check_dependencies
         check_rsync_capabilities
     fi
 
     case "$action" in
+        commit|purge)
+            [ -d "$BACKUP_ROOT" ] || die "No snapshots of '$CLIENT_NAME' in $BASE_STORAGE_PATH - $action without prepare."
+            ;;
+    esac
+
+    case "$action" in
         prepare)
-            agent_lock
             make_room_before_backup "$BASE_INTERVAL" >&2
             local full_path
             full_path=$(core_prepare_backup_target "$BASE_INTERVAL") || die "prepare failed for '$CLIENT_NAME'."
@@ -1499,6 +1622,9 @@ agent_main() {
         purge)
             agent_lock
             core_perform_all_promotions || die "purge failed for '$CLIENT_NAME'."
+            # Its failure leaves the storage as it is, which is the safe side;
+            # the snapshot is complete either way.
+            run_hook "AGENT_POST_CMD" "$AGENT_POST_CMD" "$CLIENT_NAME" 0 >&2 || true
             ;;
         status)
             print_snapshot_table "$BACKUP_ROOT"
@@ -1514,8 +1640,7 @@ agent_main() {
             exit 0
             ;; 
         check-storage)
-            if touch "$BACKUP_ROOT/.w_test" 2>/dev/null; then
-                rm "$BACKUP_ROOT/.w_test"
+            if agent_check_storage; then
                 echo "true"
             else
                 echo "false"
@@ -1640,7 +1765,7 @@ check_agent() {
     done
     case "$action" in
         version) return 0 ;;
-        prepare|commit|purge|status|check-storage|check-job-done) [ -n "$client_ok" ] || { refuse "$action without --client"; return 1; } ;;
+        prepare|commit|purge|release|status|check-storage|check-job-done) [ -n "$client_ok" ] || { refuse "$action without --client"; return 1; } ;;
         *) refuse "agent action not allowed: $action"; return 1 ;;
     esac
 }
@@ -1823,6 +1948,10 @@ load_config() {
         # PIDFILE the config actually chose.
         LOCK_DIR=""
         . "$config_file"
+        # Only a LOCK_DIR the file names moves the agent's locks; the derived
+        # one is the client's own lock, which the agent must not fill on a
+        # server that is also a client.
+        [ -n "${LOCK_DIR:-}" ] && AGENT_LOCK_DIR="$LOCK_DIR"
         [ -z "${LOCK_DIR:-}" ] && LOCK_DIR="${PIDFILE%.pid}.lock"
 
         # A number the shell cannot read makes every test on it false: before
@@ -1831,12 +1960,19 @@ load_config() {
         for var in RETAIN_HOURLY RETAIN_DAILY RETAIN_WEEKLY RETAIN_MONTHLY RETAIN_YEARLY \
                    SPACE_LOW_LIMIT_GB SMART_PURGE_SLOTS DEEP_VERIFY_INTERVAL_DAYS \
                    NETWORK_TIMEOUT NETWORK_WAIT_SECONDS LOG_PROGRESS_INTERVAL WOL_WAIT_SECONDS WOL_TTL \
-                   WOL_HEARTBEAT_SECONDS WOL_WAKE_RETRIES; do
+                   WOL_HEARTBEAT_SECONDS WOL_WAKE_RETRIES AGENT_HOOK_TIMEOUT; do
             eval "val=\"\${$var:-}\""
             case "$val" in
                 ''|*[!0-9]*) die "Config $config_file: $var must be a whole number, not '$val'." ;;
             esac
         done
+        case "${RSYNC_ACCEPT_CODES:-}" in
+            *[!0-9\ ]*) die "Config $config_file: RSYNC_ACCEPT_CODES must be numbers separated by spaces, not '$RSYNC_ACCEPT_CODES'." ;;
+        esac
+        case "${STORAGE_REQUIRE_MOUNT:-}" in
+            ''|/*) ;;
+            *) die "Config $config_file: STORAGE_REQUIRE_MOUNT must be an absolute path, not '$STORAGE_REQUIRE_MOUNT'." ;;
+        esac
         case "${WOL_RESOLVE:-}" in
             *[!0-9A-Fa-f.:]*) die "Config $config_file: WOL_RESOLVE must be an IP address, not '$WOL_RESOLVE'." ;;
         esac
@@ -1849,8 +1985,6 @@ load_config() {
             log "WARN" "Config $config_file: POWER_API_URL (wakeserver) is no longer supported - see WOL_SERVER_URL."
         fi
     fi
-    
-    if [ -n "${LOCK_DIR:-}" ]; then AGENT_LOCK_DIR="$LOCK_DIR"; fi
     
     BACKUP_ROOT="${BACKUP_ROOT:-$DEFAULT_BACKUP_ROOT}"
     BACKUP_MODE="${BACKUP_MODE:-LOCAL}"
@@ -1916,9 +2050,19 @@ run_hook() {
     log "INFO" "Hook $name: $cmd"
     # The config carries a command line, not a path, so it goes through sh -c:
     # arguments and shell constructs in it have to survive.
-    sh -c "$cmd" -- "$@"
-    local rc=$?
-    [ "$rc" -ne 0 ] && log "ERROR" "Hook $name failed with exit $rc"
+    local limit rc
+    limit=$(sanitize_int "${_HOOK_TIMEOUT:-0}")
+    if [ "$limit" -gt 0 ]; then
+        compat_run_with_timeout "$limit" sh -c "$cmd" -- "$@"
+    else
+        sh -c "$cmd" -- "$@"
+    fi
+    rc=$?
+    if [ "$rc" -eq 124 ] && [ "$limit" -gt 0 ]; then
+        log "ERROR" "Hook $name did not finish within ${limit}s"
+    elif [ "$rc" -ne 0 ]; then
+        log "ERROR" "Hook $name failed with exit $rc"
+    fi
     return $rc
 }
 
@@ -2222,6 +2366,22 @@ inhibit_sleep_stop() {
     _INHIBIT_PID=""
 }
 
+## @brief Tells the agent that a run which got as far as prepare ends without
+## purge, so that its AGENT_POST_CMD can undo what AGENT_PRE_CMD set up.
+##
+## The agent holds its storage from prepare until purge, across separate SSH
+## calls. A client that dies without sending this leaves the storage as it is
+## until the next run of this client releases it - mounted, the safe side.
+release_remote_storage() {
+    if [ -n "$REMOTE_AGENT_VERSION" ] && version_gt "19.8" "$REMOTE_AGENT_VERSION"; then
+        log "DEBUG" "Agent $REMOTE_AGENT_VERSION has no release action."
+        return 0
+    fi
+    # The limit covers an unmount that still has to flush its writes.
+    run_remote_cmd_with_timeout 300 "$REMOTE_AGENT --action release --client $CLIENT_NAME" >/dev/null \
+        || log "WARN" "Could not release the storage on $REMOTE_HOST; it stays as it is until the next run of $CLIENT_NAME."
+}
+
 cleanup() {
     if [ "$AGENT_MODE" = true ]; then
         agent_cleanup
@@ -2246,6 +2406,12 @@ cleanup() {
     
     if [ -n "${TEMP_EXCLUDE_FILE:-}" ] && [ -f "$TEMP_EXCLUDE_FILE" ]; then
         rm -f "$TEMP_EXCLUDE_FILE"
+    fi
+
+    # Before the WOL request ends: the server has to be awake to hear it.
+    if [ "${_AGENT_RELEASE_OWED:-false}" = true ]; then
+        _AGENT_RELEASE_OWED=false
+        release_remote_storage
     fi
 
     # POST_RUN_CMD belongs here rather than at the end of the happy path: this
@@ -2416,6 +2582,11 @@ PIDFILE="$PIDFILE"
 JOB_DONE_FILE="$JOB_DONE_FILE"
 LOG_PROGRESS_INTERVAL=$LOG_PROGRESS_INTERVAL
 RSYNC_EXTRA_OPTS="$RSYNC_EXTRA_OPTS"
+# rsync exit codes besides 0 that count as a complete transfer, separated by
+# spaces. 24: files vanished during the run. "23 24" also accepts files that
+# could not be read (a Windows share with locked files) - the snapshot is
+# committed without them, and each one is logged.
+RSYNC_ACCEPT_CODES="$RSYNC_ACCEPT_CODES"
 ENABLE_NOTIFICATIONS=$ENABLE_NOTIFICATIONS
 NETWORK_TIMEOUT=$NETWORK_TIMEOUT
 # Seconds a run waits for the network when it is not up yet (woken from standby).
@@ -2539,6 +2710,7 @@ check_dependencies() {
 check_agent_version() {
     local v
     v=$(run_remote_cmd_with_timeout 5 "$REMOTE_AGENT --agent-mode --action version")
+    REMOTE_AGENT_VERSION="$v"
     if [ "$v" != "$SCRIPT_VERSION" ]; then
         log "WARN" "Agent version mismatch (Local: $SCRIPT_VERSION, Remote: $v)."
     fi

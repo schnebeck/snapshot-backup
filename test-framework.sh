@@ -23,6 +23,8 @@ SCRIPT_BIN="$(pwd)/snapshot-backup.sh"
 TEST_SSH_KEY="$TEST_ROOT/id_ed25519_test"
 AUTH_KEYS="$HOME/.ssh/authorized_keys"
 KNOWN_HOSTS="$HOME/.ssh/known_hosts"
+# Comment of the loopback key; remove_loopback_key finds its line by it.
+TEST_KEY_COMMENT="snapshot-backup-test-suite"
 
 # Global Counters
 TESTS_RUN=0
@@ -35,6 +37,7 @@ TEST_FILTER="$1"
 # --- Setup & Teardown ---
 
 init_test_env() {
+    remove_loopback_key
     [ -d "$TEST_ROOT" ] && rm -rf "$TEST_ROOT"
     mkdir -p "$MNT_SRC" "$MNT_DEST" "$SERVER_STORAGE"
     
@@ -55,6 +58,8 @@ PIDFILE="$TEST_ROOT/snapshot-backup.pid"
 # Its own job-done record, for the same reason.
 JOB_DONE_FILE="$TEST_ROOT/job_done"
 WOL_MOUNT_FILE="$TEST_ROOT/wol_mount"
+# The loopback agent reads this file too; its locks stay out of /var/run.
+AGENT_LOCK_DIR="$TEST_ROOT/agent-lock"
 # No waiting for a network that is meant to be unreachable (tests 61, 62 set it).
 NETWORK_WAIT_SECONDS=0
 ENABLE_NOTIFICATIONS=false
@@ -67,8 +72,15 @@ EOF
     echo "==================================================================" >> "$LOG_FILE"
 }
 
+# The loopback key reaches root unrestricted; its line in authorized_keys lives
+# only as long as one test.
+remove_loopback_key() {
+    [ -f "$AUTH_KEYS" ] || return 0
+    sed -i "/ $TEST_KEY_COMMENT\$/d" "$AUTH_KEYS"
+}
+
 setup_loopback_ssh() {
-    ssh-keygen -t ed25519 -f "$TEST_SSH_KEY" -N "" -q
+    ssh-keygen -t ed25519 -f "$TEST_SSH_KEY" -N "" -q -C "$TEST_KEY_COMMENT"
     mkdir -p "$HOME/.ssh"; chmod 700 "$HOME/.ssh"
     cat "$TEST_SSH_KEY.pub" >> "$AUTH_KEYS"; chmod 600 "$AUTH_KEYS"
     ssh-keyscan -p 22 -t ed25519 localhost >> "$KNOWN_HOSTS" 2>/dev/null
@@ -153,6 +165,7 @@ run_test_case() {
 }
 
 print_summary() {
+    remove_loopback_key
     echo "------------------------------------------------"
     echo "Tests Run: $TESTS_RUN | Failures: $TESTS_FAILED"
     if [ "$TESTS_RUN" -eq 0 ]; then

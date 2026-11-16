@@ -1,6 +1,6 @@
 #!/bin/bash
 # file: run-tests.sh
-# Test suite for snapshot-backup.sh v19.6
+# Test suite for snapshot-backup.sh v19.8
 
 source ./test-framework.sh
 
@@ -678,6 +678,8 @@ test_25_wrapper_confines_a_client() {
         _allow AGENT alice "/usr/local/sbin/snapshot-agent.sh --action prepare --client alice --retain-hourly 0 --retain-daily 7 --retain-weekly 4 --retain-monthly 12 --retain-yearly 0"
         _allow AGENT alice "/usr/local/sbin/snapshot-agent.sh --action purge --client alice --retain-daily 7 --smart-purge-limit 20"
         _allow AGENT alice "/usr/local/sbin/snapshot-agent.sh --agent-mode --action version"
+        _allow AGENT alice "/usr/local/sbin/snapshot-agent.sh --action release --client alice"
+        _deny alice "/usr/local/sbin/snapshot-agent.sh --action release --client bob"
         _allow RSYNC alice "rsync --server -vlogDtprRze.iLsfxCIvu --numeric-ids --delete . $store/alice/daily.0.tmp/"
         _allow RSYNC alice "rsync --server --sender -vlogDtprRe.iLsfxCIvu . $store/alice/daily.0/etc"
         _allow RSYNC alice "rsync --server -vlogDtprRze.iLsfxCIvu --numeric-ids --delete --stats . $store/alice/daily.0.tmp/"
@@ -1542,10 +1544,125 @@ EOF
     return 0
 }
 
+test_66_agent_storage_and_hooks() {
+    # The agent's own config holds the hooks and the mount it needs. With the
+    # mount missing it refuses every storage action and creates nothing below
+    # the empty mount point; check-storage still answers true when AGENT_PRE_CMD
+    # mounts on demand, or the dispatcher would never start a run. AGENT_PRE_CMD
+    # runs before prepare, AGENT_POST_CMD after purge ($2=0) and on release ($2=1).
+    local conf="$TEST_ROOT/agent66.conf" mnt="$TEST_ROOT/mnt66" calls="$TEST_ROOT/calls66" out
+    local store="$mnt/store"
+    local a="$SCRIPT_BIN --agent-mode --config $conf"
+    _f() { echo -e "    ${RED}[FAIL] $1${NC}"; }
+    mkdir -p "$mnt"
+    cat > "$conf" <<EOF
+CONFIG_VERSION='2.0'
+BASE_STORAGE="$store"
+AGENT_LOCK_DIR="$TEST_ROOT/agent-lock"
+LOGFILE="$LOG_FILE"
+STORAGE_REQUIRE_MOUNT="$mnt"
+EOF
+
+    # 1. Not mounted, nothing mounts it
+    out=$($a --action check-storage --client c66 2>>"$LOG_FILE") && { _f "check-storage exited 0 without the mount"; return 1; }
+    [ "$out" = "false" ] || { _f "check-storage answered '$out' without the mount"; return 1; }
+    $a --action prepare --client c66 >> "$LOG_FILE" 2>&1 && { _f "prepare ran without the mount"; return 1; }
+    $a --action status --client c66 >> "$LOG_FILE" 2>&1 && { _f "status ran without the mount"; return 1; }
+    assert_missing "$store" || return 1
+
+    # 2. AGENT_PRE_CMD mounts on demand (here it mounts nothing)
+    printf "AGENT_PRE_CMD='echo \"pre \$1\" >> %s'\nAGENT_POST_CMD='echo \"post \$1 \$2\" >> %s'\n" "$calls" "$calls" >> "$conf"
+    out=$($a --action check-storage --client c66 2>>"$LOG_FILE")
+    [ "$out" = "true" ] || { _f "check-storage answered '$out' with AGENT_PRE_CMD"; return 1; }
+    $a --action prepare --client c66 >> "$LOG_FILE" 2>&1 && { _f "prepare ran although the hook mounted nothing"; return 1; }
+    $a --action release --client c66 >> "$LOG_FILE" 2>&1 || { _f "release failed"; return 1; }
+    [ "$(cat "$calls" 2>/dev/null)" = "$(printf 'pre c66\npost c66 1')" ] \
+        || { _f "hook calls: $(tr '\n' '|' < "$calls" 2>/dev/null)"; return 1; }
+    assert_missing "$store" || return 1
+
+    # 3. Mounted ("/" always is): only prepare creates the tree, purge ends with POST
+    : > "$calls"
+    sed -i 's|^STORAGE_REQUIRE_MOUNT=.*|STORAGE_REQUIRE_MOUNT="/"|' "$conf"
+    $a --action status --client c66 >> "$LOG_FILE" 2>&1 || { _f "status failed"; return 1; }
+    out=$($a --action check-storage --client c66 2>>"$LOG_FILE")
+    [ "$out" = "true" ] || { _f "check-storage answered '$out' for a creatable tree"; return 1; }
+    assert_missing "$store/c66" || return 1
+    $a --action commit --client c66 >> "$LOG_FILE" 2>&1 && { _f "commit ran without prepare"; return 1; }
+    out=$($a --action prepare --client c66 2>>"$LOG_FILE") || { _f "prepare failed"; return 1; }
+    case "$out" in daily.0|daily.0.tmp) ;; *) _f "prepare printed '$out' - hook output on stdout?"; return 1 ;; esac
+    assert_exists "$store/c66" || return 1
+    $a --action commit --client c66 >> "$LOG_FILE" 2>&1 || { _f "commit failed"; return 1; }
+    $a --action purge --client c66 >> "$LOG_FILE" 2>&1 || { _f "purge failed"; return 1; }
+    [ "$(cat "$calls")" = "$(printf 'pre c66\npost c66 0')" ] \
+        || { _f "hook calls: $(tr '\n' '|' < "$calls")"; return 1; }
+
+    # 4. Storage outside the mount it depends on
+    sed -i "s|^STORAGE_REQUIRE_MOUNT=.*|STORAGE_REQUIRE_MOUNT=\"$TEST_ROOT/elsewhere\"|" "$conf"
+    $a --action status --client c66 >> "$LOG_FILE" 2>&1 && { _f "storage outside STORAGE_REQUIRE_MOUNT accepted"; return 1; }
+    return 0
+}
+
+test_67_client_releases_after_a_failed_run() {
+    # Transfer, commit and purge are separate SSH calls; a run that fails after
+    # prepare tells the agent with release, so AGENT_POST_CMD undoes what
+    # AGENT_PRE_CMD set up. A complete run ends with purge's POST alone.
+    setup_loopback_ssh
+    local calls="$TEST_ROOT/calls67"
+    printf "AGENT_PRE_CMD='echo \"pre \$1\" >> %s'\nAGENT_POST_CMD='echo \"post \$1 \$2\" >> %s'\n" "$calls" "$calls" >> "$CONF_FILE"
+    echo "data" > "$MNT_SRC/f67"
+    run_backup || { echo -e "    ${RED}[FAIL] first run failed${NC}"; return 1; }
+    [ "$(cat "$calls")" = "$(printf 'pre test-client\npost test-client 0')" ] \
+        || { echo -e "    ${RED}[FAIL] complete run, hook calls: $(tr '\n' '|' < "$calls")${NC}"; return 1; }
+    : > "$calls"
+    set_config "SOURCE_DIRS" "$MNT_SRC $TEST_ROOT/no-such-source67"
+    run_backup && { echo -e "    ${RED}[FAIL] run with a missing source exited 0${NC}"; return 1; }
+    [ "$(cat "$calls")" = "$(printf 'pre test-client\npost test-client 1')" ] \
+        || { echo -e "    ${RED}[FAIL] failed run, hook calls: $(tr '\n' '|' < "$calls")${NC}"; return 1; }
+    return 0
+}
+
+test_68_rsync_accept_codes() {
+    # An rsync exit code in RSYNC_ACCEPT_CODES counts as a complete transfer
+    # and is logged as a warning; any other non-zero code fails the run.
+    local stubs="$TEST_ROOT/stubs68" real
+    real=$(command -v rsync)
+    mkdir -p "$stubs"
+    # Exits 23 (partial transfer) after a real, successful transfer.
+    cat > "$stubs/rsync" <<EOF
+#!/bin/sh
+"$real" "\$@"; rc=\$?
+for a in "\$@"; do [ "\$a" = "-R" ] && [ "\$rc" -eq 0 ] && exit 23; done
+exit \$rc
+EOF
+    chmod +x "$stubs/rsync"
+    echo "data" > "$MNT_SRC/f68"
+    ( PATH="$stubs:$PATH"; run_backup ) && { echo -e "    ${RED}[FAIL] code 23 accepted by default${NC}"; return 1; }
+    assert_missing "$MNT_DEST/daily.0/.backup_timestamp" || return 1
+    set_config "RSYNC_ACCEPT_CODES" "23 24"
+    ( PATH="$stubs:$PATH"; run_backup ) || { echo -e "    ${RED}[FAIL] code 23 failed the run with RSYNC_ACCEPT_CODES=\"23 24\"${NC}"; return 1; }
+    grep -q "WARN.*code 23 - accepted" "$LOG_FILE" || { echo -e "    ${RED}[FAIL] accepted code 23 not logged as a warning${NC}"; return 1; }
+    assert_exists "$MNT_DEST/daily.0/.backup_timestamp" || return 1
+    set_config "RSYNC_ACCEPT_CODES" "23,24"
+    run_backup && { echo -e "    ${RED}[FAIL] RSYNC_ACCEPT_CODES=\"23,24\" accepted${NC}"; return 1; }
+    return 0
+}
+
+test_69_loopback_key_is_removed() {
+    # The loopback key reaches root unrestricted; once removed it must not.
+    local ssh_test="ssh -o BatchMode=yes -o IdentitiesOnly=yes -o ConnectTimeout=5 -i $TEST_SSH_KEY $(whoami)@localhost true"
+    setup_loopback_ssh
+    $ssh_test 2>>"$LOG_FILE" || { echo -e "    ${RED}[FAIL] loopback key not accepted after setup${NC}"; return 1; }
+    remove_loopback_key
+    $ssh_test 2>>"$LOG_FILE" && { echo -e "    ${RED}[FAIL] loopback key still accepted after removal${NC}"; return 1; }
+    grep -q " $TEST_KEY_COMMENT\$" "$AUTH_KEYS" && { echo -e "    ${RED}[FAIL] key line still in $AUTH_KEYS${NC}"; return 1; }
+    return 0
+}
+
 test_18_conditional_storage_creation() {
     # Goal: Verify that storage creation is strictly conditional.
     # Case A: --action version (Read-Only) -> MUST NOT create directory
-    # Case B: --action check-storage (Write) -> MUST create directory
+    # Case B: --action check-storage -> answers true, MUST NOT create directory
+    # Case C: --action prepare -> MUST create directory
     
     local test_storage="$TEST_ROOT/conditional_storage"
     local client_name="test_client_18"
@@ -1559,6 +1676,7 @@ test_18_conditional_storage_creation() {
 CONFIG_VERSION='2.0'
 BASE_STORAGE_PATH="$test_storage"
 CLIENT_NAME="$client_name"
+AGENT_LOCK_DIR="$TEST_ROOT/agent-lock"
 EOF
 
     # --- PART 1: NEGATIVE TEST (Read-Only Action) ---
@@ -1572,13 +1690,22 @@ EOF
         return 1
     fi
 
-    # --- PART 2: POSITIVE TEST (Write Action) ---
-    # 'check-storage' explicitly requires storage access, triggering the mkdir block.
-    "$SCRIPT_BIN" --agent-mode --config "$TEST_ROOT/conditional.conf" --action check-storage >/dev/null 2>&1
-    
-    # Expectation: Directory must now exist (Functionality Check)
+    # --- PART 2: check-storage answers whether prepare could create the tree ---
+    local out
+    out=$("$SCRIPT_BIN" --agent-mode --config "$TEST_ROOT/conditional.conf" --action check-storage 2>/dev/null)
+    if [ "$out" != "true" ]; then
+        echo -e "    ${RED}[FAIL] Case B: 'check-storage' answered '$out' for a creatable tree.${NC}"
+        return 1
+    fi
+    if [ -d "$full_target" ]; then
+        echo -e "    ${RED}[FAIL] Case B: Action 'check-storage' created the directory.${NC}"
+        return 1
+    fi
+
+    # --- PART 3: POSITIVE TEST (Write Action) ---
+    "$SCRIPT_BIN" --agent-mode --config "$TEST_ROOT/conditional.conf" --action prepare --client "$client_name" >/dev/null 2>&1
     if [ ! -d "$full_target" ]; then
-        echo -e "    ${RED}[FAIL] Case B: Action 'check-storage' failed to create directory.${NC}"
+        echo -e "    ${RED}[FAIL] Case C: Action 'prepare' failed to create directory.${NC}"
         return 1
     fi
     
@@ -1715,5 +1842,9 @@ run_test_case "62 Waits for the Backup Server" test_62_waits_for_the_backup_serv
 run_test_case "63 Wrapper Holds an Inhibitor" test_63_wrapper_holds_an_inhibitor
 run_test_case "64 Monitor Keeps Up with rsync" test_64_monitor_keeps_up_with_rsync
 run_test_case "65 WOL-Server Wake Retry After a Hang" test_65_wol_wake_retry_after_a_hang
+run_test_case "66 Agent Storage Mount and Hooks" test_66_agent_storage_and_hooks
+run_test_case "67 Client Releases After a Failed Run" test_67_client_releases_after_a_failed_run
+run_test_case "68 rsync Accept Codes" test_68_rsync_accept_codes
+run_test_case "69 Loopback Key Is Removed" test_69_loopback_key_is_removed
 
 print_summary
