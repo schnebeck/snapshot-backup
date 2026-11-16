@@ -344,7 +344,7 @@ What it does *not* do is verify authorship: HTTPS establishes that the file came
 
 **`--is-job-done`** Checks if a valid backup for the current Base Interval (e.g., today for `daily`) already exists. Returns exit code `0` (true) if done, `1` (false) if a backup is needed. In REMOTE mode it first reads the record of the last successful run (`JOB_DONE_FILE`) and asks the server only if that does not cover the current period.
 
-**`--has-storage`** Checks if the backup storage is accessible and writable. Returns exit code `0` (true) on success, `1` (false) on failure.
+**`--has-storage`** Checks if the backup storage is accessible and writable. Returns exit code `0` (true) on success, `1` (false) on failure. For a client without snapshots yet, it checks whether the server could create its folder, without creating it. Storage on the server that its `AGENT_PRE_CMD` mounts only for a backup counts as available while unmounted (see G).
 
 **`--install [USER]`** Installs a convenience symlink (wrapper) to `/usr/local/bin/snapshot-backup` and ensures the script is executable.
 
@@ -365,6 +365,8 @@ Three commands the script calls at points only it knows. They are **called, not 
 | `POST_RUN_CMD` | always — success, failure, abort, signal | logged only |
 
 `POST_RUN_CMD` receives the run's exit code as `$1`. It lives in the cleanup path, which is the only place guaranteed to run on every exit — that matters when the `PRE` hook set something up that has to be taken down again.
+
+These hooks run on the client. The backup server has its own, `AGENT_PRE_CMD` and `AGENT_POST_CMD`, defined in its `/etc/snapshot-agent.conf` and not reachable from a client (see G).
 
 The case this exists for:
 
@@ -592,7 +594,7 @@ Consequently a client key can no longer **deploy** the agent (`--deploy-agent`, 
   - `AGENT_PRE_CMD` before `prepare`, `AGENT_POST_CMD` after `purge` or on the new action `release`, each with the client name, defined only on the server; `AGENT_HOOK_TIMEOUT` limits them. A client run that fails after `prepare` sends `release` from its cleanup path (only to an agent of 19.8 or later).
   - A client's storage folder is created only by `prepare`. Every other action created it as well, `status` and `check-storage` included — on a server with storage mounted on demand, below the empty mount point on the system disk.
   - `RSYNC_ACCEPT_CODES` (default `24`): rsync exit codes that count as a complete transfer. `"23 24"` accepts unreadable files, e.g. on a Windows share; the code is logged as a warning.
-  - Tests 66–68; test 18 now expects `check-storage` to leave the folder alone.
+  - Tests 66–68; test 18 now expects `check-storage` to leave the folder alone. Sections A, E (`--has-storage`), E2, F, G and I updated.
   - The test suite removes its loopback key from root's `authorized_keys` again; every remote test used to leave one unrestricted key behind. Keys from earlier runs end in `root@HOSTNAME` and have to be removed by hand once. Test 69.
 - **v19.7:** A run asks the WOL-Server again when the device did not come up in time. A backup server that hung while starting (in the firmware, before the kernel) stays deaf to magic packets; the WOL-Server's *Restart when it hangs* power-cycles and wakes it, but only after its *Restart after* time, and the first request had given up with HTTP 504 by then — the run ended with "Server unreachable" although the server was back minutes later. `WOL_WAKE_RETRIES` (default `1`) makes that many further requests, each waiting up to `WOL_WAIT_SECONDS` again; the new request is open before the old one ends, and a device the run woke is still put to sleep afterwards. Test 65.
 - **v19.6:** Remote backups with many changed files no longer crawl. The loop that reads rsync's output holds rsync up while it works on a line, and every line cost about a dozen processes (`grep`, `date`, `sed`, `dirname`) — even the file names of `-v`, which outside debug mode were thrown away afterwards. A run with tens of thousands of changed files, such as after a kernel update, crawled at about 100 files per second. Now rsync lists the files only with `--debug`, the loop uses shell patterns instead of `grep` and reads the clock from `/proc/uptime`, and `log()` returns from a discarded DEBUG line before it starts anything. Measured with 20,000 new small files over ssh: 200–234 s before, 4.3 s now (debug mode: 199 s → 50 s). The progress notification keeps working: `--info=progress2` ends its updates with `\r`, which now become lines. The installed wrappers accept the shorter option string; nothing to do on the server. Test 64.
