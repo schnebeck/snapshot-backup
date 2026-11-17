@@ -3,7 +3,7 @@
 # ==============================================================================
 ## @file    snapshot-backup.sh
 ## @brief   Unified Snapshot Backup Client & Agent (POSIX sh)
-## @version 19.8
+## @version 19.9
 ##
 ## @note    DEVIATION FROM STRICT POSIX:
 ##          This script utilizes the 'local' keyword for variable scoping.
@@ -29,7 +29,7 @@ umask 0077
 # 1. CONSTANTS & CONFIGURATION DEFAULTS
 # ==============================================================================
 
-SCRIPT_VERSION="19.8"
+SCRIPT_VERSION="19.9"
 EXPECTED_CONFIG_VERSION="2.0"
 
 # --- System Paths ---
@@ -67,7 +67,15 @@ STORAGE_REQUIRE_MOUNT=""
 # commit and purge are separate SSH calls, so what PRE sets up spans all of them.
 AGENT_PRE_CMD=""
 AGENT_POST_CMD=""
+# The same for the read-only actions status and check-job-done, run only when
+# the storage is not mounted, with the client name as $1 and the agent's PID as
+# $2. Separate from the backup hooks: a read request holds its own mark, so its
+# POST can never take away the mark of a backup that runs at the same time.
+AGENT_READ_PRE_CMD=""
+AGENT_READ_POST_CMD=""
 AGENT_HOOK_TIMEOUT=600
+# Set once AGENT_READ_PRE_CMD was started; agent_cleanup then owes the POST.
+_READ_POST_OWED=false
 
 # --- Configuration Defaults (Global) ---
 BACKUP_MODE="LOCAL"
@@ -1422,8 +1430,26 @@ agent_lock() {
     AGENT_HELD_LOCK="$l"
 }
 
+## @brief Mounts on-demand storage for a read-only action (status, check-job-done).
+##
+## The POST is owed from the moment the PRE starts: a PRE that fails or runs
+## into AGENT_HOOK_TIMEOUT may have set its mark already. agent_cleanup runs it
+## on every exit. SIGPIPE is ignored from here on: a client that gave up closes
+## the connection, and a write into it would otherwise kill the shell without
+## its EXIT trap - and without the POST.
+agent_read_mount() {
+    trap '' PIPE
+    _READ_POST_OWED=true
+    run_hook "AGENT_READ_PRE_CMD" "$AGENT_READ_PRE_CMD" "$CLIENT_NAME" "$$" >&2 \
+        || die "AGENT_READ_PRE_CMD failed - refusing '$1' for '$CLIENT_NAME'."
+}
+
 ## @brief Removes agent lock file on exit.
 agent_cleanup() {
+    if [ "${_READ_POST_OWED:-false}" = true ]; then
+        _READ_POST_OWED=false
+        run_hook "AGENT_READ_POST_CMD" "$AGENT_READ_POST_CMD" "$CLIENT_NAME" "$$" >&2 || true
+    fi
     if [ -n "${AGENT_HELD_LOCK:-}" ] && [ "$(cat "$AGENT_HELD_LOCK/pid" 2>/dev/null)" = "$$" ]; then
         rm -rf "$AGENT_HELD_LOCK"
     fi
@@ -1568,6 +1594,15 @@ agent_main() {
         run_hook "AGENT_PRE_CMD" "$AGENT_PRE_CMD" "$CLIENT_NAME" >&2 \
             || die "AGENT_PRE_CMD failed - not preparing '$CLIENT_NAME'."
     fi
+
+    # Already mounted - by a running backup, say - the read runs no hooks.
+    case "$action" in
+        status|check-job-done)
+            if [ -n "$AGENT_READ_PRE_CMD" ] && ! storage_mounted; then
+                agent_read_mount "$action"
+            fi
+            ;;
+    esac
 
     if ! storage_mounted; then
         # Storage that AGENT_PRE_CMD mounts is there for a backup, though not now.

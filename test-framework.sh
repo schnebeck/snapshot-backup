@@ -38,6 +38,7 @@ TEST_FILTER="$1"
 
 init_test_env() {
     remove_loopback_key
+    unmount_test_mounts
     [ -d "$TEST_ROOT" ] && rm -rf "$TEST_ROOT"
     mkdir -p "$MNT_SRC" "$MNT_DEST" "$SERVER_STORAGE"
     
@@ -70,6 +71,19 @@ EOF
     echo "==================================================================" >> "$LOG_FILE"
     echo "INIT TEST ENV: $(date)" >> "$LOG_FILE"
     echo "==================================================================" >> "$LOG_FILE"
+}
+
+# Tests that need a real mount point bind-mount a directory below TEST_ROOT onto
+# itself. A test that failed half-way may leave one; rm -rf must not meet it.
+# Deepest first, at most 20 rounds.
+unmount_test_mounts() {
+    local m i=0
+    while [ "$i" -lt 20 ]; do
+        m=$(awk -v r="$TEST_ROOT/" 'index($2, r) == 1 { print $2 }' /proc/mounts | sort -r | head -n 1)
+        [ -n "$m" ] || return 0
+        umount "$m" 2>/dev/null || umount -l "$m" 2>/dev/null
+        i=$((i + 1))
+    done
 }
 
 # The loopback key reaches root unrestricted; its line in authorized_keys lives
@@ -166,6 +180,7 @@ run_test_case() {
 
 print_summary() {
     remove_loopback_key
+    unmount_test_mounts
     echo "------------------------------------------------"
     echo "Tests Run: $TESTS_RUN | Failures: $TESTS_FAILED"
     if [ "$TESTS_RUN" -eq 0 ]; then

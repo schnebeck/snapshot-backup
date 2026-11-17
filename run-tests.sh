@@ -1,6 +1,6 @@
 #!/bin/bash
 # file: run-tests.sh
-# Test suite for snapshot-backup.sh v19.8
+# Test suite for snapshot-backup.sh v19.9
 
 source ./test-framework.sh
 
@@ -1658,6 +1658,145 @@ test_69_loopback_key_is_removed() {
     return 0
 }
 
+# A mark-based mount script for tests 70/71: one mark per caller, the storage
+# is bind-mounted onto itself while any mark is left. It logs its calls to
+# $TEST_ROOT/calls and writes to stdout, which must never reach an agent answer.
+# $1 = mount point
+make_mark_script() {
+    local mnt="$1"
+    cat > "$TEST_ROOT/marks.sh" <<EOF
+#!/bin/sh
+MNT="$mnt"; MARKS="$TEST_ROOT/marks"; LOG="$TEST_ROOT/calls"
+echo "\$1 \$2" >> "\$LOG"
+echo "noise from the mount script"
+case "\$1" in
+    up)   mkdir -p "\$MARKS"; : > "\$MARKS/\$2"
+          mountpoint -q "\$MNT" || mount --bind "\$MNT" "\$MNT" ;;
+    down) rm -f "\$MARKS/\$2"
+          [ -n "\$(ls -A "\$MARKS" 2>/dev/null)" ] && exit 0
+          ! mountpoint -q "\$MNT" || umount "\$MNT" ;;
+esac
+EOF
+    chmod +x "$TEST_ROOT/marks.sh"
+}
+
+# Agent config for tests 70/71. $1 = mount point, $2 = AGENT_READ_PRE_CMD,
+# $3 = AGENT_READ_POST_CMD, $4 = AGENT_HOOK_TIMEOUT. Hooks in single quotes, as
+# the README says: "$1" and "$2" are the hook's own arguments.
+write_read_agent_conf() {
+    {
+        echo "CONFIG_VERSION='2.0'"
+        echo "BASE_STORAGE=\"$1/store\""
+        echo "AGENT_LOCK_DIR=\"$TEST_ROOT/agent-lock\""
+        echo "LOGFILE=\"$LOG_FILE\""
+        echo "STORAGE_REQUIRE_MOUNT=\"$1\""
+        echo "AGENT_READ_PRE_CMD='$2'"
+        echo "AGENT_READ_POST_CMD='$3'"
+        echo "AGENT_HOOK_TIMEOUT=${4:-600}"
+    } > "$TEST_ROOT/agent70.conf"
+}
+
+# 0 when every read mark is gone and $1 is not mounted.
+read_marks_gone() {
+    [ -z "$(ls -A "$TEST_ROOT/marks" 2>/dev/null | grep '^read-')" ] && ! mountpoint -q "$1"
+}
+
+test_70_read_actions_mount_on_demand() {
+    # status and check-job-done mount on-demand storage for themselves with
+    # AGENT_READ_PRE_CMD and give it back with AGENT_READ_POST_CMD, under a mark
+    # of their own. Storage that is already mounted - by a backup - is read
+    # without hooks, and the backup's mark stays untouched.
+    local mnt="$TEST_ROOT/mnt70" a="$SCRIPT_BIN --agent-mode --config $TEST_ROOT/agent70.conf" out calls
+    _f() { echo -e "    ${RED}[FAIL] $1${NC}"; }
+    mkdir -p "$mnt/store/c70/daily.0"
+    date +%s > "$mnt/store/c70/daily.0/.backup_timestamp"
+    make_mark_script "$mnt"
+    write_read_agent_conf "$mnt" "$TEST_ROOT/marks.sh up \"read-\$1-\$2\"" "$TEST_ROOT/marks.sh down \"read-\$1-\$2\""
+
+    # 1. status: answers, PRE before, POST after, under one mark, all gone afterwards
+    out=$($a --action status --client c70 2>>"$LOG_FILE") || { _f "status refused with read hooks"; return 1; }
+    case "$out" in *daily.0*) ;; *) _f "status did not list daily.0: $out"; return 1 ;; esac
+    case "$out" in *noise*) _f "hook output on stdout"; return 1 ;; esac
+    calls=$(cat "$TEST_ROOT/calls")
+    local inv
+    inv=$(echo "$calls" | sed -n '1s/^up read-c70-//p')
+    [ -n "$inv" ] && [ "$calls" = "$(printf 'up read-c70-%s\ndown read-c70-%s' "$inv" "$inv")" ] \
+        || { _f "hook calls, expected up and down under one mark: $(echo "$calls" | tr '\n' '|')"; return 1; }
+    read_marks_gone "$mnt" || { _f "read mark or mount left after status"; return 1; }
+
+    # 2. check-job-done: a clean answer on stdout
+    out=$($a --action check-job-done --client c70 2>>"$LOG_FILE")
+    [ "$out" = "true" ] || { _f "check-job-done answered '$out'"; return 1; }
+    read_marks_gone "$mnt" || { _f "read mark or mount left after check-job-done"; return 1; }
+
+    # 3. A backup holds the storage: no read hooks, its mark untouched, still mounted
+    "$TEST_ROOT/marks.sh" up snapshot-c70 > /dev/null
+    : > "$TEST_ROOT/calls"
+    $a --action status --client c70 >> "$LOG_FILE" 2>&1 || { _f "status failed while a backup holds the storage"; return 1; }
+    [ -s "$TEST_ROOT/calls" ] && { _f "read hooks ran on mounted storage: $(tr '\n' '|' < "$TEST_ROOT/calls")"; return 1; }
+    [ -e "$TEST_ROOT/marks/snapshot-c70" ] || { _f "the backup's mark is gone"; return 1; }
+    mountpoint -q "$mnt" || { _f "storage unmounted under a running backup"; return 1; }
+    "$TEST_ROOT/marks.sh" down snapshot-c70 > /dev/null
+
+    # 4. The client gave up and closed the connection: the POST still runs
+    : > "$TEST_ROOT/calls"
+    $a --action status --client c70 2>>"$LOG_FILE" | true
+    grep -q "^down read-c70-" "$TEST_ROOT/calls" || { _f "no POST after the client closed the connection"; return 1; }
+    read_marks_gone "$mnt" || { _f "read mark or mount left after a closed connection"; return 1; }
+    return 0
+}
+
+test_71_read_hooks_on_failure() {
+    # A read request that cannot mount is refused as in 19.8, and the POST runs
+    # on every way out: PRE failed, PRE mounted nothing, hook timeout, signal.
+    # Without read hooks nothing changes.
+    local mnt="$TEST_ROOT/mnt71" a="$SCRIPT_BIN --agent-mode --config $TEST_ROOT/agent70.conf" start pid rc
+    local up="$TEST_ROOT/marks.sh up \"read-\$1-\$2\"" down="$TEST_ROOT/marks.sh down \"read-\$1-\$2\""
+    _f() { echo -e "    ${RED}[FAIL] $1${NC}"; }
+    mkdir -p "$mnt/store/c71/daily.0"
+    make_mark_script "$mnt"
+
+    # 1. No read hooks: refused, as before
+    write_read_agent_conf "$mnt" "" ""
+    $a --action status --client c71 >> "$LOG_FILE" 2>&1 && { _f "status ran without mount and read hooks"; return 1; }
+    $a --action check-job-done --client c71 >> "$LOG_FILE" 2>&1 && { _f "check-job-done ran without mount and read hooks"; return 1; }
+    [ -e "$TEST_ROOT/calls" ] && { _f "a hook ran without read hooks configured"; return 1; }
+
+    # 2. PRE fails after setting its mark
+    write_read_agent_conf "$mnt" "$up; exit 1" "$down"
+    $a --action status --client c71 >> "$LOG_FILE" 2>&1 && { _f "status ran after AGENT_READ_PRE_CMD failed"; return 1; }
+    grep -q "^down read-c71-" "$TEST_ROOT/calls" || { _f "no POST after a failed PRE"; return 1; }
+    read_marks_gone "$mnt" || { _f "read mark or mount left after a failed PRE"; return 1; }
+
+    # 3. PRE succeeds but mounts nothing
+    : > "$TEST_ROOT/calls"
+    write_read_agent_conf "$mnt" "echo pre >> $TEST_ROOT/calls" "$down"
+    $a --action status --client c71 >> "$LOG_FILE" 2>&1 && { _f "status ran although nothing was mounted"; return 1; }
+    grep -q "^down read-c71-" "$TEST_ROOT/calls" || { _f "no POST after a PRE that mounted nothing"; return 1; }
+
+    # 4. Hook timeout
+    : > "$TEST_ROOT/calls"
+    write_read_agent_conf "$mnt" "$up; sleep 30" "$down" 2
+    start=$(date +%s)
+    $a --action status --client c71 >> "$LOG_FILE" 2>&1 && { _f "status ran after the hook timed out"; return 1; }
+    [ $(( $(date +%s) - start )) -lt 20 ] || { _f "AGENT_HOOK_TIMEOUT=2 did not stop the PRE"; return 1; }
+    grep -q "^down read-c71-" "$TEST_ROOT/calls" || { _f "no POST after a hook timeout"; return 1; }
+    read_marks_gone "$mnt" || { _f "read mark or mount left after a hook timeout"; return 1; }
+
+    # 5. Signal while the PRE runs
+    : > "$TEST_ROOT/calls"
+    write_read_agent_conf "$mnt" "$up; sleep 3" "$down"
+    $a --action status --client c71 >> "$LOG_FILE" 2>&1 &
+    pid=$!
+    sleep 1
+    kill -TERM "$pid"
+    wait "$pid"; rc=$?
+    [ "$rc" -ne 0 ] || { _f "status exited 0 after SIGTERM"; return 1; }
+    grep -q "^down read-c71-" "$TEST_ROOT/calls" || { _f "no POST after SIGTERM"; return 1; }
+    read_marks_gone "$mnt" || { _f "read mark or mount left after SIGTERM"; return 1; }
+    return 0
+}
+
 test_18_conditional_storage_creation() {
     # Goal: Verify that storage creation is strictly conditional.
     # Case A: --action version (Read-Only) -> MUST NOT create directory
@@ -1846,5 +1985,7 @@ run_test_case "66 Agent Storage Mount and Hooks" test_66_agent_storage_and_hooks
 run_test_case "67 Client Releases After a Failed Run" test_67_client_releases_after_a_failed_run
 run_test_case "68 rsync Accept Codes" test_68_rsync_accept_codes
 run_test_case "69 Loopback Key Is Removed" test_69_loopback_key_is_removed
+run_test_case "70 Read Actions Mount on Demand" test_70_read_actions_mount_on_demand
+run_test_case "71 Read Hooks on Failure" test_71_read_hooks_on_failure
 
 print_summary

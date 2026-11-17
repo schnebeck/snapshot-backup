@@ -1,6 +1,6 @@
 # snapshot-backup.sh - Intelligent Incremental Backup
 
-⚠️ **STATUS: STABLE / PRODUCTION READY (v19.8)**
+⚠️ **STATUS: STABLE / PRODUCTION READY (v19.9)**
 
 ### ⚖️ DISCLAIMER / LIMITATION OF LIABILITY
 
@@ -342,7 +342,7 @@ What it does *not* do is verify authorship: HTTPS establishes that the file came
 
 **`--is-running`** Checks if a backup process is currently active. Returns exit code `0` if running, `1` if idle. Useful for monitoring scripts or status bars.
 
-**`--is-job-done`** Checks if a valid backup for the current Base Interval (e.g., today for `daily`) already exists. Returns exit code `0` (true) if done, `1` (false) if a backup is needed. In REMOTE mode it first reads the record of the last successful run (`JOB_DONE_FILE`) and asks the server only if that does not cover the current period.
+**`--is-job-done`** Checks if a valid backup for the current Base Interval (e.g., today for `daily`) already exists. Returns exit code `0` (true) if done, `1` (false) if a backup is needed. In REMOTE mode it first reads the record of the last successful run (`JOB_DONE_FILE`) and asks the server only if that does not cover the current period. That question has `NETWORK_TIMEOUT` (or `--timeout`); with storage the server mounts per request it has to cover the mount as well (see G, *Reading unmounted storage*).
 
 **`--has-storage`** Checks if the backup storage is accessible and writable. Returns exit code `0` (true) on success, `1` (false) on failure. For a client without snapshots yet, it checks whether the server could create its folder, without creating it. Storage on the server that its `AGENT_PRE_CMD` mounts only for a backup counts as available while unmounted (see G).
 
@@ -525,7 +525,9 @@ The config holds what belongs to the server. A client cannot send commands or se
 
 - `AGENT_POST_CMD`: (Default: empty) Runs after a successful `purge` with `$1` = client, `$2` = `0`, and on `release` with `$2` = `1`. Its failure is logged and changes nothing else.
 
-- `AGENT_HOOK_TIMEOUT`: (Default: `600`) Seconds each hook may take; `0` = no limit.
+- `AGENT_READ_PRE_CMD`, `AGENT_READ_POST_CMD`: (Default: empty) The same for the read-only actions `status` and `check-job-done` (since 19.9), see *Reading unmounted storage* below. `$1` = client, `$2` = the agent's PID, one per request.
+
+- `AGENT_HOOK_TIMEOUT`: (Default: `600`) Seconds each hook may take, the read hooks included; `0` = no limit.
 
 **Storage mounted on demand.** Transfer, `commit` and `purge` are separate SSH calls, so whatever `AGENT_PRE_CMD` sets up has to last from `prepare` until after `purge`. A client run that fails in between sends `release` from its cleanup path, which runs only `AGENT_POST_CMD`. A client that crashes sends nothing: the storage then stays mounted until this client's next run ends — the safe side, the data lands on the RAID and not on the system disk. Mount scripts that keep one mark per caller and unmount only when no mark is left fit this well:
 
@@ -539,7 +541,20 @@ AGENT_POST_CMD='/usr/local/sbin/umount.sh "snapshot-$1"'
 
 Use **single quotes** around a hook that refers to `$1`: in double quotes it is expanded while the file is read. Hook output goes to the agent's log and stderr, never to the client's answer.
 
-With `AGENT_PRE_CMD` set, `check-storage` (the client's `--has-storage`, which the dispatcher asks before a run) answers `true` while the mount is missing: the storage comes with `prepare`, and whether that works shows at `prepare`. `status` and `check-job-done` are refused while it is missing.
+With `AGENT_PRE_CMD` set, `check-storage` (the client's `--has-storage`, which the dispatcher asks before a run) answers `true` while the mount is missing: the storage comes with `prepare`, and whether that works shows at `prepare`.
+
+**Reading unmounted storage.** `status` and `check-job-done` (the client's `--status` and `--is-job-done`) are refused while the mount is missing — unless the read hooks are set:
+
+```
+AGENT_READ_PRE_CMD='/usr/local/sbin/mount.sh "snapshot-read-$1-$2"'
+AGENT_READ_POST_CMD='/usr/local/sbin/umount.sh "snapshot-read-$1-$2"'
+```
+
+The agent then runs `AGENT_READ_PRE_CMD`, checks the mount again, answers, and runs `AGENT_READ_POST_CMD` on every way out: success, refusal, a failed or timed-out PRE, a signal, and a client that gave up and closed the connection. If the PRE fails or the mount is still missing afterwards, the request is refused as without the hooks. Storage that is already mounted — by a running backup, by hand — is read without any hook. `check-storage` is not affected.
+
+The read hooks are **separate from the backup hooks on purpose.** A read request with `AGENT_PRE_CMD`/`AGENT_POST_CMD` would share the backup's mark `snapshot-CLIENT`: a status request during a running transfer would find the storage mounted and set nothing — but one that started just before the backup would end with a POST that removes the backup's mark, and a mark script would unmount the storage under the transfer. With its own mark per request (`$2`), a read request can only ever take back what it set itself.
+
+Timeouts on the client: `--status` waits as long as the server takes. `--is-job-done` waits `NETWORK_TIMEOUT` (10 s; `--timeout`, in the dispatcher `CHECK_TIMEOUT`) for SSH handshake **and** mount together; one that runs out answers "not done", and a run follows. Raise it if mounting takes longer, e.g. a network share. In REMOTE mode `--is-job-done` answers from its local record (`JOB_DONE_FILE`) while that covers the period, so the server is asked mostly at the start of a period, when a run is due anyway.
 
 ### H. Root Requirement & Security Trade-Off
 
@@ -588,6 +603,7 @@ Consequently a client key can no longer **deploy** the agent (`--deploy-agent`, 
 ---
 
 ## 📆 Version History
+- **v19.9:** `--status` and `--is-job-done` work with storage the server mounts only on demand. With `STORAGE_REQUIRE_MOUNT` they were refused outside a backup run. The new server settings `AGENT_READ_PRE_CMD` and `AGENT_READ_POST_CMD` mount it for the one request, under a mark of its own (`$1` = client, `$2` = the agent's PID), and give it back on every way out, also when the client gave up and closed the connection. Separate from the backup hooks so that a read request can never take away the mark of a running backup. Without them nothing changes. Only the server needs 19.9; the wrapper allows both actions already. Section G. Tests 70, 71.
 - **v19.8:** Storage on the server that is mounted only while a client backs up. Run `--install` on the server: the wrapper has to let `release` through.
   - **The agent reads `/etc/snapshot-agent.conf`.** The README promised it, but the agent read a config only with `--config`, which the wrapper refuses from clients — a setting in that file had no effect. The file is read only when it belongs to root and nobody else can write it. **Before upgrading a server that has one,** check it: a `BASE_STORAGE_PATH` there now applies and must match the clients' `REMOTE_STORAGE_ROOT`, and the file needs `CONFIG_VERSION="2.0"`.
   - `STORAGE_REQUIRE_MOUNT`: without that mount the agent refuses every storage action and creates nothing below the empty mount point.

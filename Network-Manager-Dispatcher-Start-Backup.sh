@@ -45,6 +45,8 @@ NM_SETTLE_SECONDS="${NM_SETTLE_SECONDS:-10}"
 # --is-job-done). One second was enough at home; over the VPN from a hotel an
 # SSH handshake takes longer, and an --is-job-done that times out reads as
 # "not done" - which, from an hourly timer, would mean a backup every hour.
+# A server that mounts its storage per request (AGENT_READ_PRE_CMD) needs the
+# time for the mount on top.
 CHECK_TIMEOUT="${CHECK_TIMEOUT:-10}"
 
 # Defaults, overridable in DISPATCHER_CONF
