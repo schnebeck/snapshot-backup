@@ -517,15 +517,15 @@ rsync exit codes besides `0` that count as a complete transfer, separated by spa
 
 **`STORAGE_HOOK_TIMEOUT`** (Default: `600`) Seconds each of these hooks may take; `0` = no limit.
 
-Each hook gets `CLIENT_NAME` as `$1` and the PID of the run or request as `$2`, output goes to stderr. The read hooks are separate so that a read can never release a running backup's mark — the same reason as on the server (G, *Reading unmounted storage*). With a mount script that keeps one mark per caller and unmounts when none is left:
+Each hook gets `CLIENT_NAME` as `$1` and the PID of the run or request as `$2`, output goes to stderr. The read hooks are separate so that a read can never release a running backup's mark — the same reason as on the server (G, *Reading unmounted storage*). With the mark script from `examples/` (see J), which keeps one mark per caller and unmounts when none is left, and an `/etc/fstab` entry with `noauto` for the disk:
 
 ```
 BACKUP_ROOT="/mnt/usb-backup/snapshots"
 STORAGE_REQUIRE_MOUNT="/mnt/usb-backup"
-STORAGE_PRE_CMD='/usr/local/sbin/mount.sh "snapshot-local-$1"'
-STORAGE_POST_CMD='/usr/local/sbin/umount.sh "snapshot-local-$1"'
-STORAGE_READ_PRE_CMD='/usr/local/sbin/mount.sh "snapshot-read-$1-$2"'
-STORAGE_READ_POST_CMD='/usr/local/sbin/umount.sh "snapshot-read-$1-$2"'
+STORAGE_PRE_CMD='/usr/local/sbin/storage-mark.sh up "snapshot-local-$1" /mnt/usb-backup'
+STORAGE_POST_CMD='/usr/local/sbin/storage-mark.sh down "snapshot-local-$1" /mnt/usb-backup'
+STORAGE_READ_PRE_CMD='/usr/local/sbin/storage-mark.sh up "snapshot-read-$1-$2" /mnt/usb-backup'
+STORAGE_READ_POST_CMD='/usr/local/sbin/storage-mark.sh down "snapshot-read-$1-$2" /mnt/usb-backup'
 ```
 
 Single quotes, as with all hooks that read `$1`. Without a mark script, plain commands do for backups: `STORAGE_PRE_CMD='mountpoint -q /mnt/usb-backup || mount /mnt/usb-backup'`, `STORAGE_POST_CMD='umount /mnt/usb-backup'` (this also unmounts a disk you mounted by hand). Leave the read hooks empty then: a plain `umount` after a status request could pull the disk from under a backup that started meanwhile.
@@ -552,14 +552,14 @@ The config holds what belongs to the server. A client cannot send commands or se
 
 - `AGENT_HOOK_TIMEOUT`: (Default: `600`) Seconds each hook may take, the read hooks included; `0` = no limit.
 
-**Storage mounted on demand.** Transfer, `commit` and `purge` are separate SSH calls, so whatever `AGENT_PRE_CMD` sets up has to last from `prepare` until after `purge`. A client run that fails in between sends `release` from its cleanup path, which runs only `AGENT_POST_CMD`. A client that crashes sends nothing: the storage then stays mounted until this client's next run ends — the safe side, the data lands on the RAID and not on the system disk. Mount scripts that keep one mark per caller and unmount only when no mark is left fit this well:
+**Storage mounted on demand.** Transfer, `commit` and `purge` are separate SSH calls, so whatever `AGENT_PRE_CMD` sets up has to last from `prepare` until after `purge`. A client run that fails in between sends `release` from its cleanup path, which runs only `AGENT_POST_CMD`. A client that crashes sends nothing: the storage then stays mounted until this client's next run ends — the safe side, the data lands on the RAID and not on the system disk. Mount scripts that keep one mark per caller and unmount only when no mark is left fit this well, such as `examples/storage-mark.sh` (see J):
 
 ```
 CONFIG_VERSION="2.0"
 BASE_STORAGE_PATH="/backup/snapshots"
 STORAGE_REQUIRE_MOUNT="/backup"
-AGENT_PRE_CMD='/usr/local/sbin/mount.sh "snapshot-$1"'
-AGENT_POST_CMD='/usr/local/sbin/umount.sh "snapshot-$1"'
+AGENT_PRE_CMD='/usr/local/sbin/storage-mark.sh up "snapshot-$1" /backup'
+AGENT_POST_CMD='/usr/local/sbin/storage-mark.sh down "snapshot-$1" /backup'
 ```
 
 Use **single quotes** around a hook that refers to `$1`: in double quotes it is expanded while the file is read. Hook output goes to the agent's log and stderr, never to the client's answer.
@@ -569,8 +569,8 @@ With `AGENT_PRE_CMD` set, `check-storage` (the client's `--has-storage`, which t
 **Reading unmounted storage.** `status` and `check-job-done` (the client's `--status` and `--is-job-done`) are refused while the mount is missing — unless the read hooks are set:
 
 ```
-AGENT_READ_PRE_CMD='/usr/local/sbin/mount.sh "snapshot-read-$1-$2"'
-AGENT_READ_POST_CMD='/usr/local/sbin/umount.sh "snapshot-read-$1-$2"'
+AGENT_READ_PRE_CMD='/usr/local/sbin/storage-mark.sh up "snapshot-read-$1-$2" /backup'
+AGENT_READ_POST_CMD='/usr/local/sbin/storage-mark.sh down "snapshot-read-$1-$2" /backup'
 ```
 
 The agent then runs `AGENT_READ_PRE_CMD`, checks the mount again, answers, and runs `AGENT_READ_POST_CMD` on every way out: success, refusal, a failed or timed-out PRE, a signal, and a client that gave up and closed the connection. If the PRE fails or the mount is still missing afterwards, the request is refused as without the hooks. Storage that is already mounted — by a running backup, by hand — is read without any hook. `check-storage` is not affected.
@@ -623,6 +623,23 @@ Consequently a client key can no longer **deploy** the agent (`--deploy-agent`, 
 
 **What it does not do:** a confined client can still damage its **own** history — `--delete` into its own slot, a `purge` with low retention values. What protects against a client taken over by someone who encrypts it is a copy of the backup server that no client key reaches.
 
+### J. Example Hooks (`examples/`)
+
+**`examples/storage-mark.sh`** mounts a backup disk on demand for the storage hooks — on the client (`STORAGE_*`, section F) and on the server (`AGENT_*`, section G) alike. Every caller sets a mark of its own; the disk is mounted with the first mark and unmounted when the last one is gone. A status request that ends therefore never pulls the disk from under a backup that is still running, and the other way round.
+
+```
+storage-mark.sh up     MARK MOUNTPOINT   # set MARK, mount if not mounted, fail if it is not mounted afterwards
+storage-mark.sh down   MARK MOUNTPOINT   # remove MARK; with no mark left: sync, unmount
+storage-mark.sh status MOUNTPOINT        # mount state and the marks held
+```
+
+- **Install:** `sudo install -m 755 examples/storage-mark.sh /usr/local/sbin/storage-mark.sh`, on the machine with the disk.
+- **The disk** needs an `/etc/fstab` entry with `noauto` (and `nofail`, so a missing USB disk does not stop the boot), e.g. `UUID=…  /mnt/usb-backup  ext4  noauto,nofail  0  2`. A different mount command, given the mount point last: `STORAGE_MARK_MOUNT`, `STORAGE_MARK_UMOUNT`.
+- **Marks** live in `/run/storage-mark/` (`STORAGE_MARK_DIR`), a tmpfs: a reboot clears them together with the mount. Callers serialise on a lock per mount point; one held longer than `STORAGE_MARK_WAIT` (60 s) by a live process makes the call fail, a dead holder's lock is removed.
+- **Mark names:** backups use one per client (`snapshot-local-$1`, `snapshot-$1`), so a mark left by a crashed run is taken over and removed by the next run of that client. Read requests use one per request (`snapshot-read-$1-$2`, with the PID); one left by a request killed with `kill -9` keeps the disk mounted — the safe side — until removed: `storage-mark.sh status /mnt/usb-backup`, then `storage-mark.sh down MARK /mnt/usb-backup`.
+- A disk that is busy (a shell still in it) stays mounted and `down` fails; the next `down` tries again.
+- Plain POSIX `sh`, runs on busybox; messages go to stderr and to syslog (`journalctl -t storage-mark`).
+
 ---
 
 ## 📆 Version History
@@ -631,6 +648,7 @@ Consequently a client key can no longer **deploy** the agent (`--deploy-agent`, 
   - `STORAGE_PRE_CMD`/`STORAGE_POST_CMD` hold the disk for a run, `STORAGE_READ_PRE_CMD`/`STORAGE_READ_POST_CMD` for `--status`, `--is-job-done` and `--mount` (kept until `--umount`), each with `CLIENT_NAME` and the PID; `STORAGE_HOOK_TIMEOUT` limits them. `--has-storage` answers `true` when `STORAGE_PRE_CMD` can bring the disk.
   - The client's lock is released last on the way out, after `release`, `POST_RUN_CMD` and the storage POST, also after a successful run. Before, a run that started in the gap could set its mark, and the previous run's POST then removed it — the storage was unmounted under the new run. REMOTE mode was affected as well.
   - Section F. Tests 72–74.
+  - `examples/storage-mark.sh`, a mark-based mount script for all storage hooks, client and server (section J; the examples in F and G use it). Test 75.
 - **v19.9:** `--status` and `--is-job-done` work with storage the server mounts only on demand. With `STORAGE_REQUIRE_MOUNT` they were refused outside a backup run. The new server settings `AGENT_READ_PRE_CMD` and `AGENT_READ_POST_CMD` mount it for the one request, under a mark of its own (`$1` = client, `$2` = the agent's PID), and give it back on every way out, also when the client gave up and closed the connection. Separate from the backup hooks so that a read request can never take away the mark of a running backup. Without them nothing changes. Only the server needs 19.9; the wrapper allows both actions already. Section G. Tests 70, 71.
 - **v19.8:** Storage on the server that is mounted only while a client backs up. Run `--install` on the server: the wrapper has to let `release` through.
   - **The agent reads `/etc/snapshot-agent.conf`.** The README promised it, but the agent read a config only with `--config`, which the wrapper refuses from clients — a setting in that file had no effect. The file is read only when it belongs to root and nobody else can write it. **Before upgrading a server that has one,** check it: a `BASE_STORAGE_PATH` there now applies and must match the clients' `REMOTE_STORAGE_ROOT`, and the file needs `CONFIG_VERSION="2.0"`.

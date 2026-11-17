@@ -1948,6 +1948,57 @@ test_74_local_storage_hooks_on_failure() {
     return 0
 }
 
+test_75_example_storage_mark_script() {
+    # examples/storage-mark.sh, the mark script the README recommends: mounted
+    # while any mark is left, unmounted after the last; parallel callers
+    # serialise on its lock; a failed mount fails "up". Then as the storage
+    # hooks of a LOCAL run. A bind mount stands in for the fstab entry.
+    local sm="${SCRIPT_BIN%/*}/examples/storage-mark.sh" mnt="$TEST_ROOT/mnt75" disk="$TEST_ROOT/disk75" i out
+    _f() { echo -e "    ${RED}[FAIL] $1${NC}"; }
+    [ -f "$sm" ] || { _f "$sm missing"; return 1; }
+    mkdir -p "$mnt" "$disk"
+    export STORAGE_MARK_DIR="$TEST_ROOT/marks75" STORAGE_MARK_MOUNT="mount --bind $disk"
+    _sm() { sh "$sm" "$@" 2>>"$LOG_FILE"; }
+
+    # 1. Two marks: mounted until the last is gone
+    _sm up a "$mnt" && _sm up b "$mnt" || { _f "up failed"; return 1; }
+    mountpoint -q "$mnt" || { _f "not mounted after up"; return 1; }
+    out=$(_sm status "$mnt")
+    case "$out" in *"mounted"*"mark: a"*"mark: b"*) ;; *) _f "status: $out"; return 1 ;; esac
+    _sm down a "$mnt" || { _f "down a failed"; return 1; }
+    mountpoint -q "$mnt" || { _f "unmounted while mark b is left"; return 1; }
+    _sm down b "$mnt" || { _f "down b failed"; return 1; }
+    mountpoint -q "$mnt" && { _f "still mounted after the last mark"; return 1; }
+
+    # 2. Parallel callers: in the end no mark, no lock, no mount
+    for i in 1 2 3 4 5 6 7 8; do ( _sm up "p$i" "$mnt" && sleep 0.2 && _sm down "p$i" "$mnt" ) & done
+    wait
+    mountpoint -q "$mnt" && { _f "mounted after parallel up/down"; return 1; }
+    [ -z "$(ls -A "$STORAGE_MARK_DIR"/* 2>/dev/null)" ] || { _f "left over: $(ls -A "$STORAGE_MARK_DIR"/*)"; return 1; }
+
+    # 3. A mount that fails fails "up"
+    STORAGE_MARK_MOUNT="false" _sm up x "$mnt" && { _f "up exited 0 after the mount failed"; return 1; }
+    _sm down x "$mnt"
+
+    # 4. As the storage hooks of a LOCAL run and a status request
+    echo "data" > "$MNT_SRC/f75"
+    set_config "CLIENT_NAME" "c75"
+    set_config "BACKUP_ROOT" "$mnt/backup"
+    set_config "STORAGE_REQUIRE_MOUNT" "$mnt"
+    set_config_sq "STORAGE_PRE_CMD" "sh $sm up \"snapshot-local-\$1\" $mnt"
+    set_config_sq "STORAGE_POST_CMD" "sh $sm down \"snapshot-local-\$1\" $mnt"
+    set_config_sq "STORAGE_READ_PRE_CMD" "sh $sm up \"snapshot-read-\$1-\$2\" $mnt"
+    set_config_sq "STORAGE_READ_POST_CMD" "sh $sm down \"snapshot-read-\$1-\$2\" $mnt"
+    run_backup || { _f "LOCAL run with storage-mark.sh failed"; return 1; }
+    assert_exists "$disk/backup/daily.0$MNT_SRC/f75" || return 1
+    mountpoint -q "$mnt" && { _f "still mounted after the run"; return 1; }
+    out=$("$SCRIPT_BIN" --config "$CONF_FILE" --status 2>>"$LOG_FILE") || { _f "--status failed"; return 1; }
+    case "$out" in *daily.0*) ;; *) _f "--status did not list daily.0"; return 1 ;; esac
+    mountpoint -q "$mnt" && { _f "still mounted after --status"; return 1; }
+    unset STORAGE_MARK_DIR STORAGE_MARK_MOUNT
+    return 0
+}
+
 test_18_conditional_storage_creation() {
     # Goal: Verify that storage creation is strictly conditional.
     # Case A: --action version (Read-Only) -> MUST NOT create directory
@@ -2141,5 +2192,6 @@ run_test_case "71 Read Hooks on Failure" test_71_read_hooks_on_failure
 run_test_case "72 LOCAL Backup on Demand Storage" test_72_local_backup_on_demand_storage
 run_test_case "73 LOCAL Reads on Demand Storage" test_73_local_reads_on_demand_storage
 run_test_case "74 LOCAL Storage Hooks on Failure" test_74_local_storage_hooks_on_failure
+run_test_case "75 Example storage-mark.sh" test_75_example_storage_mark_script
 
 print_summary
