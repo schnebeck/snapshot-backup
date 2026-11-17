@@ -59,6 +59,7 @@ PIDFILE="$TEST_ROOT/snapshot-backup.pid"
 # Its own job-done record, for the same reason.
 JOB_DONE_FILE="$TEST_ROOT/job_done"
 WOL_MOUNT_FILE="$TEST_ROOT/wol_mount"
+STORAGE_MOUNT_FILE="$TEST_ROOT/storage_mount"
 # The loopback agent reads this file too; its locks stay out of /var/run.
 AGENT_LOCK_DIR="$TEST_ROOT/agent-lock"
 # No waiting for a network that is meant to be unreachable (tests 61, 62 set it).

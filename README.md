@@ -1,6 +1,6 @@
 # snapshot-backup.sh - Intelligent Incremental Backup
 
-⚠️ **STATUS: STABLE / PRODUCTION READY (v19.9)**
+⚠️ **STATUS: STABLE / PRODUCTION READY (v20.0)**
 
 ### ⚖️ DISCLAIMER / LIMITATION OF LIABILITY
 
@@ -324,7 +324,7 @@ The script automatically detects the currently logged-in GUI user and sends stat
 
 **`--verify`** Forces a deep checksum verification (`rsync --checksum`) for this run. This reads every file on both source and destination to detect bit-rot or silent corruption. Significantly slower than standard metadata checks.
 
-**`--mount [PATH]`** Mounts the backup storage to the specified `[PATH]` (or defaults to the configured `BACKUP_ROOT`).
+**`--mount [PATH]`** Mounts the backup storage to the specified `[PATH]` (or defaults to the configured `BACKUP_ROOT`). LOCAL storage mounted on demand is mounted with the read hooks first and kept until `--umount PATH` (see F).
 
 - **Local Mode:** Performs a bind mount.
 
@@ -344,7 +344,7 @@ What it does *not* do is verify authorship: HTTPS establishes that the file came
 
 **`--is-job-done`** Checks if a valid backup for the current Base Interval (e.g., today for `daily`) already exists. Returns exit code `0` (true) if done, `1` (false) if a backup is needed. In REMOTE mode it first reads the record of the last successful run (`JOB_DONE_FILE`) and asks the server only if that does not cover the current period. That question has `NETWORK_TIMEOUT` (or `--timeout`); with storage the server mounts per request it has to cover the mount as well (see G, *Reading unmounted storage*).
 
-**`--has-storage`** Checks if the backup storage is accessible and writable. Returns exit code `0` (true) on success, `1` (false) on failure. For a client without snapshots yet, it checks whether the server could create its folder, without creating it. Storage on the server that its `AGENT_PRE_CMD` mounts only for a backup counts as available while unmounted (see G).
+**`--has-storage`** Checks if the backup storage is accessible and writable. Returns exit code `0` (true) on success, `1` (false) on failure. For a client without snapshots yet, it checks whether the server could create its folder, without creating it. Storage on the server that its `AGENT_PRE_CMD` mounts only for a backup counts as available while unmounted (see G); so does LOCAL storage that `STORAGE_PRE_CMD` mounts (see F).
 
 **`--install [USER]`** Installs a convenience symlink (wrapper) to `/usr/local/bin/snapshot-backup` and ensures the script is executable.
 
@@ -507,6 +507,29 @@ Additional flags to pass directly to the `rsync` command.
 **`RSYNC_ACCEPT_CODES`** (Default: `24`)
 rsync exit codes besides `0` that count as a complete transfer, separated by spaces. `24` means files vanished while a live filesystem was read — normal every night, and not logged. Any other code in the list is logged as a warning and the snapshot is committed. `"23 24"` also accepts code 23, files that could not be read — useful for a Windows share with locked files, but the snapshot then lacks those files; rsync's line for each of them stays in the log as an error. A code not in the list fails the run, and nothing is committed.
 
+**LOCAL storage mounted on demand** (since 20.0, LOCAL mode only). For a USB or RAID disk that is mounted only while it is needed:
+
+**`STORAGE_REQUIRE_MOUNT`** (Default: empty) A mount point that must be mounted before `BACKUP_ROOT`, which must lie below it, is touched. Without the mount a backup run stops and creates nothing below the empty mount point — it does not quietly fill the system disk; `--status` and `--is-job-done` say "… is not mounted" instead of answering for the empty directory; `--has-storage` answers `false`.
+
+**`STORAGE_PRE_CMD`**, **`STORAGE_POST_CMD`** (Default: empty) Hold the storage for a backup run. The PRE runs after the lock is taken and before anything touches `BACKUP_ROOT` — also when the disk is mounted already, so that the run holds a mark of its own; then the mount is required. The POST runs from the cleanup path on every exit (success, failure, PRE failed or timed out, signal), after `POST_RUN_CMD` and before the lock is released. With `STORAGE_PRE_CMD` set, `--has-storage` answers `true` while the disk is unmounted: the run brings it.
+
+**`STORAGE_READ_PRE_CMD`**, **`STORAGE_READ_POST_CMD`** (Default: empty) The same for `--status`, `--is-job-done` and `--mount`, run only when the disk is not mounted. A disk mounted already — by a running backup, by hand — is read without any hook. `--mount` keeps the read mount until `--umount` of the same path (noted in `STORAGE_MOUNT_FILE`, default `/var/lib/snapshot-backup/storage_mount`).
+
+**`STORAGE_HOOK_TIMEOUT`** (Default: `600`) Seconds each of these hooks may take; `0` = no limit.
+
+Each hook gets `CLIENT_NAME` as `$1` and the PID of the run or request as `$2`, output goes to stderr. The read hooks are separate so that a read can never release a running backup's mark — the same reason as on the server (G, *Reading unmounted storage*). With a mount script that keeps one mark per caller and unmounts when none is left:
+
+```
+BACKUP_ROOT="/mnt/usb-backup/snapshots"
+STORAGE_REQUIRE_MOUNT="/mnt/usb-backup"
+STORAGE_PRE_CMD='/usr/local/sbin/mount.sh "snapshot-local-$1"'
+STORAGE_POST_CMD='/usr/local/sbin/umount.sh "snapshot-local-$1"'
+STORAGE_READ_PRE_CMD='/usr/local/sbin/mount.sh "snapshot-read-$1-$2"'
+STORAGE_READ_POST_CMD='/usr/local/sbin/umount.sh "snapshot-read-$1-$2"'
+```
+
+Single quotes, as with all hooks that read `$1`. Without a mark script, plain commands do for backups: `STORAGE_PRE_CMD='mountpoint -q /mnt/usb-backup || mount /mnt/usb-backup'`, `STORAGE_POST_CMD='umount /mnt/usb-backup'` (this also unmounts a disk you mounted by hand). Leave the read hooks empty then: a plain `umount` after a status request could pull the disk from under a backup that started meanwhile.
+
 ### G. Agent Configuration (Server-Side)
 
 In Agent Mode (on the backup server) the script reads `/etc/snapshot-agent.conf` if it exists. The file is sourced as shell code by every client's key, so it is read only when it **belongs to root and is writable by nobody else** (e.g. mode `600` or `644`); otherwise every agent action fails with a message saying so. `--config FILE` (for an administrator; the wrapper refuses it from clients) reads `FILE` instead. `version` answers without reading either. Client and server must run 19.8 or later for everything below.
@@ -603,6 +626,11 @@ Consequently a client key can no longer **deploy** the agent (`--deploy-agent`, 
 ---
 
 ## 📆 Version History
+- **v20.0:** LOCAL mode handles storage mounted on demand, as the agent does. A LOCAL client whose `BACKUP_ROOT` lay on a disk mounted only for backups had nothing for it: `--status` listed the empty mount point, `--is-job-done` and `--has-storage` answered for it, and a run needed an outside wrapper to mount and a `PRE_RUN_CMD` guard, or it filled the system disk.
+  - `STORAGE_REQUIRE_MOUNT` (client config, LOCAL): without the mount a run stops and creates nothing below it; reads say "… is not mounted". `BACKUP_ROOT` must lie below it.
+  - `STORAGE_PRE_CMD`/`STORAGE_POST_CMD` hold the disk for a run, `STORAGE_READ_PRE_CMD`/`STORAGE_READ_POST_CMD` for `--status`, `--is-job-done` and `--mount` (kept until `--umount`), each with `CLIENT_NAME` and the PID; `STORAGE_HOOK_TIMEOUT` limits them. `--has-storage` answers `true` when `STORAGE_PRE_CMD` can bring the disk.
+  - The client's lock is released last on the way out, after `release`, `POST_RUN_CMD` and the storage POST, also after a successful run. Before, a run that started in the gap could set its mark, and the previous run's POST then removed it — the storage was unmounted under the new run. REMOTE mode was affected as well.
+  - Section F. Tests 72–74.
 - **v19.9:** `--status` and `--is-job-done` work with storage the server mounts only on demand. With `STORAGE_REQUIRE_MOUNT` they were refused outside a backup run. The new server settings `AGENT_READ_PRE_CMD` and `AGENT_READ_POST_CMD` mount it for the one request, under a mark of its own (`$1` = client, `$2` = the agent's PID), and give it back on every way out, also when the client gave up and closed the connection. Separate from the backup hooks so that a read request can never take away the mark of a running backup. Without them nothing changes. Only the server needs 19.9; the wrapper allows both actions already. Section G. Tests 70, 71.
 - **v19.8:** Storage on the server that is mounted only while a client backs up. Run `--install` on the server: the wrapper has to let `release` through.
   - **The agent reads `/etc/snapshot-agent.conf`.** The README promised it, but the agent read a config only with `--config`, which the wrapper refuses from clients — a setting in that file had no effect. The file is read only when it belongs to root and nobody else can write it. **Before upgrading a server that has one,** check it: a `BASE_STORAGE_PATH` there now applies and must match the clients' `REMOTE_STORAGE_ROOT`, and the file needs `CONFIG_VERSION="2.0"`.

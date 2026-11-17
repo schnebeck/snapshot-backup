@@ -3,7 +3,7 @@
 # ==============================================================================
 ## @file    snapshot-backup.sh
 ## @brief   Unified Snapshot Backup Client & Agent (POSIX sh)
-## @version 19.9
+## @version 20.0
 ##
 ## @note    DEVIATION FROM STRICT POSIX:
 ##          This script utilizes the 'local' keyword for variable scoping.
@@ -29,7 +29,7 @@ umask 0077
 # 1. CONSTANTS & CONFIGURATION DEFAULTS
 # ==============================================================================
 
-SCRIPT_VERSION="19.9"
+SCRIPT_VERSION="20.0"
 EXPECTED_CONFIG_VERSION="2.0"
 
 # --- System Paths ---
@@ -136,6 +136,21 @@ REMOTE_AGENT_VERSION=""
 PRE_RUN_CMD=""
 PRE_RSYNC_CMD=""
 POST_RUN_CMD=""
+
+# LOCAL storage mounted on demand. STORAGE_REQUIRE_MOUNT (shared with the agent
+# config) must be mounted before BACKUP_ROOT, which lies below it, is touched.
+# STORAGE_PRE_CMD/STORAGE_POST_CMD hold it for a backup run; the READ pair for
+# --status, --is-job-done and --mount, only when it is not mounted. Each gets
+# CLIENT_NAME as $1 and this process's PID as $2.
+STORAGE_PRE_CMD=""
+STORAGE_POST_CMD=""
+STORAGE_READ_PRE_CMD=""
+STORAGE_READ_POST_CMD=""
+STORAGE_HOOK_TIMEOUT=600
+# The read mounts a --mount holds until --umount: "<mountpoint> <token>" per line.
+STORAGE_MOUNT_FILE="/var/lib/snapshot-backup/storage_mount"
+_STORAGE_POST_OWED=false
+_STORAGE_READ_POST_OWED=false
 
 # WOL-Server (optional, https://github.com/schnebeck/wol-server): a run requests
 # the devices in WOL_DEVICES, which wakes them, keeps them awake with heartbeats
@@ -1491,6 +1506,16 @@ load_agent_config() {
     load_config "$f"
 }
 
+## @brief Dies unless path $1 (named $2 in the message) lies below STORAGE_REQUIRE_MOUNT.
+## The mount check would say nothing about a path outside the mount.
+require_below_mount() {
+    [ -n "$STORAGE_REQUIRE_MOUNT" ] || return 0
+    case "${1%/}/" in
+        "${STORAGE_REQUIRE_MOUNT%/}/"*) return 0 ;;
+    esac
+    die "$2 '$1' is not below STORAGE_REQUIRE_MOUNT '$STORAGE_REQUIRE_MOUNT'."
+}
+
 ## @brief Returns 0 when STORAGE_REQUIRE_MOUNT is unset or mounted.
 storage_mounted() {
     [ -n "$STORAGE_REQUIRE_MOUNT" ] || return 0
@@ -1582,12 +1607,7 @@ agent_main() {
         exit $?
     fi
 
-    if [ -n "$STORAGE_REQUIRE_MOUNT" ]; then
-        case "${BASE_STORAGE_PATH%/}/" in
-            "${STORAGE_REQUIRE_MOUNT%/}/"*) ;;
-            *) die "BASE_STORAGE_PATH '$BASE_STORAGE_PATH' is not below STORAGE_REQUIRE_MOUNT '$STORAGE_REQUIRE_MOUNT'." ;;
-        esac
-    fi
+    require_below_mount "$BASE_STORAGE_PATH" "BASE_STORAGE_PATH"
 
     if [ "$action" = "prepare" ]; then
         agent_lock
@@ -1995,7 +2015,7 @@ load_config() {
         for var in RETAIN_HOURLY RETAIN_DAILY RETAIN_WEEKLY RETAIN_MONTHLY RETAIN_YEARLY \
                    SPACE_LOW_LIMIT_GB SMART_PURGE_SLOTS DEEP_VERIFY_INTERVAL_DAYS \
                    NETWORK_TIMEOUT NETWORK_WAIT_SECONDS LOG_PROGRESS_INTERVAL WOL_WAIT_SECONDS WOL_TTL \
-                   WOL_HEARTBEAT_SECONDS WOL_WAKE_RETRIES AGENT_HOOK_TIMEOUT; do
+                   WOL_HEARTBEAT_SECONDS WOL_WAKE_RETRIES AGENT_HOOK_TIMEOUT STORAGE_HOOK_TIMEOUT; do
             eval "val=\"\${$var:-}\""
             case "$val" in
                 ''|*[!0-9]*) die "Config $config_file: $var must be a whole number, not '$val'." ;;
@@ -2417,6 +2437,96 @@ release_remote_storage() {
         || log "WARN" "Could not release the storage on $REMOTE_HOST; it stays as it is until the next run of $CLIENT_NAME."
 }
 
+## @brief Runs a STORAGE_* hook ($1 name, $2 command) with CLIENT_NAME as $1
+## and the token $3 as $2, output to stderr, at most STORAGE_HOOK_TIMEOUT seconds.
+storage_hook() {
+    local saved="$_HOOK_TIMEOUT" rc
+    _HOOK_TIMEOUT="$STORAGE_HOOK_TIMEOUT"
+    run_hook "$1" "$2" "$CLIENT_NAME" "$3" >&2
+    rc=$?
+    _HOOK_TIMEOUT="$saved"
+    return $rc
+}
+
+## @brief LOCAL backup run: mounts the storage with STORAGE_PRE_CMD and
+## requires STORAGE_REQUIRE_MOUNT before anything touches BACKUP_ROOT.
+##
+## The PRE runs even when the storage is mounted already, so that the run holds
+## a mark of its own. STORAGE_POST_CMD is owed from the moment the PRE starts
+## and runs from cleanup, on every exit.
+local_storage_acquire() {
+    [ "$BACKUP_MODE" = "LOCAL" ] && [ -n "$STORAGE_REQUIRE_MOUNT" ] || return 0
+    require_below_mount "$BACKUP_ROOT" "BACKUP_ROOT"
+    if [ -n "$STORAGE_PRE_CMD" ]; then
+        _STORAGE_POST_OWED=true
+        storage_hook "STORAGE_PRE_CMD" "$STORAGE_PRE_CMD" "$$" \
+            || die "STORAGE_PRE_CMD failed - not backing up."
+    fi
+    storage_mounted || die "$STORAGE_REQUIRE_MOUNT is not mounted - not backing up, nothing is created below it."
+}
+
+## @brief LOCAL read action: makes the storage available for reading.
+##
+## Mounted already - by a running backup, by hand - it runs no hook. Otherwise
+## STORAGE_READ_PRE_CMD mounts it under a mark of its own, and the owed
+## STORAGE_READ_POST_CMD runs from cleanup. SIGPIPE is ignored from then on: a
+## reader that closed the pipe (--status | head) must not kill the shell past
+## its EXIT trap. Returns 1, after saying why, when the storage is not there.
+local_storage_for_read() {
+    [ "$BACKUP_MODE" = "LOCAL" ] && [ -n "$STORAGE_REQUIRE_MOUNT" ] || return 0
+    require_below_mount "$BACKUP_ROOT" "BACKUP_ROOT"
+    storage_mounted && return 0
+    if [ -n "$STORAGE_READ_PRE_CMD" ]; then
+        trap '' PIPE
+        _STORAGE_READ_POST_OWED=true
+        if ! storage_hook "STORAGE_READ_PRE_CMD" "$STORAGE_READ_PRE_CMD" "$$"; then
+            log "ERROR" "STORAGE_READ_PRE_CMD failed - $STORAGE_REQUIRE_MOUNT is not mounted."
+            return 1
+        fi
+        storage_mounted && return 0
+    fi
+    log "ERROR" "$STORAGE_REQUIRE_MOUNT is not mounted."
+    return 1
+}
+
+## @brief Hands the read mount of a --mount over to STORAGE_MOUNT_FILE: the
+## command ends, the storage stays, and --umount $1 releases it.
+storage_hold_for_mount() {
+    [ "$_STORAGE_READ_POST_OWED" = true ] || return 0
+    mkdir -p "$(dirname "$STORAGE_MOUNT_FILE")" 2>/dev/null \
+        && printf '%s %s\n' "$1" "$$" >> "$STORAGE_MOUNT_FILE" \
+        || return 1
+    _STORAGE_READ_POST_OWED=false
+}
+
+## @brief Releases the read mount a --mount of $1 holds.
+storage_release_for_mount() {
+    [ -f "$STORAGE_MOUNT_FILE" ] || return 0
+    local token
+    token=$(awk -v mp="$1" '$1 == mp { print $2; exit }' "$STORAGE_MOUNT_FILE")
+    [ -n "$token" ] || return 0
+    awk -v mp="$1" '$1 != mp' "$STORAGE_MOUNT_FILE" > "$STORAGE_MOUNT_FILE.tmp" \
+        && mv -f "$STORAGE_MOUNT_FILE.tmp" "$STORAGE_MOUNT_FILE"
+    [ -s "$STORAGE_MOUNT_FILE" ] || rm -f "$STORAGE_MOUNT_FILE"
+    storage_hook "STORAGE_READ_POST_CMD" "$STORAGE_READ_POST_CMD" "$token" || true
+}
+
+## @brief Releases the client's lock: the last step of cleanup.
+##
+## Everything a run set up is given back before a next run can start: a POST
+## that removed the mark of a backup started in between would unmount the
+## storage under it.
+release_lock() {
+    [ "$HAS_LOCK" = true ] || return 0
+    if [ -f "$PIDFILE" ] && [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ]; then
+        rm -f "$PIDFILE"
+    fi
+    if [ -d "$LOCK_DIR" ]; then
+        rmdir "$LOCK_DIR" 2>/dev/null
+    fi
+    HAS_LOCK=false
+}
+
 cleanup() {
     if [ "$AGENT_MODE" = true ]; then
         agent_cleanup
@@ -2430,15 +2540,6 @@ cleanup() {
         wait $jobs 2>/dev/null || true
     fi
 
-    if [ "$HAS_LOCK" = true ]; then
-        if [ -f "$PIDFILE" ] && [ "$(cat "$PIDFILE" 2>/dev/null)" = "$$" ]; then
-            rm -f "$PIDFILE"
-        fi
-        if [ -d "$LOCK_DIR" ]; then
-            rmdir "$LOCK_DIR" 2>/dev/null
-        fi
-    fi
-    
     if [ -n "${TEMP_EXCLUDE_FILE:-}" ] && [ -f "$TEMP_EXCLUDE_FILE" ]; then
         rm -f "$TEMP_EXCLUDE_FILE"
     fi
@@ -2461,6 +2562,18 @@ cleanup() {
         _HOOKS_ARMED=false
         run_hook "POST_RUN_CMD" "${POST_RUN_CMD:-}" "${_RUN_EXIT_CODE:-0}" || true
     fi
+
+    # After POST_RUN_CMD, which may still read the backup disk.
+    if [ "${_STORAGE_POST_OWED:-false}" = true ]; then
+        _STORAGE_POST_OWED=false
+        storage_hook "STORAGE_POST_CMD" "$STORAGE_POST_CMD" "$$" || true
+    fi
+    if [ "${_STORAGE_READ_POST_OWED:-false}" = true ]; then
+        _STORAGE_READ_POST_OWED=false
+        storage_hook "STORAGE_READ_POST_CMD" "$STORAGE_READ_POST_CMD" "$$" || true
+    fi
+
+    release_lock
 
     # After the POST hook, which may still need the machine awake.
     wol_request_release
@@ -2585,6 +2698,26 @@ PRE_RUN_CMD="$PRE_RUN_CMD"
 PRE_RSYNC_CMD="$PRE_RSYNC_CMD"
 POST_RUN_CMD="$POST_RUN_CMD"
 
+# LOCAL storage mounted on demand (a USB or RAID disk; empty: off)
+#
+# STORAGE_REQUIRE_MOUNT must be mounted before BACKUP_ROOT, which lies below
+# it, is touched; without it a run stops and creates nothing on the system
+# disk. STORAGE_PRE_CMD/STORAGE_POST_CMD hold the storage for a backup run (the
+# POST runs on every exit). The READ pair mounts it for --status, --is-job-done
+# and --mount (until --umount), only when it is not mounted. Each hook gets
+# the client name as \$1 and the PID of this run or request as \$2 - a
+# separate mark for reads, so that a read never releases a running backup's:
+#   STORAGE_PRE_CMD='/usr/local/sbin/mount.sh "snapshot-local-\$1"'
+#   STORAGE_POST_CMD='/usr/local/sbin/umount.sh "snapshot-local-\$1"'
+#   STORAGE_READ_PRE_CMD='/usr/local/sbin/mount.sh "snapshot-read-\$1-\$2"'
+#   STORAGE_READ_POST_CMD='/usr/local/sbin/umount.sh "snapshot-read-\$1-\$2"'
+STORAGE_REQUIRE_MOUNT="$STORAGE_REQUIRE_MOUNT"
+STORAGE_PRE_CMD="$STORAGE_PRE_CMD"
+STORAGE_POST_CMD="$STORAGE_POST_CMD"
+STORAGE_READ_PRE_CMD="$STORAGE_READ_PRE_CMD"
+STORAGE_READ_POST_CMD="$STORAGE_READ_POST_CMD"
+STORAGE_HOOK_TIMEOUT=$STORAGE_HOOK_TIMEOUT
+
 # WOL-Server (optional; empty URL: off)
 #
 # For a backup server that sleeps and is woken by a WOL-Server
@@ -2694,6 +2827,7 @@ show_status() {
     if [ "$BACKUP_MODE" = "REMOTE" ]; then
         printf "STORAGE:      ● REMOTE (%s@%s)\n" "$REMOTE_USER" "$REMOTE_HOST"
     else
+        local_storage_for_read || exit 1
         printf "STORAGE:      ● LOCAL\n"
         if [ -d "$BACKUP_ROOT" ]; then
              printf "FREE SPACE:   %s\n" "$(df -h "$BACKUP_ROOT" 2>/dev/null | awk 'NR==2 {print $4}')"
@@ -2950,6 +3084,10 @@ do_mount() {
     local client="${2:-$CLIENT_NAME}"
 
     [ -z "$mountpoint" ] && mountpoint="$BACKUP_ROOT"
+    # Before the mkdir below: the mount point may lie on the storage itself.
+    if [ "$BACKUP_MODE" = "LOCAL" ]; then
+        local_storage_for_read || return 1
+    fi
     if [ ! -d "$mountpoint" ]; then
         mkdir -p "$mountpoint" || { log "ERROR" "Could not create $mountpoint."; return 1; }
     fi
@@ -2975,6 +3113,13 @@ do_mount() {
             log "ERROR" "Mounting $BACKUP_ROOT on $mountpoint failed."
             return 1
         fi
+        # A read mount stays until --umount; one that cannot be noted is given
+        # back now, with the bind mount, rather than left without an owner.
+        if ! storage_hold_for_mount "$(mount_key "$mountpoint")"; then
+            log "ERROR" "Cannot note the storage mount in $STORAGE_MOUNT_FILE - not keeping it."
+            umount "$mountpoint" 2>/dev/null
+            return 1
+        fi
     fi
     log "SUCCESS" "Mounted to $mountpoint"
 }
@@ -2986,11 +3131,15 @@ do_umount() {
     if ! umount "$mp"; then
         log "ERROR" "Unmounting $mp failed."
         # Unmounted some other way (fusermount -u): the request goes all the same.
-        mountpoint -q "$mp" 2>/dev/null || wol_release_for_mount "$(mount_key "$mp")"
+        if ! mountpoint -q "$mp" 2>/dev/null; then
+            wol_release_for_mount "$(mount_key "$mp")"
+            storage_release_for_mount "$(mount_key "$mp")"
+        fi
         return 1
     fi
     log "SUCCESS" "Unmounted $mp"
     wol_release_for_mount "$(mount_key "$mp")"
+    storage_release_for_mount "$(mount_key "$mp")"
 }
 
 ## @brief CLI Check: Is a backup currently running?
@@ -3030,6 +3179,7 @@ check_is_job_done_cli() {
     fi
 
     # 2. LOCAL MODE: Check the local filesystem directly
+    local_storage_for_read || { echo "false"; exit 1; }
     if [ ! -d "$BACKUP_ROOT/$BASE_INTERVAL.0" ]; then
         echo "false"
         exit 1
@@ -3052,6 +3202,21 @@ check_is_job_done_cli() {
 ## @brief CLI Check: Is the storage writable?
 check_has_storage_cli() {
     if [ "$BACKUP_MODE" = "LOCAL" ]; then
+        # Storage that STORAGE_PRE_CMD mounts is there for a backup, though not
+        # now; without it, the empty mount point is no storage at all.
+        if [ -n "$STORAGE_REQUIRE_MOUNT" ]; then
+            require_below_mount "$BACKUP_ROOT" "BACKUP_ROOT"
+            if ! storage_mounted; then
+                if [ -n "$STORAGE_PRE_CMD" ]; then
+                    log "INFO" "$STORAGE_REQUIRE_MOUNT is not mounted; STORAGE_PRE_CMD mounts it for a backup."
+                    echo "true"
+                    exit 0
+                fi
+                log "ERROR" "$STORAGE_REQUIRE_MOUNT is not mounted."
+                echo "false"
+                exit 1
+            fi
+        fi
         if touch "$BACKUP_ROOT/.w_test" 2>/dev/null; then
             rm "$BACKUP_ROOT/.w_test"
             echo "true"
@@ -3185,6 +3350,7 @@ client_main() {
             check_dependencies
             check_rsync_capabilities
             acquire_lock
+            local_storage_acquire
             log_startup_summary
 
             # From here on a POST_RUN_CMD is owed, whatever happens.
@@ -3217,8 +3383,7 @@ client_main() {
             
             _RUN_EXIT_CODE=0
             record_job_done
-            rmdir "$LOCK_DIR" 2>/dev/null
-            rm -f "$PIDFILE"
+            # The lock goes last, in cleanup (release_lock).
             collect_stats "$LOGFILE"
             ;;
     esac

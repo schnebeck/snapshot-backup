@@ -1,6 +1,6 @@
 #!/bin/bash
 # file: run-tests.sh
-# Test suite for snapshot-backup.sh v19.9
+# Test suite for snapshot-backup.sh v20.0
 
 source ./test-framework.sh
 
@@ -1658,20 +1658,20 @@ test_69_loopback_key_is_removed() {
     return 0
 }
 
-# A mark-based mount script for tests 70/71: one mark per caller, the storage
-# is bind-mounted onto itself while any mark is left. It logs its calls to
-# $TEST_ROOT/calls and writes to stdout, which must never reach an agent answer.
-# $1 = mount point
+# A mark-based mount script for tests 70-74: one mark per caller, the "disk" is
+# bind-mounted on the mount point while any mark is left. It logs its calls to
+# $TEST_ROOT/calls and writes to stdout, which must never reach an answer.
+# $1 = mount point, $2 = the disk (default: the mount point itself)
 make_mark_script() {
-    local mnt="$1"
+    local mnt="$1" disk="${2:-$1}"
     cat > "$TEST_ROOT/marks.sh" <<EOF
 #!/bin/sh
-MNT="$mnt"; MARKS="$TEST_ROOT/marks"; LOG="$TEST_ROOT/calls"
+MNT="$mnt"; DISK="$disk"; MARKS="$TEST_ROOT/marks"; LOG="$TEST_ROOT/calls"
 echo "\$1 \$2" >> "\$LOG"
 echo "noise from the mount script"
 case "\$1" in
     up)   mkdir -p "\$MARKS"; : > "\$MARKS/\$2"
-          mountpoint -q "\$MNT" || mount --bind "\$MNT" "\$MNT" ;;
+          mountpoint -q "\$MNT" || mount --bind "\$DISK" "\$MNT" ;;
     down) rm -f "\$MARKS/\$2"
           [ -n "\$(ls -A "\$MARKS" 2>/dev/null)" ] && exit 0
           ! mountpoint -q "\$MNT" || umount "\$MNT" ;;
@@ -1794,6 +1794,157 @@ test_71_read_hooks_on_failure() {
     [ "$rc" -ne 0 ] || { _f "status exited 0 after SIGTERM"; return 1; }
     grep -q "^down read-c71-" "$TEST_ROOT/calls" || { _f "no POST after SIGTERM"; return 1; }
     read_marks_gone "$mnt" || { _f "read mark or mount left after SIGTERM"; return 1; }
+    return 0
+}
+
+# set_config in single quotes: "$1" and "$2" stay the hook's own arguments.
+set_config_sq() {
+    sed -i "/^$1=/d" "$CONF_FILE"
+    printf "%s='%s'\n" "$1" "$2" >> "$CONF_FILE"
+}
+
+# LOCAL on-demand storage for tests 72-74: BACKUP_ROOT below $TEST_ROOT/mnt,
+# which the mark script fills from $TEST_ROOT/disk. Prints nothing.
+setup_local_storage() {
+    mkdir -p "$TEST_ROOT/mnt" "$TEST_ROOT/disk"
+    make_mark_script "$TEST_ROOT/mnt" "$TEST_ROOT/disk"
+    set_config "CLIENT_NAME" "c7x"
+    set_config "BACKUP_ROOT" "$TEST_ROOT/mnt/backup"
+    set_config "STORAGE_REQUIRE_MOUNT" "$TEST_ROOT/mnt"
+}
+
+test_72_local_backup_on_demand_storage() {
+    # LOCAL mode with BACKUP_ROOT on a disk that is mounted only for the run:
+    # STORAGE_PRE_CMD mounts it after the lock, the run writes onto the disk,
+    # STORAGE_POST_CMD releases it on the way out. Without the mount the run
+    # stops and creates nothing below the empty mount point.
+    local m="$TEST_ROOT/marks.sh" out
+    _f() { echo -e "    ${RED}[FAIL] $1${NC}"; }
+    echo "data" > "$MNT_SRC/f72"
+    setup_local_storage
+
+    # 1. No hooks, nothing mounted: refused, nothing on the system disk
+    out=$("$SCRIPT_BIN" --config "$CONF_FILE" 2>&1) && { _f "backup ran without the mount"; return 1; }
+    echo "$out" | grep -q "is not mounted - not backing up" || { _f "no 'not mounted' message"; return 1; }
+    assert_missing "$TEST_ROOT/mnt/backup" || return 1
+    out=$("$SCRIPT_BIN" --config "$CONF_FILE" --has-storage 2>>"$LOG_FILE") && { _f "--has-storage true without mount and hooks"; return 1; }
+    [ "$out" = "false" ] || { _f "--has-storage answered '$out'"; return 1; }
+
+    # 2. With hooks: mounted, written onto the disk, released
+    set_config_sq "STORAGE_PRE_CMD" "$m up \"snapshot-local-\$1\""
+    set_config_sq "STORAGE_POST_CMD" "$m down \"snapshot-local-\$1\""
+    set_config "POST_RUN_CMD" "mountpoint -q $TEST_ROOT/mnt && echo still-mounted >> $TEST_ROOT/calls"
+    out=$("$SCRIPT_BIN" --config "$CONF_FILE" --has-storage 2>>"$LOG_FILE")
+    [ "$out" = "true" ] || { _f "--has-storage answered '$out' with STORAGE_PRE_CMD"; return 1; }
+    : > "$TEST_ROOT/calls"
+    run_backup || { _f "backup with storage hooks failed"; return 1; }
+    [ "$(cat "$TEST_ROOT/calls")" = "$(printf 'up snapshot-local-c7x\nstill-mounted\ndown snapshot-local-c7x')" ] \
+        || { _f "hook calls: $(tr '\n' '|' < "$TEST_ROOT/calls")"; return 1; }
+    assert_exists "$TEST_ROOT/disk/backup/daily.0$MNT_SRC/f72" || return 1
+    mountpoint -q "$TEST_ROOT/mnt" && { _f "storage still mounted after the run"; return 1; }
+    assert_missing "$TEST_ROOT/mnt/backup" || return 1
+    return 0
+}
+
+test_73_local_reads_on_demand_storage() {
+    # --status, --is-job-done and --mount mount on-demand LOCAL storage with the
+    # read hooks under a mark of their own and release it; --mount holds it
+    # until --umount. A read during a running backup runs no hooks and leaves
+    # the backup's storage mounted. Without read hooks: a clear refusal.
+    local m="$TEST_ROOT/marks.sh" out pid
+    _f() { echo -e "    ${RED}[FAIL] $1${NC}"; }
+    setup_local_storage
+    mkdir -p "$TEST_ROOT/disk/backup/daily.0"
+    date +%s > "$TEST_ROOT/disk/backup/daily.0/.backup_timestamp"
+
+    # 1. No read hooks: refused with a message, not an answer for the empty mount point
+    out=$("$SCRIPT_BIN" --config "$CONF_FILE" --status 2>&1) && { _f "--status ran without the mount"; return 1; }
+    echo "$out" | grep -q "mnt is not mounted" || { _f "--status without a 'not mounted' message"; return 1; }
+    out=$("$SCRIPT_BIN" --config "$CONF_FILE" --is-job-done 2>>"$LOG_FILE") && { _f "--is-job-done exit 0 without the mount"; return 1; }
+    [ "$out" = "false" ] || { _f "--is-job-done answered '$out' without the mount"; return 1; }
+
+    # 2. Read hooks: answers, one mark per request, released
+    set_config_sq "STORAGE_READ_PRE_CMD" "$m up \"read-\$1-\$2\""
+    set_config_sq "STORAGE_READ_POST_CMD" "$m down \"read-\$1-\$2\""
+    out=$("$SCRIPT_BIN" --config "$CONF_FILE" --status 2>>"$LOG_FILE") || { _f "--status failed with read hooks"; return 1; }
+    case "$out" in *daily.0*) ;; *) _f "--status did not list daily.0"; return 1 ;; esac
+    case "$out" in *noise*) _f "hook output on stdout"; return 1 ;; esac
+    out=$("$SCRIPT_BIN" --config "$CONF_FILE" --is-job-done 2>>"$LOG_FILE")
+    [ "$out" = "true" ] || { _f "--is-job-done answered '$out' with read hooks"; return 1; }
+    [ "$(grep -c '^up read-c7x-' "$TEST_ROOT/calls")" = 2 ] && [ "$(grep -c '^down read-c7x-' "$TEST_ROOT/calls")" = 2 ] \
+        || { _f "read hook calls: $(tr '\n' '|' < "$TEST_ROOT/calls")"; return 1; }
+    read_marks_gone "$TEST_ROOT/mnt" || { _f "read mark or mount left after reads"; return 1; }
+
+    # 3. --mount holds the storage until --umount
+    "$SCRIPT_BIN" --config "$CONF_FILE" --mount "$TEST_ROOT/view73" >> "$LOG_FILE" 2>&1 || { _f "--mount failed"; return 1; }
+    assert_exists "$TEST_ROOT/view73/daily.0" || return 1
+    mountpoint -q "$TEST_ROOT/mnt" || { _f "storage released while --mount holds it"; return 1; }
+    "$SCRIPT_BIN" --config "$CONF_FILE" --umount "$TEST_ROOT/view73" >> "$LOG_FILE" 2>&1 || { _f "--umount failed"; return 1; }
+    read_marks_gone "$TEST_ROOT/mnt" || { _f "read mark or mount left after --umount"; return 1; }
+
+    # 4. A read during a running backup: no read hooks, the backup's storage stays
+    set_config_sq "STORAGE_PRE_CMD" "$m up \"snapshot-local-\$1\""
+    set_config_sq "STORAGE_POST_CMD" "$m down \"snapshot-local-\$1\""
+    set_config "PRE_RUN_CMD" "sleep 4"
+    run_backup &
+    pid=$!
+    sleep 2
+    mountpoint -q "$TEST_ROOT/mnt" || { _f "backup did not mount the storage"; wait "$pid"; return 1; }
+    cp "$TEST_ROOT/calls" "$TEST_ROOT/calls.before"
+    "$SCRIPT_BIN" --config "$CONF_FILE" --status >> "$LOG_FILE" 2>&1 || { _f "--status failed during a backup"; wait "$pid"; return 1; }
+    cmp -s "$TEST_ROOT/calls" "$TEST_ROOT/calls.before" || { _f "read hooks ran during a backup"; wait "$pid"; return 1; }
+    mountpoint -q "$TEST_ROOT/mnt" || { _f "storage unmounted under a running backup"; wait "$pid"; return 1; }
+    wait "$pid" || { _f "the backup failed"; return 1; }
+    mountpoint -q "$TEST_ROOT/mnt" && { _f "storage still mounted after the backup"; return 1; }
+    return 0
+}
+
+test_74_local_storage_hooks_on_failure() {
+    # A PRE that fails or runs into STORAGE_HOOK_TIMEOUT refuses the run or the
+    # read, and its POST still runs; so it does after a signal. Nothing is
+    # created below the empty mount point.
+    local m="$TEST_ROOT/marks.sh" start pid
+    _f() { echo -e "    ${RED}[FAIL] $1${NC}"; }
+    setup_local_storage
+    set_config_sq "STORAGE_POST_CMD" "$m down \"snapshot-local-\$1\""
+
+    # 1. Backup PRE fails after setting its mark
+    set_config_sq "STORAGE_PRE_CMD" "$m up \"snapshot-local-\$1\"; exit 1"
+    run_backup && { _f "backup ran after STORAGE_PRE_CMD failed"; return 1; }
+    grep -q "^down snapshot-local-c7x" "$TEST_ROOT/calls" || { _f "no POST after a failed PRE"; return 1; }
+    mountpoint -q "$TEST_ROOT/mnt" && { _f "storage left mounted"; return 1; }
+    assert_missing "$TEST_ROOT/mnt/backup" || return 1
+
+    # 2. Backup PRE times out
+    : > "$TEST_ROOT/calls"
+    set_config_sq "STORAGE_PRE_CMD" "$m up \"snapshot-local-\$1\"; sleep 30"
+    set_config "STORAGE_HOOK_TIMEOUT" "2"
+    start=$(date +%s)
+    run_backup && { _f "backup ran after the PRE timed out"; return 1; }
+    [ $(( $(date +%s) - start )) -lt 20 ] || { _f "STORAGE_HOOK_TIMEOUT=2 did not stop the PRE"; return 1; }
+    grep -q "^down snapshot-local-c7x" "$TEST_ROOT/calls" || { _f "no POST after a timed-out PRE"; return 1; }
+    mountpoint -q "$TEST_ROOT/mnt" && { _f "storage left mounted after a timeout"; return 1; }
+
+    # 3. Signal during the run
+    : > "$TEST_ROOT/calls"
+    set_config_sq "STORAGE_PRE_CMD" "$m up \"snapshot-local-\$1\""
+    set_config "STORAGE_HOOK_TIMEOUT" "600"
+    set_config "PRE_RUN_CMD" "sleep 3"
+    "$SCRIPT_BIN" --config "$CONF_FILE" >> "$LOG_FILE" 2>&1 &
+    pid=$!
+    sleep 1
+    kill -TERM "$pid"
+    wait "$pid" && { _f "run exited 0 after SIGTERM"; return 1; }
+    grep -q "^down snapshot-local-c7x" "$TEST_ROOT/calls" || { _f "no POST after SIGTERM"; return 1; }
+    mountpoint -q "$TEST_ROOT/mnt" && { _f "storage left mounted after SIGTERM"; return 1; }
+
+    # 4. Read PRE fails: refused, POST runs
+    : > "$TEST_ROOT/calls"
+    set_config_sq "STORAGE_READ_PRE_CMD" "$m up \"read-\$1-\$2\"; exit 1"
+    set_config_sq "STORAGE_READ_POST_CMD" "$m down \"read-\$1-\$2\""
+    "$SCRIPT_BIN" --config "$CONF_FILE" --status >> "$LOG_FILE" 2>&1 && { _f "--status ran after the read PRE failed"; return 1; }
+    grep -q "^down read-c7x-" "$TEST_ROOT/calls" || { _f "no read POST after a failed read PRE"; return 1; }
+    read_marks_gone "$TEST_ROOT/mnt" || { _f "read mark or mount left"; return 1; }
     return 0
 }
 
@@ -1987,5 +2138,8 @@ run_test_case "68 rsync Accept Codes" test_68_rsync_accept_codes
 run_test_case "69 Loopback Key Is Removed" test_69_loopback_key_is_removed
 run_test_case "70 Read Actions Mount on Demand" test_70_read_actions_mount_on_demand
 run_test_case "71 Read Hooks on Failure" test_71_read_hooks_on_failure
+run_test_case "72 LOCAL Backup on Demand Storage" test_72_local_backup_on_demand_storage
+run_test_case "73 LOCAL Reads on Demand Storage" test_73_local_reads_on_demand_storage
+run_test_case "74 LOCAL Storage Hooks on Failure" test_74_local_storage_hooks_on_failure
 
 print_summary
